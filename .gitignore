@@ -1,0 +1,7 @@
+poetry.lock
+local-data
+**/__pycache__/**
+**/*.egg-info
+ref
+.vscode
+**/.ipynb_checkpoints/**
