@@ -117,6 +117,7 @@ def run_acquisition(
     code_parameters: Dict[str, AcqSignalCodeParameters],
     prob_false_alaram: float,
     print_progress: bool = False,
+    noise_var_method: str = "abscorrmean"
 ) -> Dict[str, AcquisitionResult]:
     """
     Perform BPSK acquisition on the given sample block for all signals defined in code_parameters.
@@ -125,6 +126,10 @@ def run_acquisition(
 
     Pre-computed replicas and FFTs are stored for each signal in the config `replica_cache_dict`.
     The values in the cache entries must be recomputed when acquisition parameters change or when the sampling rate changes.
+
+    Options for noise variance estimation:
+        "abscorrmean": compute noise variance from the mean of abs(corr)**2 matrix
+        "abscorrvar": compute noise variance from the square root of the variance of abs(corr)**2 matrix
     """
     acquisition_results: Dict[str, AcquisitionResult] = {}
 
@@ -192,12 +197,16 @@ def run_acquisition(
         # y_noise = X * noise_var
         # E[y_noise] = 2 * M * noise_var
         # Var[y_noise] = 4 * M * noise_var**2
-        # Don't worry about peak power, its find to overestimate noise a bit
-        y_noise_mean = np.mean(correlation)
-        noise_var = y_noise_mean / (2 * acq_config.num_blocks)
-        # Another way to estimate noise stddev;  can be way off if strong signal present
-        # y_noise_var = np.var(correlation)
-        # noise = np.sqrt(y_noise_var / (4 * acq_config.num_blocks))
+        if noise_var_method == "abscorrmean":
+            # Don't worry about peak power, its fine to overestimate noise a bit
+            y_noise_mean = np.mean(correlation)
+            noise_var = y_noise_mean / (2 * acq_config.num_blocks)
+        elif noise_var_method == "abscorrvar":
+            # Another way to estimate noise stddev;  can be way off if strong signal present, but can be better estimate when lots of narrowband interference
+            y_noise_var = np.var(correlation)
+            noise_var = np.sqrt(y_noise_var / (4 * acq_config.num_blocks))
+        else:
+            raise ValueError(f"Unknown noise_var_method: {noise_var_method}")
 
         normalized_peak_value = peak_val / noise_var
         chi2 = scipy.stats.chi2(df=2 * acq_config.num_blocks)

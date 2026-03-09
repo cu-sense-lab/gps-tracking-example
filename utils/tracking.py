@@ -204,7 +204,7 @@ def track_signal(
 
     # FLL discriminator for carrier freq error
     last_prompt_corr = loop_state.last_prompt_corr
-    if last_prompt_corr == 0.0:
+    if last_prompt_corr is None or last_prompt_corr == 0.0:
         delta_omega = 0.0  # avoid zero division
     else:
         delta_omega = np.angle(prompt / loop_state.last_prompt_corr) / (2e-3 * np.pi * loop_params.block_duration_ms)

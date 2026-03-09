@@ -224,16 +224,10 @@ class FileSampleStream:
             filepath: str,
             sample_params: SampleParameters,
             buffer_size_samples: int,
-            block_size_samples: int,
         ) -> None:
         self.filepath = filepath
         self.sample_params = sample_params
-        if buffer_size_samples % block_size_samples != 0:
-            raise ValueError("Buffer size must be a multiple of block size.")
-        num_blocks_in_buffer = buffer_size_samples // block_size_samples
         self.buffer_size_samples = buffer_size_samples
-        self.block_size_samples = block_size_samples
-        self.num_blocks_in_buffer = num_blocks_in_buffer
         self.buffer_size_bytes = compute_sample_array_size_bytes(
             buffer_size_samples, sample_params.bit_depth, sample_params.is_complex
         )
@@ -246,8 +240,8 @@ class FileSampleStream:
     
     def __exit__(self, exc_type, exc_value, traceback):
         self.file.close()
-    
-    def sample_block_generator(self) -> Generator[np.ndarray]:
+
+    def sample_buffer_generator(self, skip: int = 0) -> Generator[np.ndarray, None, None]:
         while True:
             num_bytes_read = self.file.readinto(self.byte_buffer)
             if num_bytes_read < self.buffer_size_bytes:
@@ -257,7 +251,25 @@ class FileSampleStream:
                 self.sample_buffer,
                 self.sample_params,
             )
-            for block_idx in range(self.num_blocks_in_buffer):
-                start_idx = block_idx * self.block_size_samples
-                end_idx = start_idx + self.block_size_samples
-                yield self.sample_buffer[start_idx:end_idx]
+            yield self.sample_buffer
+            if skip > 1:
+                try:
+                    if self.file.seekable():
+                        self.file.seek((skip - 1) * self.buffer_size_samples * self.sample_params.bytes_per_sample, 1)
+                    else:
+                        for _ in range(skip - 1):
+                            num_bytes_read = self.file.readinto(self.byte_buffer)
+                            if num_bytes_read < self.buffer_size_bytes:
+                                raise StopIteration
+                except OSError:
+                    pass
+    
+    def sample_block_generator(self, block_size_samples: int) -> Generator[np.ndarray, None, None]:
+        if self.buffer_size_samples % block_size_samples != 0:
+            raise ValueError("Buffer size must be a multiple of block size.")
+        num_blocks_in_buffer = self.buffer_size_samples // block_size_samples
+        for sample_buffer in self.sample_buffer_generator():
+            for block_idx in range(num_blocks_in_buffer):
+                start_idx = block_idx * block_size_samples
+                end_idx = start_idx + block_size_samples
+                yield sample_buffer[start_idx:end_idx]
