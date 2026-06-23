@@ -176,7 +176,8 @@ def track_signal(
 
     # # FAST VERSION:
     EPL_chip_spacing = loop_params.EPL_chip_spacing
-    early, prompt, late = correlate__delay(
+    corr_output = np.zeros(3, dtype=np.complex64)
+    correlate__delay(
         sample_block,
         loop_params.samp_rate,
         carrier_phase_cycles,
@@ -188,7 +189,9 @@ def track_signal(
         3,
         EPL_chip_spacing,
         -EPL_chip_spacing,
+        corr_output
     )
+    early, prompt, late = corr_output
 
     # Estimate state errors from correlator outputs
     # delta_theta = np.angle(prompt) / (2.0 * np.pi)

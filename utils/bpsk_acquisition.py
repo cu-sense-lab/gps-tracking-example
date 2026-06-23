@@ -84,6 +84,7 @@ class CorrelationResult:
 
 @dataclass
 class AcquisitionResult:
+    uptime_epoch_ms: float
     signal_id: str
     peak_doppler_bin: int
     peak_code_phase_bin: int
@@ -98,26 +99,25 @@ class AcquisitionResult:
     @property
     def acq_doppler_hz(self) -> float:
         return (
-            self.correlation_result.start_doppler_hz
-            + self.peak_doppler_bin * self.correlation_result.doppler_resolution_hz
+            self.config.doppler_search_bins[self.peak_doppler_bin] * self.config.fft_resolution
         )
 
     @property
     def acq_code_phase_seconds(self) -> float:
         return (
-            self.correlation_result.start_code_phase_seconds
-            + self.peak_code_phase_bin
-            * self.correlation_result.code_phase_resolution_seconds
+            self.peak_code_phase_bin / self.config.sample_rate
         )
 
 
 def run_acquisition(
     sample_block: np.ndarray[np.complex64],
+    sample_block_uptime_epoch_ms: float,
     acq_config: AcquisitionConfiguration,
     code_parameters: Dict[str, AcqSignalCodeParameters],
     prob_false_alaram: float,
     print_progress: bool = False,
-    noise_var_method: str = "abscorrmean"
+    noise_var_method: str = "abscorrmean",
+    save_corr_peak_window_chips: Optional[float] = None,
 ) -> Dict[str, AcquisitionResult]:
     """
     Perform BPSK acquisition on the given sample block for all signals defined in code_parameters.
@@ -213,15 +213,30 @@ def run_acquisition(
         detection_threshold = chi2.ppf(1 - prob_false_alaram)
         signal_detected = normalized_peak_value > detection_threshold
 
-        corr_result = CorrelationResult(
-            correlation,
-            acq_config.doppler_search_bins[0] * acq_config.fft_resolution,
-            acq_config.fft_resolution,
-            0.0,
-            1 / acq_config.sample_rate,
-        )
+        if save_corr_peak_window_chips is not None:
+            half_window_size_samples = int(
+                save_corr_peak_window_chips / code_params.rate_chips_per_sec * acq_config.sample_rate
+            )
+            i0 = max(0, peak_sample_bin - half_window_size_samples)
+            i1 = min(acq_config.block_size_samples, peak_sample_bin + half_window_size_samples)
+            corr_result = CorrelationResult(
+                correlation[:, i0:i1],
+                acq_config.doppler_search_bins[0] * acq_config.fft_resolution,
+                acq_config.fft_resolution,
+                i0 / acq_config.sample_rate,
+                1 / acq_config.sample_rate,
+            )
+        else:
+            corr_result = CorrelationResult(
+                correlation,
+                acq_config.doppler_search_bins[0] * acq_config.fft_resolution,
+                acq_config.fft_resolution,
+                0.0,
+                1 / acq_config.sample_rate,
+            )
 
         acq_result = AcquisitionResult(
+            sample_block_uptime_epoch_ms,
             signal_id,
             peak_doppler_bin,
             peak_sample_bin,

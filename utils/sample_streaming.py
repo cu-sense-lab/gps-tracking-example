@@ -273,3 +273,24 @@ class FileSampleStream:
                 start_idx = block_idx * block_size_samples
                 end_idx = start_idx + block_size_samples
                 yield sample_buffer[start_idx:end_idx]
+
+
+@dataclass
+class SampleBuffer:
+    """
+    Sample buffer context for passing samples to tracking channels.
+    `samples` -- np.ndarray of complex64 samples
+    `start_uptime_ms` -- float, uptime in milliseconds of the first sample in the buffer
+    `samp_rate` -- float, sample rate in Hz
+    """
+    samples: np.ndarray[np.complex64]
+    start_uptime_ms: float
+    samp_rate: float
+
+    @property
+    def num_samples(self) -> int:
+        return len(self.samples)
+    
+    @property
+    def stop_uptime_ms(self) -> float:
+        return self.start_uptime_ms + (self.num_samples / self.samp_rate) * 1000
