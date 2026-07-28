@@ -1,6 +1,5 @@
 from dataclasses import dataclass
 from enum import Enum
-from typing import Tuple
 
 import numpy as np
 
@@ -19,7 +18,7 @@ class TrackingSignalState:
     carrier_phase_cycles: float
     carrier_rate_cyc_per_sec: float
 
-    def propagate_phase(self, new_uptime_epoch_ms: float) -> Tuple[float, float]:
+    def propagate_phase(self, new_uptime_epoch_ms: float) -> tuple[float, float]:
         "Return code phase (ms) and carrier phase (cycles) at new uptime epoch, without modifying state."
         dt_sec = (new_uptime_epoch_ms - self.uptime_epoch_ms) * 1e-3
         new_code_phase_ms = self.code_phase_ms + dt_sec * self.code_rate_ms_per_sec
@@ -103,10 +102,8 @@ class AlignedCorrelator:
         if not (accum_start_sample_index < accum_stop_sample_index):
             raise ValueError("accumulation stop must be after accumulation start")
 
-        if accum_start_sample_index < 0:
-            accum_start_sample_index = 0
-        if accum_stop_sample_index > len(buffer.samples):
-            accum_stop_sample_index = len(buffer.samples)
+        accum_start_sample_index = max(0, accum_start_sample_index)
+        accum_stop_sample_index = min(len(buffer.samples), accum_stop_sample_index)
         
         actual_accum_start_uptime_ms = buffer.start_uptime_ms + accum_start_sample_index / buffer.samp_rate * 1000
         samples = buffer.samples[accum_start_sample_index:accum_stop_sample_index]
@@ -197,7 +194,7 @@ class TrackingLoopState:
             return 0.0
         angles = np.angle(iq)
         if costas:
-            angles = 2.0 * angles
+            angles *= 2.0
         return float(np.abs(np.mean(np.exp(1j * angles))))
 
 
@@ -255,7 +252,7 @@ class CorrelationInterval:
     def increment(self) -> None:
         self.start_code_phase_ms += self.duration_ms
 
-    def compute_start_and_stop_uptime_ms(self, signal_state: TrackingSignalState) -> Tuple[float, float]:
+    def compute_start_and_stop_uptime_ms(self, signal_state: TrackingSignalState) -> tuple[float, float]:
         code_phase_ms = signal_state.code_phase_ms
         code_rate_ms_per_sec = signal_state.code_rate_ms_per_sec
         start_uptime_ms = (

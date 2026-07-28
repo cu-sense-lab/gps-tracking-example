@@ -1,6 +1,15 @@
 from dataclasses import dataclass
-from typing import Dict, Optional, Generator
+from typing import NotRequired, Optional, Generator, TypedDict
 import numpy as np
+from numpy.typing import NDArray
+
+
+class SampleParametersDict(TypedDict):
+    bit_depth: int
+    is_complex: bool
+    is_integer: bool
+    is_signed: NotRequired[bool]
+    is_i_lsb: NotRequired[bool]
 
 
 @dataclass
@@ -29,7 +38,7 @@ class SampleParameters:
         return self.bit_depth // 8  # Use integer division
 
     @staticmethod
-    def from_dict(sample_parameters_dict: Dict[str, int | bool]) -> "SampleParameters":
+    def from_dict(sample_parameters_dict: SampleParametersDict) -> "SampleParameters":
         """
         Create a SampleParameters object from a dictionary.
         """
@@ -48,27 +57,27 @@ def get_numpy_dtype(
 
     match (is_integer, is_signed, bit_depth):
         case (True, True, 8):
-            return np.int8
+            return np.dtype(np.int8)
         case (True, True, 16):
-            return np.int16
+            return np.dtype(np.int16)
         case (True, True, 32):
-            return np.int32
+            return np.dtype(np.int32)
         # case (True, True, 64):
-        #     return np.int64
+        #     return np.dtype(np.int64)
         case (True, False, 8):
-            return np.uint8
+            return np.dtype(np.uint8)
         case (True, False, 16):
-            return np.uint16
+            return np.dtype(np.uint16)
         case (True, False, 32):
-            return np.uint32
+            return np.dtype(np.uint32)
         case (True, False, 64):
-            return np.uint64
+            return np.dtype(np.uint64)
         case (False, True, 16):
-            return np.float16
+            return np.dtype(np.float16)
         case (False, True, 32):
-            return np.float32
+            return np.dtype(np.float32)
         # case (False, True, 64):  # Note: we cannot deal with 64-bit sample components since we restrict ourselves to 32-bit sample buffers
-        #     return np.float64
+        #     return np.dtype(np.float64)
         case (_, _, _):
             return None
 
@@ -90,8 +99,8 @@ def compute_sample_array_size_bytes(
 
 
 def convert_to_complex64_samples(
-    input_bytes: memoryview,
-    output_sample_array: np.ndarray[int, np.complex64],
+    input_bytes: bytearray,
+    output_sample_array: NDArray[np.complex64],
     sample_params: SampleParameters,
 ) -> None:
     """
@@ -194,8 +203,8 @@ def convert_to_complex64_samples(
 
 
 def mixdown_samples(
-        input_samples: np.ndarray[np.complex64],
-        output_samples: np.ndarray[np.complex64],
+        input_samples: NDArray[np.complex64],
+        output_samples: NDArray[np.complex64],
         samp_rate: float,
         initial_phase_cycles: float,
         freq_hz: float,
@@ -245,7 +254,7 @@ class FileSampleStream:
         while True:
             num_bytes_read = self.file.readinto(self.byte_buffer)
             if num_bytes_read < self.buffer_size_bytes:
-                raise StopIteration
+                return
             convert_to_complex64_samples(
                 self.byte_buffer,
                 self.sample_buffer,
@@ -260,7 +269,7 @@ class FileSampleStream:
                         for _ in range(skip - 1):
                             num_bytes_read = self.file.readinto(self.byte_buffer)
                             if num_bytes_read < self.buffer_size_bytes:
-                                raise StopIteration
+                                return
                 except OSError:
                     pass
     
@@ -283,7 +292,7 @@ class SampleBuffer:
     `start_uptime_ms` -- float, uptime in milliseconds of the first sample in the buffer
     `samp_rate` -- float, sample rate in Hz
     """
-    samples: np.ndarray[np.complex64]
+    samples: NDArray[np.complex64]
     start_uptime_ms: float
     samp_rate: float
 

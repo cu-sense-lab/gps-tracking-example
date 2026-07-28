@@ -2,6 +2,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple
 import numpy as np
+from numpy.typing import NDArray
 import scipy.stats
 
 
@@ -48,12 +49,12 @@ class AcquisitionConfiguration:
 class AcqSignalCodeParameters:
     rate_chips_per_sec: float
     length_chips: int
-    sequence: np.ndarray[np.int8]
+    sequence: NDArray[np.int8]
 
 
 @dataclass
 class CorrelationResult:
-    correlation_matrix: np.ndarray[np.float64]
+    correlation_matrix: NDArray[np.float64]
     start_doppler_hz: float
     doppler_resolution_hz: float
     start_code_phase_seconds: float
@@ -68,14 +69,14 @@ class CorrelationResult:
         return self.correlation_matrix.shape[1]
 
     @property
-    def doppler_bins_hz(self) -> np.ndarray[np.float64]:
+    def doppler_bins_hz(self) -> NDArray[np.float64]:
         return (
             self.start_doppler_hz
             + np.arange(self.num_doppler_bins) * self.doppler_resolution_hz
         )
 
     @property
-    def code_phase_bins_seconds(self) -> np.ndarray[np.float64]:
+    def code_phase_bins_seconds(self) -> NDArray[np.float64]:
         return (
             self.start_code_phase_seconds
             + np.arange(self.num_code_phase_bins) * self.code_phase_resolution_seconds
@@ -110,7 +111,7 @@ class AcquisitionResult:
 
 
 def run_acquisition(
-    sample_block: np.ndarray[np.complex64],
+    sample_block: NDArray[np.complex64],
     sample_block_uptime_epoch_ms: float,
     acq_config: AcquisitionConfiguration,
     code_parameters: Dict[str, AcqSignalCodeParameters],
@@ -138,8 +139,8 @@ def run_acquisition(
     M = acq_config.num_blocks
     N = acq_config.block_size_samples
     samples = sample_block[: M * N].reshape((M, N))
-    # Compute FFT of blocks
-    samples_fft = np.fft.fft(samples, axis=1)
+    # Compute conjugated FFT of blocks
+    conj_samples_fft = np.conj(np.fft.fft(samples, axis=1))
 
     for signal_id, code_params in code_parameters.items():
 
@@ -152,7 +153,7 @@ def run_acquisition(
             replica_samples_fft = replica_entry.replica_fft
         else:
             replica_samples = np.zeros(
-                acq_config.block_size_samples, dtype=np.complex64
+                N, dtype=np.complex64
             )
             chips_arr = (
                 0.0 + acq_config.replica_time_arr * code_params.rate_chips_per_sec
@@ -169,7 +170,7 @@ def run_acquisition(
 
         doppler_search_bins = acq_config.doppler_search_bins
         correlation = np.zeros(
-            (len(doppler_search_bins), acq_config.block_size_samples)
+            (len(doppler_search_bins), N)
         )
 
         for i, roll in enumerate(doppler_search_bins):
@@ -181,7 +182,7 @@ def run_acquisition(
 
             shifted_replica_fft = np.roll(replica_samples_fft, roll)
             corr = np.fft.ifft(
-                np.conj(samples_fft) * shifted_replica_fft[None, :]
+                conj_samples_fft * shifted_replica_fft[None, :]
             )
             # non-coherent square-law summation over M blocks, normalized by N
             # y_noise / noise_var ~ ChiSquared(2M)
@@ -200,17 +201,17 @@ def run_acquisition(
         if noise_var_method == "abscorrmean":
             # Don't worry about peak power, its fine to overestimate noise a bit
             y_noise_mean = np.mean(correlation)
-            noise_var = y_noise_mean / (2 * acq_config.num_blocks)
+            noise_var = y_noise_mean / (2 * M)
         elif noise_var_method == "abscorrvar":
             # Another way to estimate noise stddev;  can be way off if strong signal present, but can be better estimate when lots of narrowband interference
             y_noise_var = np.var(correlation)
-            noise_var = np.sqrt(y_noise_var / (4 * acq_config.num_blocks))
+            noise_var = np.sqrt(y_noise_var / (4 * M))
         else:
             raise ValueError(f"Unknown noise_var_method: {noise_var_method}")
 
         normalized_peak_value = peak_val / noise_var
-        chi2 = scipy.stats.chi2(df=2 * acq_config.num_blocks)
-        detection_threshold = chi2.ppf(1 - prob_false_alaram)
+        chi2 = scipy.stats.chi2(df=2 * M)
+        detection_threshold = chi2.isf(prob_false_alaram)
         signal_detected = normalized_peak_value > detection_threshold
 
         if save_corr_peak_window_chips is not None:
@@ -218,7 +219,7 @@ def run_acquisition(
                 save_corr_peak_window_chips / code_params.rate_chips_per_sec * acq_config.sample_rate
             )
             i0 = max(0, peak_sample_bin - half_window_size_samples)
-            i1 = min(acq_config.block_size_samples, peak_sample_bin + half_window_size_samples)
+            i1 = min(N, peak_sample_bin + half_window_size_samples)
             corr_result = CorrelationResult(
                 correlation[:, i0:i1],
                 acq_config.doppler_search_bins[0] * acq_config.fft_resolution,

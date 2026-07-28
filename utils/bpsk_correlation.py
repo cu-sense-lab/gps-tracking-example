@@ -1,5 +1,6 @@
 import numpy as np
 import numba as nb
+from numpy.typing import NDArray
 
 @nb.jit(nopython=True, parallel=False)
 def numba_correlate__bpsk__complex64(
@@ -44,9 +45,9 @@ def correlate__delay(
     num_chip_bins: int,
     chip_bin_offset: float,
     chip_bin_spacing: float,
-    output: np.ndarray[np.complex64]
+    output: NDArray[np.complex64]
 ) -> None:
-        
+
     chip_start = initial_code_phase_chips % code_length_chips
     chip_delta = code_rate_chips_per_sec / samp_rate  # chips per sample
 
@@ -66,8 +67,6 @@ def correlate__delay(
         conj_carr_rotation,
         output
     )
-
-    return output
 
 
 @nb.jit(nopython=True, parallel=False)
@@ -127,9 +126,9 @@ def correlate_delay_interleaved(
     num_chip_bins: int,
     chip_bin_offset: float,
     chip_bin_spacing: float,
-    output: np.ndarray[np.complex64]
+    output: NDArray[np.complex64]
 ) -> None:
-        
+
     chip_start = initial_code_phase_chips % max(code_length_0, code_length_1)  # NOTE: code lengths must be divisor pair
     chip_delta = code_rate_chips_per_sec / samp_rate  # chips per sample
 
@@ -151,5 +150,3 @@ def correlate_delay_interleaved(
         conj_carr_rotation,
         output
     )
-
-    return output
