@@ -206,6 +206,7 @@ def build_acquisition_code_params(
             rate_chips_per_sec=signal_def.acquisition_code_rate_chips_per_sec,
             length_chips=signal_def.acquisition_code_length_chips,
             sequence=signal_def.acquisition_code_sequence,
+            is_interleaved=signal_def.correlator_strategy == CorrelatorStrategyName.INTERLEAVED_BPSK,
         )
         for signal_id, signal_def in signal_definitions.items()
     }
