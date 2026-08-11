@@ -92,8 +92,11 @@ def numba_correlate__interleaved_bpsk__complex64(
         carrierless = samples[i] * conj_carr_sample
         for j in range(num_bins):
             chip_index = int(center_chip + chip_bin_offset + j * chip_bin_spacing)
+            # chip_index advances at the combined (interleaved) chip rate. Each component
+            # occupies every other chip, so its own index into its code is chip_index // 2.
+            component_chip_index = chip_index // 2
             if chip_index % 2 == 0:
-                symbol = code_seq_0[chip_index % code_length_0]
+                symbol = code_seq_0[component_chip_index % code_length_0]
                 if symbol == 1:
                     corr_values[j, 0] += carrierless
                 elif symbol == -1:
@@ -101,7 +104,7 @@ def numba_correlate__interleaved_bpsk__complex64(
                 elif symbol != 0:
                     corr_values[j, 0] += carrierless * symbol
             else:
-                symbol = code_seq_1[chip_index % code_length_1]
+                symbol = code_seq_1[component_chip_index % code_length_1]
                 if symbol == 1:
                     corr_values[j, 1] += carrierless
                 elif symbol == -1:
@@ -129,7 +132,12 @@ def correlate_delay_interleaved(
     output: NDArray[np.complex64]
 ) -> None:
 
-    chip_start = initial_code_phase_chips % max(code_length_0, code_length_1)  # NOTE: code lengths must be divisor pair
+    # The interleaved stream repeats every 2 * lcm(len0, len1) combined chips, which is
+    # 2 * max(...) for a divisor pair.  NOTE: code lengths must be divisor pair.
+    # Reducing by anything else (e.g. max alone) shifts both components' chip_index // 2
+    # and breaks alignment once the code phase runs past one code period.
+    interleaved_period_chips = 2 * max(code_length_0, code_length_1)
+    chip_start = initial_code_phase_chips % interleaved_period_chips
     chip_delta = code_rate_chips_per_sec / samp_rate  # chips per sample
 
     conj_carr_sample = np.exp(-2j * np.pi * initial_carr_phase_cycles)

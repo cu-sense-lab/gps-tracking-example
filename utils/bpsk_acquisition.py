@@ -50,6 +50,11 @@ class AcqSignalCodeParameters:
     rate_chips_per_sec: float
     length_chips: int
     sequence: NDArray[np.int8]
+    # True for signals where `sequence` is one component of a chip-interleaved
+    # pair (e.g. L2C's CM/CL). The replica is zero-filled on the other
+    # component's chip slots rather than holding this component's chip value
+    # across both, so it doesn't spuriously correlate against the other code.
+    is_interleaved: bool = False
 
 
 @dataclass
@@ -70,16 +75,18 @@ class CorrelationResult:
 
     @property
     def doppler_bins_hz(self) -> NDArray[np.float64]:
-        return (
+        return np.asarray(
             self.start_doppler_hz
-            + np.arange(self.num_doppler_bins) * self.doppler_resolution_hz
+            + np.arange(self.num_doppler_bins) * self.doppler_resolution_hz,
+            dtype=np.float64,
         )
 
     @property
     def code_phase_bins_seconds(self) -> NDArray[np.float64]:
-        return (
+        return np.asarray(
             self.start_code_phase_seconds
-            + np.arange(self.num_code_phase_bins) * self.code_phase_resolution_seconds
+            + np.arange(self.num_code_phase_bins) * self.code_phase_resolution_seconds,
+            dtype=np.float64,
         )
 
 
@@ -155,13 +162,26 @@ def run_acquisition(
             replica_samples = np.zeros(
                 N, dtype=np.complex64
             )
-            chips_arr = (
-                0.0 + acq_config.replica_time_arr * code_params.rate_chips_per_sec
-            )
-            chip_indices = chips_arr.astype(int) % code_params.length_chips
-            replica_samples[: acq_config.replica_length_samples] = code_params.sequence[
-                chip_indices
-            ].astype(float)
+            if code_params.is_interleaved:
+                # Physical chip clock runs at 2x this component's own rate, alternating
+                # between this component's chips (even slots) and the other component's
+                # (odd slots). Zero-fill the odd slots so the replica only correlates
+                # against its own component, instead of smearing across both.
+                physical_chip_idx = (
+                    acq_config.replica_time_arr * 2.0 * code_params.rate_chips_per_sec
+                ).astype(int)
+                own_slot = physical_chip_idx % 2 == 0
+                own_chip_indices = (physical_chip_idx // 2) % code_params.length_chips
+                replica_values = np.where(
+                    own_slot, code_params.sequence[own_chip_indices], 0
+                )
+            else:
+                chips_arr = (
+                    0.0 + acq_config.replica_time_arr * code_params.rate_chips_per_sec
+                )
+                chip_indices = chips_arr.astype(int) % code_params.length_chips
+                replica_values = code_params.sequence[chip_indices]
+            replica_samples[: acq_config.replica_length_samples] = replica_values.astype(float)
             replica_samples_fft = np.fft.fft(replica_samples)
             replica_entry = SignalReplicaCacheEntry(
                 replica_samples, replica_samples_fft
@@ -189,9 +209,11 @@ def run_acquisition(
             correlation[i] = np.sum(1 / N * np.abs(corr) ** 2, axis=0)
 
         # Find acquisition peak
-        peak_doppler_bin, peak_sample_bin = np.unravel_index(
+        peak_doppler_bin_idx, peak_sample_bin_idx = np.unravel_index(
             correlation.argmax(), correlation.shape
         )
+        peak_doppler_bin = int(peak_doppler_bin_idx)
+        peak_sample_bin = int(peak_sample_bin_idx)
         peak_val = correlation[peak_doppler_bin, peak_sample_bin]
 
         # Estimate noise distribution
@@ -201,11 +223,11 @@ def run_acquisition(
         if noise_var_method == "abscorrmean":
             # Don't worry about peak power, its fine to overestimate noise a bit
             y_noise_mean = np.mean(correlation)
-            noise_var = y_noise_mean / (2 * M)
+            noise_var = float(y_noise_mean / (2 * M))
         elif noise_var_method == "abscorrvar":
             # Another way to estimate noise stddev;  can be way off if strong signal present, but can be better estimate when lots of narrowband interference
             y_noise_var = np.var(correlation)
-            noise_var = np.sqrt(y_noise_var / (4 * M))
+            noise_var = float(np.sqrt(y_noise_var / (4 * M)))
         else:
             raise ValueError(f"Unknown noise_var_method: {noise_var_method}")
 

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum, StrEnum
-from typing import Any, Dict, Iterable, Protocol
+from typing import Dict, Iterable, Protocol
 
 import numpy as np
 
@@ -10,6 +10,7 @@ import gnss_tools.signals.gps_l1ca as gps_l1ca
 import gnss_tools.signals.gps_l2c as gps_l2c
 
 from . import bpsk_acquisition
+from . import sample_streaming
 from . import tracking_bpsk_aligned
 from . import tracking_l2c_aligned
 
@@ -37,8 +38,29 @@ class SignalDefinition:
     tracking_code_sequences: tuple[np.ndarray, ...]
 
 
+# Unifies SignalTrackingOutputs (L1CA) and L2CSignalTrackingOutputs (L2C) so
+# TrackingChannelAdapter can read correlator outputs without caring which one it holds.
+class TrackingOutputsLike(Protocol):
+    prompt_corr: np.ndarray
+    early_corr: np.ndarray
+    late_corr: np.ndarray
+
+
+# Unifies tracking_bpsk_aligned.TrackingChannel and tracking_l2c_aligned.TrackingChannel
+# so TrackingChannelAdapter can wrap either without an Any/Union escape hatch.
+class TrackingChannelLike(Protocol):
+    loop_state: tracking_bpsk_aligned.TrackingLoopState
+
+    @property
+    def outputs(self) -> TrackingOutputsLike:
+        ...
+
+    def process_sample_buffer(self, buffer: sample_streaming.SampleBuffer) -> None:
+        ...
+
+
 class CorrelatorStrategy(Protocol):
-    kind: CorrelatorStrategy
+    kind: CorrelatorStrategyName
 
     def create_tracking_channel(
         self,
@@ -46,12 +68,12 @@ class CorrelatorStrategy(Protocol):
         loop_params: tracking_bpsk_aligned.TrackingLoopParameters,
         initial_signal_state: tracking_bpsk_aligned.TrackingSignalState,
         output_capacity: int,
-    ) -> Any:
+    ) -> TrackingChannelLike:
         ...
 
 
 class BpskCorrelatorStrategy:
-    kind = CorrelatorStrategy.BPSK
+    kind = CorrelatorStrategyName.BPSK
 
     def create_tracking_channel(
         self,
@@ -74,7 +96,7 @@ class BpskCorrelatorStrategy:
 
 
 class InterleavedBpskCorrelatorStrategy:
-    kind = CorrelatorStrategy.INTERLEAVED_BPSK
+    kind = CorrelatorStrategyName.INTERLEAVED_BPSK
 
     def create_tracking_channel(
         self,
@@ -97,22 +119,22 @@ class InterleavedBpskCorrelatorStrategy:
         )
 
 
-STRATEGIES: Dict[CorrelatorStrategy, CorrelatorStrategy] = {
-    CorrelatorStrategy.BPSK: BpskCorrelatorStrategy(),
-    CorrelatorStrategy.INTERLEAVED_BPSK: InterleavedBpskCorrelatorStrategy(),
+STRATEGIES: Dict[CorrelatorStrategyName, CorrelatorStrategy] = {
+    CorrelatorStrategyName.BPSK: BpskCorrelatorStrategy(),
+    CorrelatorStrategyName.INTERLEAVED_BPSK: InterleavedBpskCorrelatorStrategy(),
 }
 
 
 @dataclass
 class TrackingChannelAdapter:
     signal_definition: SignalDefinition
-    channel: Any
+    channel: TrackingChannelLike
 
     @property
-    def outputs(self) -> Any:
+    def outputs(self) -> TrackingOutputsLike:
         return self.channel.outputs
 
-    def process_sample_buffer(self, sample_buffer: Any) -> None:
+    def process_sample_buffer(self, sample_buffer: sample_streaming.SampleBuffer) -> None:
         self.channel.process_sample_buffer(sample_buffer)
 
     def set_mode_pll(self) -> None:
@@ -149,7 +171,7 @@ def build_signal_definitions(
             definitions[signal_id] = SignalDefinition(
                 signal_id=signal_id,
                 family=family,
-                correlator_strategy=CorrelatorStrategy.BPSK,
+                correlator_strategy=CorrelatorStrategyName.BPSK,
                 carrier_freq_hz=gps_l1ca.CARRIER_FREQ,
                 acquisition_code_rate_chips_per_sec=gps_l1ca.CODE_RATE,
                 acquisition_code_length_chips=gps_l1ca.CODE_LENGTH,
@@ -163,7 +185,7 @@ def build_signal_definitions(
             definitions[signal_id] = SignalDefinition(
                 signal_id=signal_id,
                 family=family,
-                correlator_strategy=CorrelatorStrategy.INTERLEAVED_BPSK,
+                correlator_strategy=CorrelatorStrategyName.INTERLEAVED_BPSK,
                 carrier_freq_hz=gps_l2c.CARRIER_FREQ,
                 acquisition_code_rate_chips_per_sec=gps_l2c.CODE_RATE_L2CM,
                 acquisition_code_length_chips=gps_l2c.CODE_LENGTH_L2CM,
@@ -184,6 +206,7 @@ def build_acquisition_code_params(
             rate_chips_per_sec=signal_def.acquisition_code_rate_chips_per_sec,
             length_chips=signal_def.acquisition_code_length_chips,
             sequence=signal_def.acquisition_code_sequence,
+            is_interleaved=signal_def.correlator_strategy == CorrelatorStrategyName.INTERLEAVED_BPSK,
         )
         for signal_id, signal_def in signal_definitions.items()
     }
