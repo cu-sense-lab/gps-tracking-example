@@ -11,3 +11,4 @@ notebooks/stec-test
 ._*
 .DS_Store
 .claude/
+.env

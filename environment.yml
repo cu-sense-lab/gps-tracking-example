@@ -1,5 +1,5 @@
 
-name: gnss_tracking_example
+name: gnss_tracking_env
 channels:
   - conda-forge
   - defaults
