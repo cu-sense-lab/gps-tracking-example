@@ -107,14 +107,18 @@ SCENARIOS: tuple[TrackingScenario, ...] = (
         rng_seed=1,
     ),
     # L5 runs at 25 Msps (10.23 Mcps needs >=2 samples/chip), so these are kept
-    # short: 200 ms is ~5x the samples of a 2 s L1 C/A run.  Doppler seeding
-    # errors reflect the half-bin acquisition search, whose worst case is 250 Hz
-    # -- the edge of a 1 ms FLL's unambiguous range.
+    # short relative to the 2 s L1 C/A runs.  Doppler seeding errors reflect the
+    # half-bin acquisition search, whose worst case is 250 Hz -- the edge of a
+    # 1 ms FLL's unambiguous range.
+    #
+    # 400 ms is chosen to span the overlay transition with room to spare: PLL
+    # lock lands near 50 ms and Neuman-Hofman sync near 100 ms, leaving ~15
+    # coherent 20 ms epochs for the baseline to cover.
     TrackingScenario(
         name="l5_clean",
         family="L5",
         prn=1,
-        duration_ms=200,
+        duration_ms=400,
         samp_rate=25e6,
         doppler_hz=1500.0,
         code_phase_ms=0.31,
@@ -128,7 +132,7 @@ SCENARIOS: tuple[TrackingScenario, ...] = (
         name="l5_navbits_seeded",
         family="L5",
         prn=1,
-        duration_ms=200,
+        duration_ms=400,
         samp_rate=25e6,
         doppler_hz=1500.0,
         code_phase_ms=0.31,
@@ -142,7 +146,7 @@ SCENARIOS: tuple[TrackingScenario, ...] = (
         name="l5_noisy",
         family="L5",
         prn=7,
-        duration_ms=200,
+        duration_ms=400,
         samp_rate=25e6,
         doppler_hz=-2400.0,
         code_phase_ms=0.72,

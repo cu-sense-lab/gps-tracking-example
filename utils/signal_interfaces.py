@@ -53,6 +53,12 @@ class SignalDefinition:
     primary_period_ms: int
     discriminator_policy: tracking_channel.LoopDiscriminatorPolicy
 
+    # Applied once a tiered (overlay) code is synchronised and can be wiped off.
+    # `synced_coherent_periods` is how many primary code periods are then folded
+    # into one coherent accumulation.  Defaults leave behaviour unchanged for
+    # signals without an overlay.
+    synced_discriminator_policy: tracking_channel.LoopDiscriminatorPolicy | None = None
+    synced_coherent_periods: int = 1
 
     @property
     def component_names(self) -> tuple[str, ...]:
@@ -146,14 +152,20 @@ def _build_l5_definition(signal_id: str, prn: int) -> SignalDefinition:
     # NOTE: unlike the L1CA/L2C getters, these return float64 0/1 rather than int8.
     code_i = (1 - 2 * gps_l5.get_GPS_L5I_code_sequence(prn)).astype(np.int8)
     code_q = (1 - 2 * gps_l5.get_GPS_L5Q_code_sequence(prn)).astype(np.int8)
+    # Neuman-Hofman overlays: one overlay chip per primary code period (1 ms).
+    # NH10 rides on I, NH20 on Q.  Both advance on the same boundary, so a single
+    # counter mod lcm(10, 20) = 20 fixes both phases -- and because NH10's period
+    # is exactly the 10 ms CNAV symbol, locking it also gives symbol sync.
+    overlay_i = (1 - 2 * gps_l5.NEUMAN_HOFFMAN_SEQ_L5I).astype(np.int8)
+    overlay_q = (1 - 2 * gps_l5.NEUMAN_HOFFMAN_SEQ_L5Q).astype(np.int8)
     # I and Q share every chip -- they are separated by carrier phase, not
     # by time -- so both take one component chip per chip, at offset 0.
     # Correlating the complex baseband against each real code independently keeps
     # them apart; the inherent 90 degree relationship needs no special handling.
     code_set = build_code_set(
         [
-            CodeComponent(name="I", sequence=code_i),
-            CodeComponent(name="Q", sequence=code_q),
+            CodeComponent(name="I", sequence=code_i, overlay=overlay_i),
+            CodeComponent(name="Q", sequence=code_q, overlay=overlay_q),
         ]
     )
     return SignalDefinition(
@@ -191,6 +203,19 @@ def _build_l5_definition(signal_id: str, prn: int) -> SignalDefinition:
         discriminator_policy=tracking_channel.LoopDiscriminatorPolicy(
             carrier_component=1, code_components=(0, 1), costas=True
         ),
+        # Once NH is stripped, Q is genuinely dataless: the phase discriminator
+        # can use the full four-quadrant angle instead of wrapping at +/-1/4
+        # cycle, which is where the pilot's ~6 dB comes from.
+        #
+        # The delay discriminator drops to Q alone.  I is capped at 10 ms by its
+        # CNAV symbols, so over a 20 ms epoch it would partly cancel and drag the
+        # combined magnitude down rather than help.
+        synced_discriminator_policy=tracking_channel.LoopDiscriminatorPolicy(
+            carrier_component=1, code_components=(1,), costas=False
+        ),
+        # NH20's period. The loop update rate drops to 20 ms with it, so the loop
+        # filter is retuned at the same moment (see TrackingChannel).
+        synced_coherent_periods=20,
     )
 
 
@@ -261,6 +286,8 @@ def create_tracking_channels(
             initial_signal_state=initial_state,
             output_capacity=output_capacity,
             discriminator_policy=signal_def.discriminator_policy,
+            synced_policy=signal_def.synced_discriminator_policy,
+            synced_coherent_periods=signal_def.synced_coherent_periods,
         )
 
         adapter = TrackingChannelAdapter(signal_definition=signal_def, channel=channel)

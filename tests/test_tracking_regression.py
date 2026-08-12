@@ -21,6 +21,11 @@ deliberate and verified changes:
 Both were validated against explicitly constructed replicas in
 `tests/test_correlator.py` before the baseline was replaced.
 
+The L5 baselines were regenerated again when the tiered-code layer landed: those
+channels now synchronise their Neuman-Hofman overlay part-way through the run and
+switch to 20 ms coherent integration on the pilot.  L1 C/A and L2C were verified
+unchanged at that point -- with no overlay the fold uses unit signs and an epoch
+of one interval, which is arithmetically the previous behaviour.
 """
 
 from __future__ import annotations
@@ -83,11 +88,15 @@ def test_tracking_converges(scenario: TrackingScenario) -> None:
 
     assert float(actual["prompt_corr_circ_length"][-1]) > 0.9, "prompt phase not coherent"
 
-    # Prompt should dominate early/late for an aligned 0.5-chip EPL correlator.
-    prompt = actual["prompt_corr"][:, 0]
-    early = actual["early_corr"][:, 0]
-    late = actual["late_corr"][:, 0]
-    tail = slice(-500, None)
+    # Prompt should dominate early/late for an aligned 0.5-chip EPL correlator --
+    # on the component the loops actually run on.  That is not component 0 in
+    # general: L5 tracks its Q pilot, and its I component is data-limited past
+    # 10 ms, so I's correlators say nothing about lock quality.
+    component = int(actual["carrier_component"])
+    prompt = actual["prompt_corr"][:, component]
+    early = actual["early_corr"][:, component]
+    late = actual["late_corr"][:, component]
+    tail = slice(-min(500, len(prompt)), None)
     prompt_mag = np.abs(prompt[tail]).mean()
     assert prompt_mag > np.abs(early[tail]).mean(), "prompt not above early"
     assert prompt_mag > np.abs(late[tail]).mean(), "prompt not above late"

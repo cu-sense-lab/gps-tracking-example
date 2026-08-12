@@ -24,6 +24,7 @@ from scipy.constants import speed_of_light
 
 from utils import sample_streaming
 
+from . import secondary_code
 from .bpsk_correlation import correlate__multicomponent
 from .code_components import CodeSet, epl_delay_bins
 
@@ -137,17 +138,41 @@ class AlignedCorrelator:
 
     def __init__(self, config: DelayDopplerCorrelatorConfig, num_components: int):
         self.config = config
-        self.corr_grid = np.zeros(
-            (config.num_delays, config.num_dopplers, num_components), dtype=np.complex64
-        )
+        shape = (config.num_delays, config.num_dopplers, num_components)
+        # `corr_grid` holds one correlation interval -- for a signal with a tiered
+        # code, one primary code period.  `epoch_grid` is where those intervals are
+        # folded, sign-corrected, to build a longer coherent accumulation.  With no
+        # tiered code the fold is a plain copy of a single interval, so the two are
+        # equivalent and the epoch is one interval long.
+        self.corr_grid = np.zeros(shape, dtype=np.complex64)
+        self.epoch_grid = np.zeros(shape, dtype=np.complex64)
         # Every delay/doppler bin accumulates the same number of samples per call,
         # so a single running count is sufficient.
         self.corr_count = 0
+        self.epoch_count = 0
 
     def reset(self) -> None:
         self.corr_grid.fill(0.0)
         self.corr_count = 0
 
+    def reset_epoch(self) -> None:
+        self.epoch_grid.fill(0.0)
+        self.epoch_count = 0
+
+    def fold(self, signs: np.ndarray) -> None:
+        """
+        Add the finished interval into the epoch accumulator, wiping off the
+        tiered code by multiplying each component by its overlay chip.
+
+        Signs are +/-1 int8, so complex64 stays complex64 and a sign of +1 is
+        exact -- an un-synced or overlay-free signal folds bit-identically to a
+        plain accumulation.
+
+        Must only ever be called on a COMPLETE interval; folding a partially
+        accumulated one would corrupt the epoch with a short correlation.
+        """
+        self.epoch_grid += self.corr_grid * signs[None, None, :]
+        self.epoch_count += self.corr_count
 
     def accumulate(
         self,
@@ -357,6 +382,50 @@ def _wrap_cycles(cycles: float, half_range: float) -> float:
     return float(np.mod(cycles + half_range, period) - half_range)
 
 
+# A discrete loop stays well damped only while its noise bandwidth times its
+# update period stays small; the usual guidance is Bn*T <~ 0.25, with 0.1 leaving
+# comfortable margin.  Extending coherent integration multiplies T directly, so
+# this is the binding constraint on how far integration can be pushed.
+MAX_BANDWIDTH_TIME_PRODUCT = 0.1
+
+
+def _retune_for_update_period(
+    loop_params: TrackingLoopParameters,
+    update_period_ms: float,
+    max_bandwidth_time_product: float = MAX_BANDWIDTH_TIME_PRODUCT,
+) -> TrackingLoopParameters:
+    """
+    Rebuild the loop filter for a longer update period, narrowing bandwidths as
+    needed to keep it stable.
+
+    Two separate things have to happen when coherent integration is extended:
+
+    1. The gains must be recomputed, because all three are proportional to the
+       update period.  A 20 ms epoch driving gains built for 1 ms is a 20x
+       mistuning.
+    2. The bandwidths must be capped.  Holding a 20 Hz PLL across a 20 ms epoch
+       gives Bn*T = 0.4, well past the guideline, and the loop becomes
+       under-damped: it passes measurement noise straight into the estimates.
+       Measured on L5 at 20 ms, Doppler jitter grew from 0.022 to 0.102 Hz as
+       noise rose, while the capped loop held flat near 0.047 Hz.  (Coherent gain
+       itself is unaffected -- the loss is in the loop, not the accumulation.)
+
+    Narrowing is affordable precisely because the integration is longer: the
+    extra coherent gain is what pays for the reduced bandwidth.  Each loop is
+    capped independently, so a loop already slow enough is left alone.
+    """
+    update_period_sec = update_period_ms * 1e-3
+    bandwidth_cap_hz = max_bandwidth_time_product / update_period_sec
+    return TrackingLoopParameters(
+        DLL_bandwidth_hz=min(loop_params.DLL_bandwidth_hz, bandwidth_cap_hz),
+        PLL_bandwidth_hz=min(loop_params.PLL_bandwidth_hz, bandwidth_cap_hz),
+        FLL_bandwidth_hz=min(loop_params.FLL_bandwidth_hz, bandwidth_cap_hz),
+        nominal_update_period_ms=update_period_ms,
+        corr_period_ms=loop_params.corr_period_ms,
+        EPL_chip_spacing=loop_params.EPL_chip_spacing,
+        prompt_corr_circ_length_threshold=loop_params.prompt_corr_circ_length_threshold,
+    )
+
 
 class TrackingChannel:
     """
@@ -374,6 +443,8 @@ class TrackingChannel:
         output_capacity: int = 60000,
         discriminator_policy: LoopDiscriminatorPolicy | None = None,
         correlator_config: DelayDopplerCorrelatorConfig | None = None,
+        synced_policy: LoopDiscriminatorPolicy | None = None,
+        synced_coherent_periods: int = 1,
     ) -> None:
         self.loop_params = loop_params
         self.signal_params = signal_params
@@ -409,13 +480,40 @@ class TrackingChannel:
         )
 
         # Weights for non-coherent code combining, aligned to policy.code_components.
-        self._code_weights = signal_params.code_set.power_weights[
-            list(self.policy.code_components)
-        ]
+        self._set_policy(self.policy)
+
+        # --- tiered (overlay) code state -------------------------------------
+        # Until the overlay is synced the channel folds one interval per epoch
+        # with unit signs, which is arithmetically identical to having no overlay
+        # at all -- so signals without one are completely unaffected.
+        self._overlays = tuple(c.overlay for c in signal_params.code_set.components)
+        self.overlay_sync = secondary_code.build_synchroniser(
+            self._overlays, reference_index=self.policy.carrier_component
+        )
+        self.coherent_periods = 1
+        self._epoch_interval_count = 0
+        self._unit_signs = np.ones(num_components, dtype=np.int8)
+        self._synced_policy = synced_policy
+        self._synced_coherent_periods = synced_coherent_periods
+        # Loop gains scale with the update period, so extending the coherent
+        # accumulation demands a retuned filter.  Built up front to keep the
+        # transition free of allocation and surprises.
+        self._synced_loop_params = (
+            _retune_for_update_period(
+                loop_params, synced_coherent_periods * signal_params.primary_period_ms
+            )
+            if synced_coherent_periods > 1
+            else loop_params
+        )
 
         # Hidden option/flag variables
         self._ignore_loop_updates = False
 
+    def _set_policy(self, policy: LoopDiscriminatorPolicy) -> None:
+        self.policy = policy
+        self._code_weights = self.signal_params.code_set.power_weights[
+            list(policy.code_components)
+        ]
 
     def _combine_code_magnitude(self, corr_vector: np.ndarray) -> float:
         """
@@ -427,6 +525,29 @@ class TrackingChannel:
         selected = corr_vector[list(self.policy.code_components)]
         return float(np.sqrt(np.sum(self._code_weights * np.abs(selected) ** 2)))
 
+    def _on_overlay_synced(self) -> None:
+        """
+        Switch to pilot tracking now that the tiered code can be stripped.
+
+        Two things change together and must stay together: the coherent
+        accumulation lengthens to `coherent_periods`, and the loop filter is
+        retuned for that slower update rate.  Applying one without the other
+        mistunes every loop by the same factor.
+
+        The discriminator can also drop Costas wrapping at this point -- with the
+        overlay removed a pilot really is dataless, so the full four-quadrant
+        angle is available and the squaring loss goes away.
+        """
+        self.coherent_periods = self._synced_coherent_periods
+        self.loop_params = self._synced_loop_params
+        if self._synced_policy is not None:
+            self._set_policy(self._synced_policy)
+
+        # Whatever is part-way through the epoch was folded without wipe-off, so
+        # mixing it into the first coherent accumulation would partly cancel it.
+        # Start the first wiped-off epoch clean.
+        self.correlator.reset_epoch()
+        self._epoch_interval_count = 0
 
     def run_loop_filter(self) -> None:
         # Update signal state to reflect parameters at current correlation epoch
@@ -435,8 +556,9 @@ class TrackingChannel:
 
         # Grid is (delay, doppler, component); assume a single doppler for now.
         # Keep the full component vectors for output, and drive the loops with the
-        # components the policy selects.
-        early_all, prompt_all, late_all = self.correlator.corr_grid[:, 0]
+        # components the policy selects.  The epoch grid is the folded, overlay
+        # wiped-off accumulation -- one interval long until the overlay syncs.
+        early_all, prompt_all, late_all = self.correlator.epoch_grid[:, 0]
         prompt = prompt_all[self.policy.carrier_component]
 
         # Compute loop discriminators
@@ -537,6 +659,41 @@ class TrackingChannel:
             self.outputs.prompt_corr_circ_length[idx] = circ_length
             self.outputs.output_index += 1
 
+    def _complete_interval(self) -> None:
+        """
+        Fold one finished correlation interval into the epoch, and run the loop
+        filter once the epoch is full.
+
+        This is the whole of the tiered-code machinery, and it sits *on top of*
+        the interval logic rather than inside it: the PARTIAL/COMPLETE handling in
+        `process_sample_buffer` is untouched, and only ever hands complete
+        intervals here.  A signal with no overlay folds with unit signs and an
+        epoch of one interval, which is arithmetically the old behaviour.
+        """
+        if self.overlay_sync is None:
+            signs = self._unit_signs
+        else:
+            # Feed the synchroniser the raw prompt, before wipe-off: it is looking
+            # for the overlay's own sign pattern, which wipe-off would remove.
+            # Gated on PLL lock, because an un-locked carrier leaves the prompts
+            # rotating and the correlation meaningless.
+            if not self.overlay_sync.synced and self.loop_state.mode is TrackingLoopMode.PLL:
+                prompt = self.correlator.corr_grid[1, 0, self.policy.carrier_component]
+                if self.overlay_sync.observe(complex(prompt)):
+                    self._on_overlay_synced()
+            # Signs are read *after* a possible sync so that the interval which
+            # triggered it is itself wiped off correctly, rather than folded raw
+            # into the freshly reset epoch.
+            signs = self.overlay_sync.signs(self._overlays)
+            self.overlay_sync.advance()
+
+        self.correlator.fold(signs)
+        self._epoch_interval_count += 1
+
+        if self._epoch_interval_count >= self.coherent_periods:
+            self.run_loop_filter()
+            self.correlator.reset_epoch()
+            self._epoch_interval_count = 0
 
     def process_sample_buffer(self, buffer: sample_streaming.SampleBuffer) -> None:
         while True:
@@ -572,7 +729,7 @@ class TrackingChannel:
                 # accumulates nothing; skip it rather than running the loop filter on zeros.
                 if self.correlator.corr_count > 0:
                     self.correlator_status = CorrelatorStatus.COMPLETE
-                    self.run_loop_filter()
+                    self._complete_interval()
 
                 self.corr_interval.increment()
                 self.correlator.reset()

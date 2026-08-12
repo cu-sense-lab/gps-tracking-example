@@ -99,6 +99,11 @@ def _build_channel(scenario: TrackingScenario):
         initial_signal_state=initial_state,
         output_capacity=scenario.duration_ms // BLOCK_DURATION_MS + 16,
         discriminator_policy=signal_def.discriminator_policy,
+        # Must mirror create_tracking_channels, or the goldens would silently
+        # cover a different configuration than the notebook runs: overlay
+        # wipe-off without the extended integration and policy switch it enables.
+        synced_policy=signal_def.synced_discriminator_policy,
+        synced_coherent_periods=signal_def.synced_coherent_periods,
     )
 
 
@@ -137,4 +142,8 @@ def run_scenario(scenario: TrackingScenario) -> dict[str, np.ndarray]:
     result = {name: np.asarray(getattr(outputs, name))[:count] for name in OUTPUT_FIELDS}
     result["output_index"] = np.asarray(count)
     result["final_mode"] = np.asarray(channel.loop_state.mode.name)
+    # Which component the loops actually ran on. Not component 0 in general: L5
+    # tracks the Q pilot, and its I component is data-limited so its correlators
+    # say nothing about lock quality.
+    result["carrier_component"] = np.asarray(channel.policy.carrier_component)
     return result

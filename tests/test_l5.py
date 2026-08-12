@@ -359,9 +359,150 @@ def test_acquisition_seeds_tracking_to_convergence():
     assert abs(final_doppler_error) < 5.0, f"Doppler did not converge: {final_doppler_error:+.2f} Hz"
     assert adapter.channel.loop_state.mode is tracking_channel.TrackingLoopMode.PLL
 
-    # I and Q are equal power, so their prompts should be comparable.
+    # I and Q are equal power, so while both are integrated over the same 1 ms
+    # they should be comparable.  Measured before overlay sync, since afterwards
+    # Q integrates over 20 ms while I is capped at 10 ms by its CNAV symbols --
+    # see test_data_component_cannot_be_integrated_past_its_symbol.
     early_epochs = slice(20, 60)
     prompt_i = np.abs(outputs.prompt_corr[early_epochs, 0]).mean()
     prompt_q = np.abs(outputs.prompt_corr[early_epochs, 1]).mean()
     assert prompt_i > 0 and prompt_q > 0
     assert 0.5 < prompt_i / prompt_q < 2.0, f"I/Q imbalance: {prompt_i:.0f} vs {prompt_q:.0f}"
+
+
+# --------------------------------------------------------------------------
+# Overlay wipe-off and extended coherent integration
+# --------------------------------------------------------------------------
+
+def _track_until_synced(noise_sigma=3.0, buffers=14, buffer_ms=50, seed=4):
+    """Acquire, then track long enough for the overlay to lock."""
+    from utils import sample_streaming, tracking_channel
+    from utils.signal_interfaces import create_tracking_channels
+
+    true_doppler_hz, code_phase_ms = 1500.0, 0.31
+    definitions = build_signal_definitions(SignalFamily.L5, prns=[PRN])
+    config = bpsk_acquisition.AcquisitionConfiguration(
+        replica_duration_ms=1, num_blocks=20, sample_rate=SAMP_RATE,
+        min_search_doppler_hz=-5000, max_search_doppler_hz=5000,
+    )
+    rng = np.random.default_rng(seed)
+    acq = bpsk_acquisition.run_acquisition(
+        sample_block=synthetic.generate_l5_samples(
+            prn=PRN, start_sec=0.0, duration_sec=config.acq_total_duration_ms * 1e-3,
+            samp_rate=SAMP_RATE, doppler_hz=true_doppler_hz,
+            code_phase_ms=code_phase_ms, noise_sigma=noise_sigma, rng=rng),
+        sample_block_uptime_epoch_ms=0.0, acq_config=config,
+        code_parameters=build_acquisition_code_params(definitions),
+        prob_false_alaram=1e-7, noise_var_method="abscorrvar",
+        half_bin_doppler_search=True,
+    )[f"G{PRN:02d}"]
+    assert acq.signal_detected
+
+    loop_params = tracking_channel.TrackingLoopParameters(
+        DLL_bandwidth_hz=2.0, PLL_bandwidth_hz=20.0, FLL_bandwidth_hz=50.0,
+        nominal_update_period_ms=1, corr_period_ms=1, EPL_chip_spacing=0.5,
+    )
+    adapter = create_tracking_channels(
+        signal_definitions=definitions, acquisition_results={f"G{PRN:02d}": acq},
+        tracking_signal_ids=[f"G{PRN:02d}"], loop_params=loop_params,
+        output_capacity=4000,
+    )[f"G{PRN:02d}"]
+
+    synced_at_epoch = None
+    for i in range(buffers):
+        was_synced = adapter.channel.overlay_sync.synced
+        adapter.process_sample_buffer(sample_streaming.SampleBuffer(
+            samples=synthetic.generate_l5_samples(
+                prn=PRN, start_sec=i * buffer_ms * 1e-3, duration_sec=buffer_ms * 1e-3,
+                samp_rate=SAMP_RATE, doppler_hz=true_doppler_hz,
+                code_phase_ms=code_phase_ms, noise_sigma=noise_sigma, rng=rng),
+            start_uptime_ms=i * buffer_ms, samp_rate=SAMP_RATE))
+        if not was_synced and adapter.channel.overlay_sync.synced and synced_at_epoch is None:
+            synced_at_epoch = adapter.outputs.output_index
+    return adapter, synced_at_epoch, true_doppler_hz
+
+
+def test_overlay_syncs_and_switches_to_pilot_tracking():
+    adapter, synced_at, _ = _track_until_synced()
+    channel = adapter.channel
+
+    assert channel.overlay_sync.synced, "overlay never locked"
+    assert synced_at is not None
+    assert channel.overlay_sync.confidence > 2.0
+
+    # Everything that must move together at the transition.
+    assert channel.coherent_periods == 20, "coherent accumulation did not extend"
+    assert channel.policy.costas is False, "pilot should drop Costas wrapping"
+    assert channel.policy.code_components == (1,), "delay discriminator should be Q only"
+    assert channel.loop_params.nominal_update_period_ms == 20, "loop filter not retuned"
+
+
+def test_wipe_off_gives_n_fold_coherent_gain():
+    """
+    The point of the whole layer.  Folding 20 primary periods coherently must
+    multiply the prompt by ~20, not by sqrt(20) -- the latter is what you would
+    get if the overlay signs were wrong and the folds added incoherently.
+    """
+    adapter, synced_at, _ = _track_until_synced(noise_sigma=0.0)
+    outputs = adapter.outputs
+    count = outputs.output_index
+
+    # Stay clear of the transition on both sides.
+    before = np.abs(outputs.prompt_corr[synced_at - 40 : synced_at - 2, 1]).mean()
+    after = np.abs(outputs.prompt_corr[count - 15 : count, 1]).mean()
+
+    gain = after / before
+    assert gain == pytest.approx(20.0, rel=0.05), f"expected ~20x, got {gain:.1f}x"
+    assert gain > 2 * np.sqrt(20), "gain is incoherent -- overlay signs are wrong"
+
+
+def test_coherent_gain_holds_across_noise_levels():
+    for noise_sigma in (0.0, 2.0, 4.0):
+        adapter, synced_at, _ = _track_until_synced(noise_sigma=noise_sigma)
+        outputs = adapter.outputs
+        count = outputs.output_index
+        before = np.abs(outputs.prompt_corr[synced_at - 40 : synced_at - 2, 1]).mean()
+        after = np.abs(outputs.prompt_corr[count - 15 : count, 1]).mean()
+        assert after / before == pytest.approx(20.0, rel=0.1), (
+            f"sigma={noise_sigma}: gain {after/before:.1f}x"
+        )
+
+
+def test_tracking_still_converges_after_the_switch():
+    adapter, _, true_doppler_hz = _track_until_synced()
+    outputs = adapter.outputs
+    count = outputs.output_index
+    final_error = outputs.doppler_freq_hz[count - 1] - true_doppler_hz
+    assert abs(final_error) < 5.0, f"Doppler diverged after switch: {final_error:+.2f} Hz"
+
+
+def test_extending_integration_narrows_the_loops():
+    """
+    A discrete loop needs Bn*T well under ~0.25.  Extending the epoch 20x
+    multiplies T by 20, so the bandwidths must come down or the loop turns
+    under-damped and passes measurement noise into the estimates.
+    """
+    adapter, _, _ = _track_until_synced()
+    params = adapter.channel.loop_params
+    update_period_sec = params.nominal_update_period_ms * 1e-3
+    for bandwidth_hz in (
+        params.PLL_bandwidth_hz, params.DLL_bandwidth_hz, params.FLL_bandwidth_hz
+    ):
+        assert bandwidth_hz * update_period_sec <= 0.1 + 1e-9
+
+
+def test_data_component_cannot_be_integrated_past_its_symbol():
+    """
+    Why the post-sync delay discriminator drops to Q alone: L5I carries 100 sps
+    CNAV symbols, so a 20 ms epoch spans two of them and they partly cancel.  Q,
+    being a true pilot once NH is stripped, keeps growing.
+    """
+    adapter, _, _ = _track_until_synced(noise_sigma=0.0)
+    outputs = adapter.outputs
+    count = outputs.output_index
+    tail = slice(count - 15, count)
+    prompt_i = np.abs(outputs.prompt_corr[tail, 0]).mean()
+    prompt_q = np.abs(outputs.prompt_corr[tail, 1]).mean()
+    assert prompt_q > 2 * prompt_i, (
+        f"expected the pilot to dominate over 20 ms, got I={prompt_i:.0f} Q={prompt_q:.0f}"
+    )
