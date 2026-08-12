@@ -8,6 +8,7 @@ import numpy as np
 
 import gnss_tools.signals.gps_l1ca as gps_l1ca
 import gnss_tools.signals.gps_l2c as gps_l2c
+import gnss_tools.signals.gps_l5 as gps_l5
 
 from . import bpsk_acquisition
 from . import sample_streaming
@@ -18,6 +19,7 @@ from .code_components import CodeComponent, CodeSet, build_code_set
 class SignalFamily(StrEnum):
     L1CA = "L1CA"
     L2C = "L2C"
+    L5 = "L5"
 
 
 @dataclass(frozen=True)
@@ -140,9 +142,62 @@ def _build_l2c_definition(signal_id: str, prn: int) -> SignalDefinition:
     )
 
 
+def _build_l5_definition(signal_id: str, prn: int) -> SignalDefinition:
+    # NOTE: unlike the L1CA/L2C getters, these return float64 0/1 rather than int8.
+    code_i = (1 - 2 * gps_l5.get_GPS_L5I_code_sequence(prn)).astype(np.int8)
+    code_q = (1 - 2 * gps_l5.get_GPS_L5Q_code_sequence(prn)).astype(np.int8)
+    # I and Q share every chip -- they are separated by carrier phase, not
+    # by time -- so both take one component chip per chip, at offset 0.
+    # Correlating the complex baseband against each real code independently keeps
+    # them apart; the inherent 90 degree relationship needs no special handling.
+    code_set = build_code_set(
+        [
+            CodeComponent(name="I", sequence=code_i),
+            CodeComponent(name="Q", sequence=code_q),
+        ]
+    )
+    return SignalDefinition(
+        signal_id=signal_id,
+        family=SignalFamily.L5,
+        carrier_freq_hz=gps_l5.CARRIER_FREQ,
+        # Acquire on the Q (pilot) component.  At 1 ms coherent integration the two
+        # perform identically -- Q's Neuman-Hofman overlay flips sign every 1 ms
+        # just as I's CNAV symbols do -- but acquiring on the component that will
+        # ultimately drive the loops keeps the code phase reference consistent.
+        acquisition_code_rate_chips_per_sec=gps_l5.CODE_RATE,
+        acquisition_code_length_chips=gps_l5.PRIMARY_CODE_LENGTH,
+        acquisition_code_sequence=code_q,
+        acquisition_is_interleaved=False,
+        code_set=code_set,
+        tracking_code_rate_chips_per_sec=gps_l5.CODE_RATE,
+        # 10230 chips at 10.23 Mcps.  Exactly the interval granularity the aligned
+        # correlator already uses, which is what makes tiered-code wipe-off cheap
+        # to add later.
+        primary_period_ms=1,
+        # Carrier runs on Q, the pilot.  The plan had this on I pre-sync, but
+        # starting on Q avoids a 90 degree phase discontinuity when Neuman-Hofman
+        # sync later switches the loops to the pilot -- I and Q are in quadrature,
+        # so swapping the carrier component mid-track would force the PLL to
+        # re-pull.  At 1 ms the two are equally noisy, so there is no cost.
+        #
+        # Costas stays True until the overlay is stripped: NH20 flips Q's sign
+        # every 1 ms, so the pilot is not yet effectively dataless.  Switching to
+        # a full atan2 discriminator is what earns L5 its ~6 dB, and that arrives
+        # with the tiered-code layer.
+        #
+        # The delay discriminator combines I and Q non-coherently.  They are equal
+        # power, so this is worth ~3 dB and costs nothing: overlay and data flips
+        # cancel in the magnitudes.
+        discriminator_policy=tracking_channel.LoopDiscriminatorPolicy(
+            carrier_component=1, code_components=(0, 1), costas=True
+        ),
+    )
+
+
 _DEFINITION_BUILDERS = {
     SignalFamily.L1CA: _build_l1ca_definition,
     SignalFamily.L2C: _build_l2c_definition,
+    SignalFamily.L5: _build_l5_definition,
 }
 
 

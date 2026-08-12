@@ -52,7 +52,7 @@ class AcqSignalCodeParameters:
     sequence: NDArray[np.int8]
     # True for signals where `sequence` is one component of a chip-interleaved
     # pair (e.g. L2C's CM/CL). The replica is zero-filled on the other
-    # component's chip slots rather than holding this component's chip value
+    # component's chips rather than holding this component's chip value
     # across both, so it doesn't spuriously correlate against the other code.
     is_interleaved: bool = False
 
@@ -103,11 +103,16 @@ class AcquisitionResult:
     signal_detected: bool
     correlation_result: CorrelationResult
     config: AcquisitionConfiguration
+    # Sub-bin refinement, in Hz, from the half-bin Doppler search.  Zero when the
+    # peak came from the plain integer-bin pass (and for all signals when the
+    # search is disabled).
+    doppler_offset_hz: float = 0.0
 
     @property
     def acq_doppler_hz(self) -> float:
         return (
             self.config.doppler_search_bins[self.peak_doppler_bin] * self.config.fft_resolution
+            + self.doppler_offset_hz
         )
 
     @property
@@ -126,6 +131,7 @@ def run_acquisition(
     print_progress: bool = False,
     noise_var_method: str = "abscorrmean",
     save_corr_peak_window_chips: Optional[float] = None,
+    half_bin_doppler_search: bool = False,
 ) -> Dict[str, AcquisitionResult]:
     """
     Perform BPSK acquisition on the given sample block for all signals defined in code_parameters.
@@ -138,6 +144,16 @@ def run_acquisition(
     Options for noise variance estimation:
         "abscorrmean": compute noise variance from the mean of abs(corr)**2 matrix
         "abscorrvar": compute noise variance from the square root of the variance of abs(corr)**2 matrix
+
+    `half_bin_doppler_search` repeats the search with the samples shifted down by
+    half a Doppler bin and keeps whichever pass peaks higher, halving the
+    worst-case Doppler error at twice the cost.  It matters when the coherent
+    integration length -- and therefore the bin width `1 / T_coherent` -- is
+    forced short.  GPS L5 is the case in point: its Neuman-Hofman overlay caps
+    coherent integration at 1 ms, giving 1000 Hz bins and up to +/-500 Hz of
+    seeding error, while a 1 ms FLL discriminator is only unambiguous to
+    +/-250 Hz.  Without this the tracking loop can be handed an error it cannot
+    resolve.
     """
     acquisition_results: Dict[str, AcquisitionResult] = {}
 
@@ -146,8 +162,20 @@ def run_acquisition(
     M = acq_config.num_blocks
     N = acq_config.block_size_samples
     samples = sample_block[: M * N].reshape((M, N))
-    # Compute conjugated FFT of blocks
-    conj_samples_fft = np.conj(np.fft.fft(samples, axis=1))
+    # Compute conjugated FFT of blocks, once per sub-bin Doppler hypothesis.
+    # Blocks are combined non-coherently below, so applying the same phase ramp
+    # from the start of each block (rather than from the start of the capture) is
+    # sufficient -- only the frequency shift within a block matters.
+    sub_bin_offsets_hz = [0.0]
+    conj_sample_ffts = [np.conj(np.fft.fft(samples, axis=1))]
+    if half_bin_doppler_search:
+        half_bin_hz = 0.5 * acq_config.fft_resolution
+        block_time_arr = np.arange(N) / acq_config.sample_rate
+        shifted_samples = samples * np.exp(-2j * np.pi * half_bin_hz * block_time_arr)[None, :]
+        conj_sample_ffts.append(np.conj(np.fft.fft(shifted_samples, axis=1)))
+        # Mixing the samples down by half a bin makes the signal appear that much
+        # lower, so the recovered Doppler is the bin centre plus the offset.
+        sub_bin_offsets_hz.append(half_bin_hz)
 
     for signal_id, code_params in code_parameters.items():
 
@@ -164,16 +192,16 @@ def run_acquisition(
             )
             if code_params.is_interleaved:
                 # Physical chip clock runs at 2x this component's own rate, alternating
-                # between this component's chips (even slots) and the other component's
-                # (odd slots). Zero-fill the odd slots so the replica only correlates
+                # between this component's chips (even chips) and the other's
+                # (odd ones). Zero-fill those so the replica only correlates
                 # against its own component, instead of smearing across both.
                 physical_chip_idx = (
                     acq_config.replica_time_arr * 2.0 * code_params.rate_chips_per_sec
                 ).astype(int)
-                own_slot = physical_chip_idx % 2 == 0
+                own_signal_chip = physical_chip_idx % 2 == 0
                 own_chip_indices = (physical_chip_idx // 2) % code_params.length_chips
                 replica_values = np.where(
-                    own_slot, code_params.sequence[own_chip_indices], 0
+                    own_signal_chip, code_params.sequence[own_chip_indices], 0
                 )
             else:
                 chips_arr = (
@@ -189,32 +217,40 @@ def run_acquisition(
             acq_config.replica_cache_dict[signal_id] = replica_entry
 
         doppler_search_bins = acq_config.doppler_search_bins
-        correlation = np.zeros(
-            (len(doppler_search_bins), N)
-        )
 
-        for i, roll in enumerate(doppler_search_bins):
-            # coherent integration over N samples; z_noise ~ CN(0, N*noise_var)
-            # shifted_samples_fft = np.roll(samples_fft, -roll, axis=1)
-            # corr = np.fft.ifft(
-            #     np.conj(shifted_samples_fft) * replica_samples_fft[None, :]
-            # )
+        # Search each sub-bin Doppler hypothesis and keep whichever peaks highest.
+        # With the half-bin search disabled there is exactly one hypothesis and
+        # this reduces to the original single pass.
+        correlation = None
+        peak_doppler_bin = peak_sample_bin = 0
+        peak_val = -np.inf
+        doppler_offset_hz = 0.0
 
-            shifted_replica_fft = np.roll(replica_samples_fft, roll)
-            corr = np.fft.ifft(
-                conj_samples_fft * shifted_replica_fft[None, :]
+        for conj_samples_fft, sub_bin_offset_hz in zip(conj_sample_ffts, sub_bin_offsets_hz):
+            pass_correlation = np.zeros((len(doppler_search_bins), N))
+
+            for i, roll in enumerate(doppler_search_bins):
+                # coherent integration over N samples; z_noise ~ CN(0, N*noise_var)
+                shifted_replica_fft = np.roll(replica_samples_fft, roll)
+                corr = np.fft.ifft(
+                    conj_samples_fft * shifted_replica_fft[None, :]
+                )
+                # non-coherent square-law summation over M blocks, normalized by N
+                # y_noise / noise_var ~ ChiSquared(2M)
+                pass_correlation[i] = np.sum(1 / N * np.abs(corr) ** 2, axis=0)
+
+            pass_doppler_bin_idx, pass_sample_bin_idx = np.unravel_index(
+                pass_correlation.argmax(), pass_correlation.shape
             )
-            # non-coherent square-law summation over M blocks, normalized by N
-            # y_noise / noise_var ~ ChiSquared(2M)
-            correlation[i] = np.sum(1 / N * np.abs(corr) ** 2, axis=0)
+            pass_peak_val = pass_correlation[pass_doppler_bin_idx, pass_sample_bin_idx]
+            if pass_peak_val > peak_val:
+                correlation = pass_correlation
+                peak_doppler_bin = int(pass_doppler_bin_idx)
+                peak_sample_bin = int(pass_sample_bin_idx)
+                peak_val = float(pass_peak_val)
+                doppler_offset_hz = sub_bin_offset_hz
 
-        # Find acquisition peak
-        peak_doppler_bin_idx, peak_sample_bin_idx = np.unravel_index(
-            correlation.argmax(), correlation.shape
-        )
-        peak_doppler_bin = int(peak_doppler_bin_idx)
-        peak_sample_bin = int(peak_sample_bin_idx)
-        peak_val = correlation[peak_doppler_bin, peak_sample_bin]
+        assert correlation is not None  # at least one hypothesis is always searched
 
         # Estimate noise distribution
         # y_noise = X * noise_var
@@ -236,6 +272,11 @@ def run_acquisition(
         detection_threshold = chi2.isf(prob_false_alaram)
         signal_detected = normalized_peak_value > detection_threshold
 
+        # The reported Doppler axis belongs to the winning pass, so it carries the
+        # same sub-bin offset as the peak.
+        start_doppler_hz = (
+            acq_config.doppler_search_bins[0] * acq_config.fft_resolution + doppler_offset_hz
+        )
         if save_corr_peak_window_chips is not None:
             half_window_size_samples = int(
                 save_corr_peak_window_chips / code_params.rate_chips_per_sec * acq_config.sample_rate
@@ -244,7 +285,7 @@ def run_acquisition(
             i1 = min(N, peak_sample_bin + half_window_size_samples)
             corr_result = CorrelationResult(
                 correlation[:, i0:i1],
-                acq_config.doppler_search_bins[0] * acq_config.fft_resolution,
+                start_doppler_hz,
                 acq_config.fft_resolution,
                 i0 / acq_config.sample_rate,
                 1 / acq_config.sample_rate,
@@ -252,7 +293,7 @@ def run_acquisition(
         else:
             corr_result = CorrelationResult(
                 correlation,
-                acq_config.doppler_search_bins[0] * acq_config.fft_resolution,
+                start_doppler_hz,
                 acq_config.fft_resolution,
                 0.0,
                 1 / acq_config.sample_rate,
@@ -270,6 +311,7 @@ def run_acquisition(
             signal_detected,
             corr_result,
             acq_config,
+            doppler_offset_hz=doppler_offset_hz,
         )
 
         acquisition_results[signal_id] = acq_result

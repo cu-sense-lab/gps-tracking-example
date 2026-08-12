@@ -17,7 +17,7 @@ from dataclasses import dataclass
 @dataclass(frozen=True)
 class TrackingScenario:
     name: str
-    family: str  # "L1CA" | "L2C"
+    family: str  # "L1CA" | "L2C" | "L5"
     prn: int
     duration_ms: int
     samp_rate: float
@@ -105,6 +105,53 @@ SCENARIOS: tuple[TrackingScenario, ...] = (
         noise_sigma=3.0,
         nav_bits=True,
         rng_seed=1,
+    ),
+    # L5 runs at 25 Msps (10.23 Mcps needs >=2 samples/chip), so these are kept
+    # short: 200 ms is ~5x the samples of a 2 s L1 C/A run.  Doppler seeding
+    # errors reflect the half-bin acquisition search, whose worst case is 250 Hz
+    # -- the edge of a 1 ms FLL's unambiguous range.
+    TrackingScenario(
+        name="l5_clean",
+        family="L5",
+        prn=1,
+        duration_ms=200,
+        samp_rate=25e6,
+        doppler_hz=1500.0,
+        code_phase_ms=0.31,
+        doppler_error_hz=0.0,
+        code_error_chips=0.0,
+        noise_sigma=0.0,
+        nav_bits=False,
+        buffer_duration_ms=50,
+    ),
+    TrackingScenario(
+        name="l5_navbits_seeded",
+        family="L5",
+        prn=1,
+        duration_ms=200,
+        samp_rate=25e6,
+        doppler_hz=1500.0,
+        code_phase_ms=0.31,
+        doppler_error_hz=250.0,
+        code_error_chips=0.25,
+        noise_sigma=0.0,
+        nav_bits=True,
+        buffer_duration_ms=50,
+    ),
+    TrackingScenario(
+        name="l5_noisy",
+        family="L5",
+        prn=7,
+        duration_ms=200,
+        samp_rate=25e6,
+        doppler_hz=-2400.0,
+        code_phase_ms=0.72,
+        doppler_error_hz=125.0,
+        code_error_chips=0.5,
+        noise_sigma=3.0,
+        nav_bits=True,
+        rng_seed=5,
+        buffer_duration_ms=50,
     ),
 )
 

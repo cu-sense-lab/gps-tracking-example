@@ -16,6 +16,7 @@ import numpy as np
 
 import gnss_tools.signals.gps_l1ca as gps_l1ca
 import gnss_tools.signals.gps_l2c as gps_l2c
+import gnss_tools.signals.gps_l5 as gps_l5
 
 from utils import sample_streaming
 from utils import tracking_channel
@@ -39,11 +40,13 @@ LOOP_KWARGS = dict(
 _FAMILY_CONSTANTS = {
     "L1CA": (gps_l1ca.CARRIER_FREQ, gps_l1ca.CODE_RATE),
     "L2C": (gps_l2c.CARRIER_FREQ, gps_l2c.CODE_RATE_L2CLM),
+    "L5": (gps_l5.CARRIER_FREQ, gps_l5.CODE_RATE),
 }
 
 _FAMILY_GENERATORS = {
     "L1CA": synthetic.generate_l1ca_samples,
     "L2C": synthetic.generate_l2c_samples,
+    "L5": synthetic.generate_l5_samples,
 }
 
 OUTPUT_FIELDS = (
