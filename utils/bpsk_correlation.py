@@ -2,159 +2,118 @@ import numpy as np
 import numba as nb
 from numpy.typing import NDArray
 
-@nb.jit(nopython=True, parallel=False)
-def numba_correlate__bpsk__complex64(
-        samples: nb.complex64[:],  # type: ignore
-        code_seq: nb.int8[:],  # type: ignore
-        code_length: nb.int32,  # type: ignore
-        chip_start: nb.float32,  # type: ignore
-        chip_delta: nb.float32,  # type: ignore
-        num_bins: nb.int32,  # type: ignore
-        chip_bin_offset: nb.float32,  # type: ignore
-        chip_bin_spacing: nb.float32,  # type: ignore
-        conj_carr_sample: nb.complex64,  # type: ignore
-        conj_carr_rotation: nb.complex64,  # type: ignore
-        corr_values: nb.complex64[:]  # type: ignore
-    ) -> None:
-    
-    num_samples = len(samples)
-    center_chip = chip_start
-    for i in range(num_samples):
-        carrierless = samples[i] * conj_carr_sample
-        for j in range(num_bins):
-            symbol = code_seq[int(center_chip + chip_bin_offset + j * chip_bin_spacing) % code_length]
-            if symbol == 1:
-                corr_values[j] += carrierless
-            elif symbol == -1:
-                corr_values[j] -= carrierless
-            elif symbol != 0:
-                corr_values[j] += carrierless * symbol
-        conj_carr_sample *= conj_carr_rotation
-        center_chip += chip_delta
-
-
-def correlate__delay(
-    samples: np.ndarray,
-    samp_rate: float,
-    initial_carr_phase_cycles: float,
-    doppler_freq_hz: float,
-    code_seq: np.ndarray,
-    code_length_chips: int,
-    code_rate_chips_per_sec: float,
-    initial_code_phase_chips: float,
-    num_chip_bins: int,
-    chip_bin_offset: float,
-    chip_bin_spacing: float,
-    output: NDArray[np.complex64]
-) -> None:
-
-    chip_start = initial_code_phase_chips % code_length_chips
-    chip_delta = code_rate_chips_per_sec / samp_rate  # chips per sample
-
-    conj_carr_sample = np.exp(-2j * np.pi * initial_carr_phase_cycles)
-    conj_carr_rotation = np.exp(-2j * np.pi * doppler_freq_hz / samp_rate)
-
-    numba_correlate__bpsk__complex64(
-        samples,
-        code_seq,
-        code_length_chips,
-        chip_start,
-        chip_delta,
-        num_chip_bins,
-        chip_bin_offset,
-        chip_bin_spacing,
-        conj_carr_sample,
-        conj_carr_rotation,
-        output
-    )
+from .code_components import CodeSet
 
 
 @nb.jit(nopython=True, parallel=False)
-def numba_correlate__interleaved_bpsk__complex64(
+def numba_correlate__multicomponent__complex64(
         samples: nb.complex64[:],  # type: ignore
-        code_seq_0: nb.int8[:],  # type: ignore
-        code_seq_1: nb.int8[:],  # type: ignore
-        code_length_0: nb.int32,  # type: ignore
-        code_length_1: nb.int32,  # type: ignore
-        chip_start: nb.float32,  # type: ignore
-        chip_delta: nb.float32,  # type: ignore
-        num_bins: nb.int32,  # type: ignore
-        chip_bin_offset: nb.float32,  # type: ignore
-        chip_bin_spacing: nb.float32,  # type: ignore
+        codes_flat: nb.int8[:],  # type: ignore
+        component_code_start_indices: nb.int64[:],  # type: ignore
+        component_code_lengths: nb.int64[:],  # type: ignore
+        chips_per_component_chip: nb.int64[:],  # type: ignore
+        component_offset_chips: nb.int64[:],  # type: ignore
+        initial_code_phase_chips: nb.float64,  # type: ignore
+        chips_per_sample: nb.float64,  # type: ignore
+        bin_offsets_chips: nb.float64[:],  # type: ignore
         conj_carr_sample: nb.complex64,  # type: ignore
         conj_carr_rotation: nb.complex64,  # type: ignore
         corr_values: nb.complex64[:, :]  # type: ignore
     ) -> None:
-    
+    """
+    Accumulate one correlation interval for every (delay bin, code component) pair.
+
+    Component `c` is present at chip `k` when `(k - component_offset_chips[c])` is a
+    multiple of `chips_per_component_chip[c]`, and then contributes its code chip at index
+    `((k - component_offset_chips[c]) // chips_per_component_chip[c]) % component_code_lengths[c]`.  That
+    single rule expresses every multiplexing scheme in the repository -- see
+    `utils.code_components` -- so signals differ only by the arrays passed in.
+
+    Codes are packed end to end in `codes_flat` because their lengths differ by
+    three orders of magnitude (1023 vs 767250).  Component `c`'s code lives at
+    `codes_flat[component_code_start_indices[c] : component_code_start_indices[c] + component_code_lengths[c]]`.
+
+    `component_code_start_indices` addresses `codes_flat`; `component_offset_chips` and
+    `bin_offsets_chips` are positions on the chip axis.  Different quantities,
+    named apart.
+
+    `corr_values` is accumulated in place and is NOT zeroed here: a correlation
+    interval may be spread across several sample buffers.
+    """
     num_samples = len(samples)
-    center_chip = chip_start
+    num_bins = len(bin_offsets_chips)
+    num_components = len(component_code_start_indices)
+
+    code_phase_chips = initial_code_phase_chips
     for i in range(num_samples):
         carrierless = samples[i] * conj_carr_sample
         for j in range(num_bins):
-            chip_index = int(center_chip + chip_bin_offset + j * chip_bin_spacing)
-            # chip_index advances at the combined (interleaved) chip rate. Each component
-            # occupies every other chip, so its own index into its code is chip_index // 2.
-            component_chip_index = chip_index // 2
-            if chip_index % 2 == 0:
-                symbol = code_seq_0[component_chip_index % code_length_0]
+            # floor, not truncation: a late bin near a code wrap produces a
+            # slightly negative chip index, which must map to the previous chip.
+            chip_index = int(np.floor(code_phase_chips + bin_offsets_chips[j]))
+            for c in range(num_components):
+                offset_from_component_origin = chip_index - component_offset_chips[c]
+                if offset_from_component_origin % chips_per_component_chip[c] != 0:
+                    continue  # this chip belongs to another component
+                # Index within this component's own code, then displaced by where
+                # that component's block starts in the flat buffer.
+                component_chip_index = (
+                    offset_from_component_origin // chips_per_component_chip[c]
+                ) % component_code_lengths[c]
+                symbol = codes_flat[component_code_start_indices[c] + component_chip_index]
                 if symbol == 1:
-                    corr_values[j, 0] += carrierless
+                    corr_values[j, c] += carrierless
                 elif symbol == -1:
-                    corr_values[j, 0] -= carrierless
+                    corr_values[j, c] -= carrierless
                 elif symbol != 0:
-                    corr_values[j, 0] += carrierless * symbol
-            else:
-                symbol = code_seq_1[component_chip_index % code_length_1]
-                if symbol == 1:
-                    corr_values[j, 1] += carrierless
-                elif symbol == -1:
-                    corr_values[j, 1] -= carrierless
-                elif symbol != 0:
-                    corr_values[j, 1] += carrierless * symbol
+                    corr_values[j, c] += carrierless * symbol
         conj_carr_sample *= conj_carr_rotation
-        center_chip += chip_delta
+        code_phase_chips += chips_per_sample
 
 
-def correlate_delay_interleaved(
+def correlate__multicomponent(
     samples: np.ndarray,
     samp_rate: float,
     initial_carr_phase_cycles: float,
     doppler_freq_hz: float,
-    code_seq_0: np.ndarray,
-    code_seq_1: np.ndarray,
-    code_length_0: int,
-    code_length_1: int,
+    code_set: CodeSet,
     code_rate_chips_per_sec: float,
     initial_code_phase_chips: float,
-    num_chip_bins: int,
-    chip_bin_offset: float,
-    chip_bin_spacing: float,
-    output: NDArray[np.complex64]
+    bin_offsets_chips: NDArray[np.float64],
+    output: NDArray[np.complex64],
 ) -> None:
+    """
+    Correlate `samples` against every component of `code_set`.
 
-    # The interleaved stream repeats every 2 * lcm(len0, len1) combined chips, which is
-    # 2 * max(...) for a divisor pair.  NOTE: code lengths must be divisor pair.
-    # Reducing by anything else (e.g. max alone) shifts both components' chip_index // 2
-    # and breaks alignment once the code phase runs past one code period.
-    interleaved_period_chips = 2 * max(code_length_0, code_length_1)
-    chip_start = initial_code_phase_chips % interleaved_period_chips
-    chip_delta = code_rate_chips_per_sec / samp_rate  # chips per sample
+    `output` has shape (num_bins, num_components) and is accumulated in place.
+    `code_rate_chips_per_sec` and `initial_code_phase_chips` are on the signal's
+    combined chip clock -- 1.023 Mcps for L1 C/A and for L2C's interleaved CM/CL
+    stream, 10.23 Mcps for L5.
+    """
+    if code_set.has_subcarrier:
+        # Dispatching here (rather than branching per sample inside the kernel)
+        # keeps subcarrier-free signals off that code path entirely.  The BOC/TMBOC
+        # kernel lands with GPS L1C.
+        raise NotImplementedError("subcarrier (BOC/TMBOC) correlation is not implemented yet")
+
+    wrapped_code_phase_chips = code_set.wrap_code_phase_chips(initial_code_phase_chips)
+    chips_per_sample = code_rate_chips_per_sec / samp_rate
 
     conj_carr_sample = np.exp(-2j * np.pi * initial_carr_phase_cycles)
     conj_carr_rotation = np.exp(-2j * np.pi * doppler_freq_hz / samp_rate)
 
-    numba_correlate__interleaved_bpsk__complex64(
+    numba_correlate__multicomponent__complex64(
         samples,
-        code_seq_0,
-        code_seq_1,
-        code_length_0,
-        code_length_1,
-        chip_start,
-        chip_delta,
-        num_chip_bins,
-        chip_bin_offset,
-        chip_bin_spacing,
+        code_set.codes_flat,
+        code_set.component_code_start_indices,
+        code_set.component_code_lengths,
+        code_set.chips_per_component_chip,
+        code_set.component_offset_chips,
+        wrapped_code_phase_chips,
+        chips_per_sample,
+        bin_offsets_chips,
         conj_carr_sample,
         conj_carr_rotation,
-        output
+        output,
     )
+
