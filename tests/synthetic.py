@@ -61,9 +61,18 @@ def get_l5_overlays() -> tuple[np.ndarray, np.ndarray]:
     return nh_i, nh_q
 
 
-def _nav_bits(t: np.ndarray, bit_period_sec: float) -> np.ndarray:
-    """Deterministic alternating data modulation, so bit flips are exercised."""
-    return 1 - 2 * (((t // bit_period_sec).astype(np.int64)) % 2 == 1)
+def _nav_bits(code_period_index: np.ndarray, periods_per_symbol: int) -> np.ndarray:
+    """
+    Deterministic alternating data modulation, so bit flips are exercised.
+
+    Keyed to the code period, not to absolute time.  The data symbol is synchronous
+    with the primary code in every signal here (IS-GPS-200 for L1 C/A and L2 CNAV,
+    IS-GPS-705 for L5), so a flip falls exactly on a code period boundary and can
+    never land inside a correlation interval.  Keying it to `t` instead put the
+    flip `code_phase_ms` into each period -- a fixture artefact that made a
+    symbol-length coherent accumulation look worse than it is.
+    """
+    return 1 - 2 * ((code_period_index // periods_per_symbol) % 2 == 1)
 
 
 def generate_l1ca_samples(
@@ -85,9 +94,11 @@ def generate_l1ca_samples(
 
     code_rate = gps_l1ca.CODE_RATE * (1.0 + doppler_hz / gps_l1ca.CARRIER_FREQ)
     chips = code_phase_ms * 1e-3 * gps_l1ca.CODE_RATE + t * code_rate
-    data = _nav_bits(t, 0.020) if nav_bits else 1.0
+    chip_index = chips.astype(np.int64)
+    # 20 ms nav bit = 20 code periods of 1 ms.
+    data = _nav_bits(chip_index // gps_l1ca.CODE_LENGTH, 20) if nav_bits else 1.0
 
-    samples = code[chips.astype(np.int64) % len(code)] * data
+    samples = code[chip_index % len(code)] * data
     samples = (samples * np.exp(2j * np.pi * doppler_hz * t)).astype(np.complex64)
     return _add_noise(samples, noise_sigma, rng)
 
@@ -116,7 +127,8 @@ def generate_l2c_samples(
 
     combined_rate = gps_l2c.CODE_RATE_L2CLM * (1.0 + doppler_hz / gps_l2c.CARRIER_FREQ)
     k = (code_phase_ms * 1e-3 * gps_l2c.CODE_RATE_L2CLM + t * combined_rate).astype(np.int64)
-    data = _nav_bits(t, 0.020) if nav_bits else 1.0
+    # One CNAV symbol is exactly one CM period: 10230 CM chips = 20460 combined.
+    data = _nav_bits(k // (2 * gps_l2c.CODE_LENGTH_L2CM), 1) if nav_bits else 1.0
 
     chips = np.where(k % 2 == 0, cm[(k // 2) % len(cm)] * data, cl[(k // 2) % len(cl)])
     samples = (chips * np.exp(2j * np.pi * doppler_hz * t)).astype(np.complex64)
@@ -162,7 +174,9 @@ def generate_l5_samples(
     overlay_i = nh_i[period_index % len(nh_i)] if overlay else 1
     overlay_q = nh_q[period_index % len(nh_q)] if overlay else 1
 
-    data = _nav_bits(t, 1.0 / gps_l5.DATA_SYMBOL_RATE) if nav_bits else 1
+    # One CNAV symbol is 10 ms = 10 primary code periods, which is also NH10's
+    # period -- that alignment is what makes NH10 sync deliver symbol sync.
+    data = _nav_bits(period_index, 10) if nav_bits else 1
 
     in_phase = code_i[chip_index % len(code_i)] * overlay_i * data
     quadrature = code_q[chip_index % len(code_q)] * overlay_q

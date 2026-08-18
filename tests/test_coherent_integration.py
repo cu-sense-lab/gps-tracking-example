@@ -1,0 +1,168 @@
+"""
+How long one coherent accumulation may last, and what rejects a bad choice.
+
+There is one knob, `coherent_integration_ms`, and one fixed granularity,
+`CORRELATION_INTERVAL_MS = 1`.  The interval is not a user choice: an overlay chip
+lasts one primary code period -- 1 ms for every signal here -- so a longer interval
+could span a sign change.  Integration is built out of intervals, folded with
+wipe-off, which is why extending it never means lengthening the interval.
+
+An accumulation is coherent only while what it accumulates keeps one sign, so the
+limit is the shortest such interval across *every* component -- one epoch serves the
+whole signal, so a length that suits the pilot but overruns a data component leaves
+that component quietly self-cancelling:
+
+    un-stripped overlay   one primary code period
+    data symbol           `symbol_period_ms` on the component
+    dataless pilot        no limit of its own (only Doppler, not checked here)
+
+L5 is the case in point: Q alone would take NH20's 20 ms, but I carries 10 ms CNAV
+symbols, so 10 ms is the signal's limit.
+
+The requirement is divisibility, not just "fits".  Epochs are anchored to multiples
+of their own length in code phase, so N = 10 tiles a 20 ms symbol exactly while
+N = 8 leaves the epoch [16, 24) across the boundary at 20 however it is aligned.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+import pytest
+
+from utils import tracking_channel
+from utils.signal_interfaces import (
+    TRACKING_POLICIES,
+    GpsL1CA,
+    GpsL2C,
+    GpsL5,
+    build_signals,
+)
+
+
+def _channel(signal_type, coherent_integration_ms, synced_coherent_integration_ms=None):
+    signal = build_signals(signal_type, prns=[1])["G01"]
+    policy = TRACKING_POLICIES[signal_type.signal_type_id]
+    return tracking_channel.TrackingChannel(
+        loop_params=tracking_channel.TrackingLoopParameters(
+            DLL_bandwidth_hz=2.0, PLL_bandwidth_hz=20.0, FLL_bandwidth_hz=50.0,
+            coherent_integration_ms=coherent_integration_ms,
+        ),
+        signal_params=tracking_channel.TrackingSignalParameters(
+            code_set=signal.code_set,
+            nominal_code_rate_chips_per_sec=signal_type.tracking_code_rate_chips_per_sec,
+            carrier_freq_hz=signal_type.carrier_freq_hz,
+            primary_period_ms=signal_type.primary_period_ms,
+        ),
+        initial_signal_state=tracking_channel.TrackingSignalState(
+            uptime_epoch_ms=0.0, code_phase_ms=0.5, code_rate_ms_per_sec=1e3,
+            carrier_phase_cycles=0.0, carrier_rate_cyc_per_sec=0.0,
+        ),
+        output_capacity=10,
+        discriminator_policy=policy.discriminator_policy,
+        synced_policy=policy.synced_discriminator_policy,
+        synced_coherent_integration_ms=(
+            synced_coherent_integration_ms or coherent_integration_ms
+        ),
+    )
+
+
+# --------------------------------------------------------------------------
+# The knob itself
+# --------------------------------------------------------------------------
+
+def test_one_interval_is_the_default():
+    params = tracking_channel.TrackingLoopParameters(
+        DLL_bandwidth_hz=2.0, PLL_bandwidth_hz=20.0, FLL_bandwidth_hz=50.0
+    )
+    assert params.coherent_integration_ms == tracking_channel.CORRELATION_INTERVAL_MS
+    assert params.intervals_per_epoch == 1
+
+
+def test_integration_is_a_whole_number_of_intervals():
+    for bad in (0, -1):
+        with pytest.raises(ValueError, match="positive multiple"):
+            tracking_channel.TrackingLoopParameters(
+                DLL_bandwidth_hz=2.0, PLL_bandwidth_hz=20.0, FLL_bandwidth_hz=50.0,
+                coherent_integration_ms=bad,
+            )
+
+
+def test_loop_gains_follow_the_integration_length():
+    """Every gain is proportional to the update period, which is the epoch."""
+    short = tracking_channel.TrackingLoopParameters(
+        DLL_bandwidth_hz=2.0, PLL_bandwidth_hz=20.0, FLL_bandwidth_hz=50.0,
+        coherent_integration_ms=1,
+    )
+    long = tracking_channel.TrackingLoopParameters(
+        DLL_bandwidth_hz=2.0, PLL_bandwidth_hz=20.0, FLL_bandwidth_hz=50.0,
+        coherent_integration_ms=10,
+    )
+    assert long.DLL_filter_coeff == pytest.approx(10 * short.DLL_filter_coeff)
+    assert long.intervals_per_epoch == 10
+
+
+# --------------------------------------------------------------------------
+# Rejection
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "signal_type, coherent_ms",
+    [
+        (GpsL1CA, 1), (GpsL1CA, 4), (GpsL1CA, 5),
+        (GpsL1CA, 20),                      # exactly one nav bit
+        (GpsL2C, 1), (GpsL2C, 10),
+        (GpsL2C, 20),                       # exactly one CNAV symbol
+    ],
+)
+def test_integration_dividing_the_symbol_is_accepted(signal_type, coherent_ms):
+    channel = _channel(signal_type, coherent_ms)
+    assert channel.coherent_integration_ms == coherent_ms
+
+
+@pytest.mark.parametrize(
+    "signal_type, coherent_ms, expected",
+    [
+        (GpsL1CA, 3, "does not divide 20"),
+        (GpsL1CA, 30, "exceeds 20"),
+        (GpsL2C, 8, "does not divide 20"),
+        (GpsL2C, 40, "exceeds 20"),
+    ],
+)
+def test_integration_that_would_span_a_symbol_is_rejected(signal_type, coherent_ms, expected):
+    with pytest.raises(ValueError, match=expected):
+        _channel(signal_type, coherent_ms)
+
+
+def test_an_unstripped_overlay_caps_integration_at_one_primary_period():
+    """
+    Before Neuman-Hofman is synced, the overlay flips every 1 ms and nothing
+    longer is coherent -- regardless of the 10 ms CNAV symbol behind it.
+    """
+    with pytest.raises(ValueError, match="overlay chip"):
+        _channel(GpsL5, 5, synced_coherent_integration_ms=10)
+
+    assert _channel(GpsL5, 1, synced_coherent_integration_ms=10)
+
+
+def test_the_synced_configuration_is_checked_up_front():
+    """
+    A bad post-sync length must fail at construction, not part-way through a run
+    when the channel finally reaches lock.
+
+    NH20's 20 ms is the length the pilot alone would allow, and it is rejected --
+    the epoch is shared, and I's CNAV symbol is 10 ms.  Switching the loops onto
+    the pilot does not exempt the epoch from the data component riding in it.
+    """
+    assert TRACKING_POLICIES[GpsL5.signal_type_id].synced_coherent_integration_ms == 10
+    assert _channel(GpsL5, 1, synced_coherent_integration_ms=10)
+
+    with pytest.raises(ValueError, match="exceeds 10 ms"):
+        _channel(GpsL5, 1, synced_coherent_integration_ms=20)
+
+
+def test_a_dataless_pilot_has_no_symbol_limit():
+    """L2 CL and L5 Q carry no data, so only Doppler bounds them."""
+    for signal_type, pilot in ((GpsL2C, "CL"), (GpsL5, "Q")):
+        signal = build_signals(signal_type, prns=[1])["G01"]
+        component = signal.code_set.components[signal.code_set.index_of(pilot)]
+        assert component.symbol_period_ms is None

@@ -92,6 +92,28 @@ SCENARIOS: tuple[TrackingScenario, ...] = (
         noise_sigma=0.0,
         nav_bits=False,
     ),
+    # CM's code period is 20 ms, so a real acquisition reports a code phase
+    # anywhere in [0, 20) ms -- not the sub-millisecond value every other scenario
+    # uses.  That gap hid a defect for a long time: the loop filter took the code
+    # phase for the epoch's stream time, which fed the correlator a `dt_sec` wrong
+    # by exactly that phase and turned the loop's own Doppler corrections into
+    # apparent frequency errors `code_phase / corr_period` times larger.  Below
+    # about 4 ms it converged anyway; above it, L2C diverged -- roughly 80% of the
+    # code phases real data produces.
+    TrackingScenario(
+        name="l2c_late_code_phase",
+        family="L2C",
+        prn=1,
+        duration_ms=2000,
+        samp_rate=5e6,
+        doppler_hz=-870.0,
+        code_phase_ms=15.61,
+        doppler_error_hz=100.0,
+        code_error_chips=0.25,
+        noise_sigma=3.0,
+        nav_bits=True,
+        rng_seed=2,
+    ),
     TrackingScenario(
         name="l2c_navbits_noisy",
         family="L2C",

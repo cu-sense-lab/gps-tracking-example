@@ -15,10 +15,11 @@ import pytest
 
 import gnss_tools.signals.gps_l5 as gps_l5
 
-from utils import bpsk_acquisition
+from utils import bpsk_acquisition, secondary_code
 from utils.bpsk_correlation import correlate__multicomponent
 from utils.signal_interfaces import (
     TRACKING_POLICIES,
+    GpsL1CA,
     GpsL5,
     build_acquisition_code_params,
     build_signals,
@@ -83,7 +84,7 @@ def test_carrier_loop_runs_on_the_pilot(l5_definition):
     Costas stays on until the overlay is stripped -- NH20 flips Q every 1 ms, so
     the pilot is not yet effectively dataless.
     """
-    policy = TRACKING_POLICIES[GpsL5.signal_id].discriminator_policy
+    policy = TRACKING_POLICIES[GpsL5.signal_type_id].discriminator_policy
     assert policy.carrier_component == l5_definition.code_set.index_of("Q")
     assert policy.code_components == (0, 1), "delay discriminator should combine I and Q"
     assert policy.costas is True
@@ -178,28 +179,48 @@ def test_early_late_are_symmetric_when_aligned(l5_definition):
 # Acquisition
 # --------------------------------------------------------------------------
 
-def _acquire(true_doppler_hz, code_phase_ms, half_bin, prn=PRN, noise_sigma=2.0, seed=0):
-    definitions = build_signals(GpsL5, prns=[prn])
-    config = bpsk_acquisition.AcquisitionConfiguration(
-        # NH caps coherent integration at one primary code period; blocks are
-        # combined non-coherently, so the overlay's sign flips are harmless.
-        replica_duration_ms=1,
-        num_blocks=10,
+def _acquisition_config() -> bpsk_acquisition.AcquisitionConfiguration:
+    """
+    The composite-Q dwell: replica = primary x NH20 = 20 ms, coherent = 5 ms x 4.
+
+    Folding NH20 into the replica removes the overlay as a limit on coherent
+    integration, and the recovered code phase then carries the shared overlay
+    counter outright -- mod 20 for NH20, and mod 10 for NH10 -- so nothing is left
+    to resolve.  Q is the dataless pilot, which is what makes its composite exact:
+    I's CNAV symbol period equals NH10's, so data reduces to a sign on each whole
+    composite period and can shift the recovered index by one.
+
+    Coherent integration still stops at 5 ms, bounded by I's 10 ms symbol once the
+    epoch is shared across components.
+    """
+    return bpsk_acquisition.AcquisitionConfiguration(
+        replica_duration_ms=20,
+        coherent_duration_ms=5.0,
+        num_blocks=4,
         sample_rate=SAMP_RATE,
         min_search_doppler_hz=-5000,
         max_search_doppler_hz=5000,
     )
+
+
+
+def _acquire(
+    true_doppler_hz, code_phase_ms, half_bin, prn=PRN, noise_sigma=2.0, seed=0,
+    start_sec=0.0, nav_bits=True,
+):
+    definitions = build_signals(GpsL5, prns=[prn])
+    config = _acquisition_config()
     samples = synthetic.generate_l5_samples(
-        prn=prn, start_sec=0.0, duration_sec=config.acq_total_duration_ms * 1e-3,
+        prn=prn, start_sec=start_sec, duration_sec=config.acq_total_duration_ms * 1e-3,
         samp_rate=SAMP_RATE, doppler_hz=true_doppler_hz, code_phase_ms=code_phase_ms,
-        noise_sigma=noise_sigma, rng=np.random.default_rng(seed),
+        nav_bits=nav_bits, noise_sigma=noise_sigma, rng=np.random.default_rng(seed),
     )
     results = bpsk_acquisition.run_acquisition(
         sample_block=samples,
         sample_block_uptime_epoch_ms=0.0,
         acq_config=config,
         code_parameters=build_acquisition_code_params(GpsL5, definitions),
-        prob_false_alaram=1e-7,
+        prob_false_alarm_total=1e-6,
         noise_var_method="abscorrvar",
         half_bin_doppler_search=half_bin,
     )
@@ -227,10 +248,7 @@ def test_acquisition_rejects_an_absent_satellite():
     defect.  noise_sigma = 8 is a realistic level where the true peak is ~30x the
     mismatched one.
     """
-    config = bpsk_acquisition.AcquisitionConfiguration(
-        replica_duration_ms=1, num_blocks=10, sample_rate=SAMP_RATE,
-        min_search_doppler_hz=-5000, max_search_doppler_hz=5000,
-    )
+    config = _acquisition_config()
     samples = synthetic.generate_l5_samples(
         prn=PRN, start_sec=0.0, duration_sec=config.acq_total_duration_ms * 1e-3,
         samp_rate=SAMP_RATE, doppler_hz=800.0, code_phase_ms=0.2,
@@ -243,7 +261,7 @@ def test_acquisition_rejects_an_absent_satellite():
         peaks[prn] = bpsk_acquisition.run_acquisition(
             sample_block=samples, sample_block_uptime_epoch_ms=0.0, acq_config=config,
             code_parameters=build_acquisition_code_params(GpsL5, definitions),
-            prob_false_alaram=1e-7, noise_var_method="abscorrvar",
+            prob_false_alarm_total=1e-6, noise_var_method="abscorrvar",
         )[f"G{prn:02d}"]
 
     assert peaks[PRN].signal_detected, "the transmitted PRN should acquire"
@@ -265,14 +283,47 @@ def test_l5_codes_have_low_cross_correlation():
             assert peak < 0.1, f"PRN {PRN} vs {other_prn} {label}: {peak:.3f}"
 
 
-def test_doppler_bin_width_is_one_kilohertz():
+def test_composite_replica_separates_grid_from_response():
     """
-    The constraint that motivates the half-bin search: coherent integration is
-    capped at 1 ms, so bins are 1 / T_coherent = 1000 Hz wide and the worst-case
-    seeding error is 500 Hz -- double a 1 ms FLL's unambiguous range.
+    Folding NH10 into the replica is what buys the finer Doppler grid.
+
+    Grid spacing follows the 20 ms replica (50 Hz); the mainlobe follows the 5 ms
+    coherent length (200 Hz).  The grid is therefore four times as fine as the
+    response, and the worst-case seeding error drops from the 500 Hz of a 1 ms
+    replica to 25 Hz -- comfortably inside a 1 ms FLL's +/-250 Hz unambiguous range, which is
+    what the half-bin search previously existed to rescue.
     """
     _, config = _acquire(0.0, 0.0, half_bin=False)
-    assert config.fft_resolution == pytest.approx(1000.0)
+    assert config.fft_resolution == pytest.approx(50.0)
+    assert config.doppler_response_width_hz == pytest.approx(200.0)
+
+
+def test_composite_code_phase_carries_the_overlay_counter():
+    """
+    The payoff of acquiring on primary x NH20: the code phase lands inside a 20 ms
+    code, so its integer millisecond *is* the shared overlay counter -- NH20
+    directly, and NH10 as that mod 10.  Both Neuman-Hofman phases and CNAV symbol
+    sync fall out of acquisition, with no hypothesis search and no post-lock search.
+    The generator advances the overlay once per primary period, so starting the
+    dwell 3 ms in must show up as counter 3.
+    """
+    code_phase_ms = 0.31
+    # Data on: the whole point of acquiring on the pilot is that CNAV cannot
+    # perturb this.  On the I composite it could -- I's symbol period equals NH10's,
+    # so data becomes a per-period sign and a straddling dwell scored a neighbouring
+    # index (8.31 ms for a true 7.31 ms).  Q carries no data, so the counter is exact.
+    for start_ms, expected_index in ((0.0, 0), (3.0, 3), (7.0, 7), (13.0, 13)):
+        result, _ = _acquire(
+            1234.0, code_phase_ms, half_bin=False, start_sec=start_ms * 1e-3
+        )
+        assert result.signal_detected
+        phase_ms = result.acq_code_phase_seconds * 1e3
+        assert int(np.floor(phase_ms)) == expected_index, (
+            f"start {start_ms} ms -> phase {phase_ms:.4f} ms, "
+            f"expected overlay index {expected_index}"
+        )
+        # and the fractional part is still the primary code phase
+        assert phase_ms % 1.0 == pytest.approx(code_phase_ms, abs=2e-3)
 
 
 @pytest.mark.parametrize("true_doppler_hz", [0.0, 250.0, 400.0, 500.0, 700.0, -400.0, -500.0])
@@ -282,20 +333,21 @@ def test_half_bin_search_halves_worst_case_doppler_error(true_doppler_hz):
     appear lower, so the recovered Doppler is the bin centre *plus* the offset.
     Getting this backwards would double the error instead of halving it.
     """
-    coarse, _ = _acquire(true_doppler_hz, 0.31, half_bin=False)
+    coarse, config = _acquire(true_doppler_hz, 0.31, half_bin=False)
     fine, _ = _acquire(true_doppler_hz, 0.31, half_bin=True)
     assert coarse.signal_detected and fine.signal_detected
 
-    # 250 Hz is the FLL's unambiguous limit at 1 ms; the half-bin grid's worst
-    # case sits exactly on it.
-    assert abs(fine.acq_doppler_hz - true_doppler_hz) <= 250.0 + 1e-6
+    # Half a grid step is the worst case without the search; the half-bin pass can
+    # only improve on it.
+    assert abs(fine.acq_doppler_hz - true_doppler_hz) <= 0.5 * config.fft_resolution + 1e-6
     assert abs(fine.acq_doppler_hz - true_doppler_hz) <= abs(
         coarse.acq_doppler_hz - true_doppler_hz
     ) + 1e-6
 
 
 def test_half_bin_offset_is_reported_and_applied():
-    fine, config = _acquire(500.0, 0.31, half_bin=True)
+    # 525 Hz sits on a half-bin of the 50 Hz grid, so the shifted pass must win.
+    fine, config = _acquire(525.0, 0.31, half_bin=True)
     assert fine.doppler_offset_hz == pytest.approx(0.5 * config.fft_resolution)
     bin_centre = config.doppler_search_bins[fine.peak_doppler_bin] * config.fft_resolution
     assert fine.acq_doppler_hz == pytest.approx(bin_centre + fine.doppler_offset_hz)
@@ -327,7 +379,7 @@ def test_acquisition_seeds_tracking_to_convergence():
     definitions = build_signals(GpsL5, prns=[prn])
     loop_params = tracking_channel.TrackingLoopParameters(
         DLL_bandwidth_hz=2.0, PLL_bandwidth_hz=20.0, FLL_bandwidth_hz=50.0,
-        nominal_update_period_ms=1, corr_period_ms=1, EPL_chip_spacing=0.5,
+        coherent_integration_ms=1, EPL_chip_spacing=0.5,
     )
     channels = create_tracking_channels(
         GpsL5,
@@ -355,7 +407,11 @@ def test_acquisition_seeds_tracking_to_convergence():
 
     outputs = adapter.outputs
     count = outputs.output_index
-    assert count > 100, "too few epochs to judge convergence"
+    # Far fewer than one epoch per millisecond.  Acquiring on Q x NH20 hands the
+    # channel its overlay counter, so wipe-off is live from the first interval and
+    # the accumulation lengthens to 10 ms as soon as the PLL locks -- after which
+    # epochs are emitted a tenth as often.
+    assert count > 25, "too few epochs to judge convergence"
 
     final_doppler_error = outputs.doppler_freq_hz[count - 1] - true_doppler_hz
     assert abs(final_doppler_error) < 5.0, f"Doppler did not converge: {final_doppler_error:+.2f} Hz"
@@ -383,10 +439,7 @@ def _track_until_synced(noise_sigma=3.0, buffers=14, buffer_ms=50, seed=4):
 
     true_doppler_hz, code_phase_ms = 1500.0, 0.31
     definitions = build_signals(GpsL5, prns=[PRN])
-    config = bpsk_acquisition.AcquisitionConfiguration(
-        replica_duration_ms=1, num_blocks=20, sample_rate=SAMP_RATE,
-        min_search_doppler_hz=-5000, max_search_doppler_hz=5000,
-    )
+    config = _acquisition_config()
     rng = np.random.default_rng(seed)
     acq = bpsk_acquisition.run_acquisition(
         sample_block=synthetic.generate_l5_samples(
@@ -395,14 +448,14 @@ def _track_until_synced(noise_sigma=3.0, buffers=14, buffer_ms=50, seed=4):
             code_phase_ms=code_phase_ms, noise_sigma=noise_sigma, rng=rng),
         sample_block_uptime_epoch_ms=0.0, acq_config=config,
         code_parameters=build_acquisition_code_params(GpsL5, definitions),
-        prob_false_alaram=1e-7, noise_var_method="abscorrvar",
+        prob_false_alarm_total=1e-6, noise_var_method="abscorrvar",
         half_bin_doppler_search=True,
     )[f"G{PRN:02d}"]
     assert acq.signal_detected
 
     loop_params = tracking_channel.TrackingLoopParameters(
         DLL_bandwidth_hz=2.0, PLL_bandwidth_hz=20.0, FLL_bandwidth_hz=50.0,
-        nominal_update_period_ms=1, corr_period_ms=1, EPL_chip_spacing=0.5,
+        coherent_integration_ms=1, EPL_chip_spacing=0.5,
     )
     adapter = create_tracking_channels(
         GpsL5,
@@ -410,6 +463,16 @@ def _track_until_synced(noise_sigma=3.0, buffers=14, buffer_ms=50, seed=4):
         tracking_signal_ids=[f"G{PRN:02d}"], loop_params=loop_params,
         output_capacity=4000,
     )[f"G{PRN:02d}"]
+
+    # Acquiring on Q x NH20 hands the channel its overlay counter, so it would start
+    # synced and never run the search.  Un-sync it deliberately: the post-lock
+    # search is still the fallback whenever a caller skips acquisition's answer or
+    # the signal is too weak to trust it, and these tests are what cover it.
+    adapter.channel.overlay_sync.status = secondary_code.OverlaySyncStatus.UNSYNCED
+    adapter.channel.overlay_sync.counter = 0
+    adapter.channel._set_policy(TRACKING_POLICIES[GpsL5.signal_type_id].discriminator_policy)
+    adapter.channel.coherent_integration_ms = loop_params.coherent_integration_ms
+    adapter.channel.loop_params = loop_params
 
     synced_at_epoch = None
     for i in range(buffers):
@@ -434,16 +497,19 @@ def test_overlay_syncs_and_switches_to_pilot_tracking():
     assert channel.overlay_sync.confidence > 2.0
 
     # Everything that must move together at the transition.
-    assert channel.coherent_periods == 20, "coherent accumulation did not extend"
+    assert channel.coherent_integration_ms == 10, "coherent accumulation did not extend"
     assert channel.policy.costas is False, "pilot should drop Costas wrapping"
-    assert channel.policy.code_components == (1,), "delay discriminator should be Q only"
-    assert channel.loop_params.nominal_update_period_ms == 20, "loop filter not retuned"
+    assert channel.policy.code_components == (0, 1), (
+        "delay discriminator should combine I and Q -- a 10 ms epoch is exactly one "
+        "CNAV symbol, so I no longer cancels and is worth ~3 dB non-coherently"
+    )
+    assert channel.loop_params.coherent_integration_ms == 10, "loop filter not retuned"
 
 
 def test_wipe_off_gives_n_fold_coherent_gain():
     """
-    The point of the whole layer.  Folding 20 primary periods coherently must
-    multiply the prompt by ~20, not by sqrt(20) -- the latter is what you would
+    The point of the whole layer.  Folding 10 primary periods coherently must
+    multiply the prompt by ~10, not by sqrt(10) -- the latter is what you would
     get if the overlay signs were wrong and the folds added incoherently.
     """
     adapter, synced_at, _ = _track_until_synced(noise_sigma=0.0)
@@ -455,8 +521,8 @@ def test_wipe_off_gives_n_fold_coherent_gain():
     after = np.abs(outputs.prompt_corr[count - 15 : count, 1]).mean()
 
     gain = after / before
-    assert gain == pytest.approx(20.0, rel=0.05), f"expected ~20x, got {gain:.1f}x"
-    assert gain > 2 * np.sqrt(20), "gain is incoherent -- overlay signs are wrong"
+    assert gain == pytest.approx(10.0, rel=0.05), f"expected ~10x, got {gain:.1f}x"
+    assert gain > 2 * np.sqrt(10), "gain is incoherent -- overlay signs are wrong"
 
 
 def test_coherent_gain_holds_across_noise_levels():
@@ -466,7 +532,7 @@ def test_coherent_gain_holds_across_noise_levels():
         count = outputs.output_index
         before = np.abs(outputs.prompt_corr[synced_at - 40 : synced_at - 2, 1]).mean()
         after = np.abs(outputs.prompt_corr[count - 15 : count, 1]).mean()
-        assert after / before == pytest.approx(20.0, rel=0.1), (
+        assert after / before == pytest.approx(10.0, rel=0.1), (
             f"sigma={noise_sigma}: gain {after/before:.1f}x"
         )
 
@@ -487,18 +553,22 @@ def test_extending_integration_narrows_the_loops():
     """
     adapter, _, _ = _track_until_synced()
     params = adapter.channel.loop_params
-    update_period_sec = params.nominal_update_period_ms * 1e-3
+    update_period_sec = params.coherent_integration_ms * 1e-3
     for bandwidth_hz in (
         params.PLL_bandwidth_hz, params.DLL_bandwidth_hz, params.FLL_bandwidth_hz
     ):
         assert bandwidth_hz * update_period_sec <= 0.1 + 1e-9
 
 
-def test_data_component_cannot_be_integrated_past_its_symbol():
+def test_the_data_component_survives_the_epoch_it_shares():
     """
-    Why the post-sync delay discriminator drops to Q alone: L5I carries 100 sps
-    CNAV symbols, so a 20 ms epoch spans two of them and they partly cancel.  Q,
-    being a true pilot once NH is stripped, keeps growing.
+    One epoch serves the whole signal, so its length is the shortest limit among
+    the components -- I's 10 ms CNAV symbol, not Q's absent one.  At 10 ms each
+    epoch is exactly one symbol, so I comes out at full magnitude alongside the
+    pilot.  At NH20's tempting 20 ms it would span two symbols and half cancel,
+    which is what capping the epoch at 10 ms buys.
+
+    I and Q are equal power, so full magnitude means comparable to Q.
     """
     adapter, _, _ = _track_until_synced(noise_sigma=0.0)
     outputs = adapter.outputs
@@ -506,6 +576,172 @@ def test_data_component_cannot_be_integrated_past_its_symbol():
     tail = slice(count - 15, count)
     prompt_i = np.abs(outputs.prompt_corr[tail, 0]).mean()
     prompt_q = np.abs(outputs.prompt_corr[tail, 1]).mean()
-    assert prompt_q > 2 * prompt_i, (
-        f"expected the pilot to dominate over 20 ms, got I={prompt_i:.0f} Q={prompt_q:.0f}"
+    assert 0.5 < prompt_i / prompt_q < 2.0, (
+        f"I should survive a symbol-length epoch, got I={prompt_i:.0f} Q={prompt_q:.0f}"
     )
+
+
+# --------------------------------------------------------------------------
+# Overlay phase supplied by acquisition, rather than searched for after lock
+# --------------------------------------------------------------------------
+
+def _seeded_channel(initial_overlay_counter, doppler_hz=1500.0, code_phase_ms=0.31):
+    from utils import tracking_channel
+
+    signal = build_signals(GpsL5, prns=[PRN])[f"G{PRN:02d}"]
+    policy = TRACKING_POLICIES[GpsL5.signal_type_id]
+    return tracking_channel.TrackingChannel(
+        loop_params=tracking_channel.TrackingLoopParameters(
+            DLL_bandwidth_hz=2.0, PLL_bandwidth_hz=20.0, FLL_bandwidth_hz=50.0,
+            coherent_integration_ms=1, EPL_chip_spacing=0.5,
+        ),
+        signal_params=tracking_channel.TrackingSignalParameters(
+            code_set=signal.code_set,
+            nominal_code_rate_chips_per_sec=gps_l5.CODE_RATE,
+            carrier_freq_hz=gps_l5.CARRIER_FREQ, primary_period_ms=1,
+        ),
+        initial_signal_state=tracking_channel.TrackingSignalState(
+            uptime_epoch_ms=0.0, code_phase_ms=code_phase_ms,
+            code_rate_ms_per_sec=(1.0 + doppler_hz / gps_l5.CARRIER_FREQ) * 1e3,
+            carrier_phase_cycles=0.0, carrier_rate_cyc_per_sec=doppler_hz,
+        ),
+        output_capacity=4000,
+        discriminator_policy=policy.discriminator_policy,
+        synced_policy=policy.synced_discriminator_policy,
+        synced_coherent_integration_ms=policy.synced_coherent_integration_ms,
+        initial_overlay_counter=initial_overlay_counter,
+    )
+
+
+def _drive(channel, doppler_hz=1500.0, code_phase_ms=0.31, buffers=14, buffer_ms=50,
+           noise_sigma=3.0, seed=4):
+    from utils import sample_streaming
+
+    rng = np.random.default_rng(seed)
+    extended_at_mode = None
+    for i in range(buffers):
+        before = channel.coherent_integration_ms
+        channel.process_sample_buffer(sample_streaming.SampleBuffer(
+            samples=synthetic.generate_l5_samples(
+                prn=PRN, start_sec=i * buffer_ms * 1e-3, duration_sec=buffer_ms * 1e-3,
+                samp_rate=SAMP_RATE, doppler_hz=doppler_hz,
+                code_phase_ms=code_phase_ms, noise_sigma=noise_sigma, rng=rng),
+            start_uptime_ms=i * buffer_ms, samp_rate=SAMP_RATE))
+        if before == 1 and channel.coherent_integration_ms > 1 and extended_at_mode is None:
+            extended_at_mode = channel.loop_state.mode
+    return extended_at_mode
+
+
+# The synthetic advances the overlay once per primary period from code phase 0, so
+# the NH20 index at code phase c ms is c % 20.  The first interval starts at
+# ceil(0.31) = 1 ms.
+CORRECT_SEEDED_COUNTER = 1
+
+
+def test_seeded_overlay_starts_synced_without_extending():
+    """
+    Wipe-off and coherent extension are separate concerns, and only the first is
+    available at epoch zero.
+
+    Knowing the overlay phase makes wipe-off correct immediately -- it is a sign
+    multiply -- and lets the pilot discriminator drop Costas wrapping.  Extending
+    the accumulation is limited by Doppler error instead: acquisition seeds to half
+    a bin, 50 Hz on L5's 100 Hz grid, and at 20 ms that is df*T = 1.0, a null.
+    """
+    channel = _seeded_channel(CORRECT_SEEDED_COUNTER)
+
+    assert channel.overlay_sync.synced, "a supplied counter means no search is needed"
+    assert channel.coherent_integration_ms == 1, "must not extend before the loops have pulled in"
+    assert channel.policy.costas is False, "the pilot discriminator is available at once"
+
+
+def test_seeded_overlay_extends_only_once_the_pll_has_locked():
+    from utils import tracking_channel
+
+    channel = _seeded_channel(CORRECT_SEEDED_COUNTER)
+    extended_at_mode = _drive(channel)
+
+    assert extended_at_mode is tracking_channel.TrackingLoopMode.PLL, (
+        "coherent integration lengthened while still in FLL"
+    )
+    assert channel.coherent_integration_ms == 10
+    assert channel.loop_params.PLL_bandwidth_hz < 20.0, "loop filter was not retuned"
+
+
+def test_a_wrong_seeded_counter_never_locks():
+    """
+    Guards the counter convention itself.
+
+    With the overlay stripped the discriminator uses the full four-quadrant angle,
+    so a mis-phased wipe-off is not absorbed the way Costas would absorb it: the
+    prompts flip sign pseudo-randomly, the phase-coherence gate never opens, and
+    the channel stays in FLL.  An off-by-one here would otherwise be easy to miss.
+    """
+    from utils import tracking_channel
+
+    wrong = _seeded_channel((CORRECT_SEEDED_COUNTER + 5) % 20)
+    _drive(wrong)
+
+    assert wrong.coherent_integration_ms == 1
+    assert wrong.loop_state.mode is tracking_channel.TrackingLoopMode.FLL
+
+    right = _seeded_channel(CORRECT_SEEDED_COUNTER)
+    _drive(right)
+    assert right.loop_state.mode is tracking_channel.TrackingLoopMode.PLL
+
+
+def test_seeding_a_counter_needs_a_tiered_code():
+    from utils import tracking_channel
+
+    signal = build_signals(GpsL1CA, prns=[PRN])[f"G{PRN:02d}"]
+    with pytest.raises(ValueError, match="no tiered code"):
+        tracking_channel.TrackingChannel(
+            loop_params=tracking_channel.TrackingLoopParameters(
+                DLL_bandwidth_hz=2.0, PLL_bandwidth_hz=20.0, FLL_bandwidth_hz=50.0,
+                coherent_integration_ms=1,
+            ),
+            signal_params=tracking_channel.TrackingSignalParameters(
+                code_set=signal.code_set,
+                nominal_code_rate_chips_per_sec=1.023e6,
+                carrier_freq_hz=GpsL1CA.carrier_freq_hz,
+            ),
+            initial_signal_state=tracking_channel.TrackingSignalState(
+                uptime_epoch_ms=0.0, code_phase_ms=0.0, code_rate_ms_per_sec=1e3,
+                carrier_phase_cycles=0.0, carrier_rate_cyc_per_sec=0.0,
+            ),
+            initial_overlay_counter=3,
+        )
+
+
+def test_extended_epochs_start_on_a_code_phase_the_epoch_length_divides():
+    """
+    A single interval is safe anywhere, but an epoch of N intervals is not: begun
+    at an arbitrary code phase it can span a data symbol boundary and cancel
+    itself.  Epoch starts are therefore anchored to multiples of N ms of code
+    phase, which for L5 also puts every epoch at NH20 index 0.
+    """
+    from utils import sample_streaming, tracking_channel
+
+    channel = _seeded_channel(CORRECT_SEEDED_COUNTER)
+    epoch_starts = []
+    real = channel.run_loop_filter
+
+    def spy():
+        if channel.coherent_integration_ms > 1:
+            # start of the epoch that just closed
+            epoch_starts.append(
+                channel.corr_interval.start_code_phase_ms
+                - (channel.coherent_integration_ms - tracking_channel.CORRELATION_INTERVAL_MS)
+            )
+        return real()
+
+    channel.run_loop_filter = spy
+    _drive(channel)
+
+    assert channel.coherent_integration_ms == 10, "never extended"
+    assert epoch_starts, "no extended epochs ran"
+    epoch_ms = 10
+    offenders = [s for s in epoch_starts if s % epoch_ms != 0]
+    assert not offenders, f"epochs began off the {epoch_ms} ms grid: {offenders[:5]}"
+    # Consecutive extended epochs are exactly one epoch apart.
+    assert np.all(np.diff(epoch_starts) == epoch_ms)
