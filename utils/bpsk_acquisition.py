@@ -102,12 +102,11 @@ class AcquisitionConfiguration:
 class AcqSignalCodeParameters:
     rate_chips_per_sec: float
     length_chips: int
+    # Stated on the signal's own chip axis, carrying 0 wherever this component
+    # does not transmit -- so a chip-interleaved component (e.g. L2C's CM) is
+    # already zero-filled on its sibling's chips and cannot spuriously correlate
+    # against that sibling's code. See `utils.code_components`.
     sequence: NDArray[np.int8]
-    # True for signals where `sequence` is one component of a chip-interleaved
-    # pair (e.g. L2C's CM/CL). The replica is zero-filled on the other
-    # component's chips rather than holding this component's chip value
-    # across both, so it doesn't spuriously correlate against the other code.
-    is_interleaved: bool = False
 
 
 @dataclass
@@ -358,25 +357,11 @@ def run_acquisition(
             replica_samples = np.zeros(
                 N, dtype=np.complex64
             )
-            if code_params.is_interleaved:
-                # Physical chip clock runs at 2x this component's own rate, alternating
-                # between this component's chips (even chips) and the other's
-                # (odd ones). Zero-fill those so the replica only correlates
-                # against its own component, instead of smearing across both.
-                physical_chip_idx = (
-                    acq_config.replica_time_arr * 2.0 * code_params.rate_chips_per_sec
-                ).astype(int)
-                own_signal_chip = physical_chip_idx % 2 == 0
-                own_chip_indices = (physical_chip_idx // 2) % code_params.length_chips
-                replica_values = np.where(
-                    own_signal_chip, code_params.sequence[own_chip_indices], 0
-                )
-            else:
-                chips_arr = (
-                    0.0 + acq_config.replica_time_arr * code_params.rate_chips_per_sec
-                )
-                chip_indices = chips_arr.astype(int) % code_params.length_chips
-                replica_values = code_params.sequence[chip_indices]
+            chips_arr = (
+                0.0 + acq_config.replica_time_arr * code_params.rate_chips_per_sec
+            )
+            chip_indices = chips_arr.astype(int) % code_params.length_chips
+            replica_values = code_params.sequence[chip_indices]
             replica_samples[: acq_config.replica_length_samples] = replica_values.astype(float)
             replica_samples_fft = np.fft.fft(replica_samples)
             replica_entry = SignalReplicaCacheEntry(

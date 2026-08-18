@@ -29,7 +29,7 @@ import gnss_tools.signals.gps_l1ca as gps_l1ca
 import gnss_tools.signals.gps_l2c as gps_l2c
 
 from utils.bpsk_correlation import correlate__multicomponent
-from utils.code_components import BPSKComponent, TDBPSKComponent, build_code_set
+from utils.code_components import Branch, CodeComponent, build_code_set
 
 from . import synthetic
 
@@ -37,16 +37,30 @@ SAMP_RATE = 5e6
 EPL_BINS = np.array([0.5, 0.0, -0.5])  # early, prompt, late
 
 
+def _interleave(sequences):
+    """CM on even chips, CL on odd, zero-filled apart -- what the signal catalog
+    hands the correlator."""
+    stride = len(sequences)
+    filled = []
+    for offset, sequence in enumerate(sequences):
+        padded = np.zeros(len(sequence) * stride, dtype=np.int8)
+        padded[offset::stride] = sequence
+        filled.append(padded)
+    return filled
+
+
 def _l1ca_code_set(prn: int = 1):
-    return build_code_set([BPSKComponent(name="CA", sequence=synthetic.get_l1ca_code(prn))])
+    return build_code_set(
+        [CodeComponent(name="CA", sequence=synthetic.get_l1ca_code(prn), branch=Branch.Q)]
+    )
 
 
 def _l2c_code_set(prn: int = 1):
-    cm, cl = synthetic.get_l2c_codes(prn)
+    cm, cl = _interleave(list(synthetic.get_l2c_codes(prn)))
     return build_code_set(
         [
-            TDBPSKComponent(name="CM", sequence=cm, chips_per_component_chip=2, component_offset_chips=0),
-            TDBPSKComponent(name="CL", sequence=cl, chips_per_component_chip=2, component_offset_chips=1),
+            CodeComponent(name="CM", sequence=cm, branch=Branch.Q),
+            CodeComponent(name="CL", sequence=cl, branch=Branch.Q),
         ]
     )
 
@@ -112,9 +126,10 @@ def test_l1ca_wrong_prn_does_not_correlate():
 )
 def test_l2c_interleaved_recovers_both_components(start_chip):
     """
-    Each component's own index is chip_index // chips_per_component_chip, and the stream repeats
-    every lcm(stride * length) chips -- 2 * 767250 here, not max(length).  Indexing
-    with the raw chip index collapsed correlation to the noise floor.
+    Each component is indexed by the raw chip index into its own zero-filled
+    sequence, and the stream repeats every lcm of those lengths -- 2 * 767250
+    here, not 767250.  Wrapping by the shorter value collapsed correlation to
+    the noise floor.
     """
     samples, n = _l2c_signal(prn=1, duration_ms=20, code_phase_chips=start_chip)
     result = _correlate(
@@ -128,12 +143,12 @@ def test_l2c_interleaved_recovers_both_components(start_chip):
 def test_l2c_components_are_independent():
     """CM and CL must land in separate accumulators, not be summed or aliased."""
     samples, n = _l2c_signal(prn=1, duration_ms=20, code_phase_chips=0)
-    cm, _ = synthetic.get_l2c_codes(1)
-    _, wrong_cl = synthetic.get_l2c_codes(7)
+    cm, _ = _interleave(list(synthetic.get_l2c_codes(1)))
+    _, wrong_cl = _interleave(list(synthetic.get_l2c_codes(7)))
     mismatched_set = build_code_set(
         [
-            TDBPSKComponent(name="CM", sequence=cm, chips_per_component_chip=2, component_offset_chips=0),
-            TDBPSKComponent(name="CL", sequence=wrong_cl, chips_per_component_chip=2, component_offset_chips=1),
+            CodeComponent(name="CM", sequence=cm, branch=Branch.Q),
+            CodeComponent(name="CL", sequence=wrong_cl, branch=Branch.Q),
         ]
     )
 
@@ -246,14 +261,15 @@ def test_kernel_reads_each_component_from_its_own_block():
     seq_a[3] = -1  # A's only -1
     seq_b = -np.ones(length_b, dtype=np.int8)
     seq_b[5] = 1  # B's only +1
+    filled_a, filled_b = _interleave([seq_a, seq_b])
 
     code_set = build_code_set(
         [
-            TDBPSKComponent("A", seq_a, chips_per_component_chip=2, component_offset_chips=0),
-            TDBPSKComponent("B", seq_b, chips_per_component_chip=2, component_offset_chips=1),
+            CodeComponent("A", filled_a, branch=Branch.I),
+            CodeComponent("B", filled_b, branch=Branch.Q),
         ]
     )
-    assert code_set.component_code_start_indices.tolist() == [0, length_a]
+    assert code_set.component_code_start_indices.tolist() == [0, 2 * length_a]
 
     one_sample = np.ones(1, dtype=np.complex64)
     for chip in range(2 * length_a * length_b):
@@ -261,15 +277,8 @@ def test_kernel_reads_each_component_from_its_own_block():
         correlate__multicomponent(
             one_sample, 1.0, 0.0, 0.0, code_set, 1.0, float(chip), np.array([0.0]), out
         )
-        for component, (sequence, stride, offset) in enumerate(
-            ((seq_a, 2, 0), (seq_b, 2, 1))
-        ):
-            shifted = chip - offset
-            expected = (
-                0
-                if shifted % stride != 0
-                else int(sequence[(shifted // stride) % len(sequence)])
-            )
+        for component, sequence in enumerate((filled_a, filled_b)):
+            expected = int(sequence[chip % len(sequence)])
             assert int(np.real(out[0, component])) == expected, (
                 f"chip {chip}, component {component}"
             )
@@ -277,13 +286,14 @@ def test_kernel_reads_each_component_from_its_own_block():
 
 def test_subcarrier_signals_are_rejected_until_implemented():
     """BOC/TMBOC correlation lands with GPS L1C; until then it must not silently pass."""
-    from utils.code_components import BOCComponent, Subcarrier, SubcarrierKind
+    from utils.code_components import Subcarrier, SubcarrierKind
 
     code_set = build_code_set(
         [
-            BOCComponent(
+            CodeComponent(
                 name="P",
                 sequence=synthetic.get_l1ca_code(1),
+                branch=Branch.Q,
                 subcarrier=Subcarrier(kind=SubcarrierKind.BOC_SIN, rate_hz=1.023e6),
             )
         ]

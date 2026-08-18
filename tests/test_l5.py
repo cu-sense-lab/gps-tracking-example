@@ -52,12 +52,17 @@ def _correlate(samples, code_set, code_phase_chips, bins, carr_phase=0.0, dopple
 # --------------------------------------------------------------------------
 
 def test_components_are_colocated_not_interleaved(l5_definition):
-    """Unlike L2C, both L5 components occupy every chip."""
+    """
+    Unlike L2C, both L5 components occupy every chip -- no zero-filling, equal
+    lengths -- and are separated by carrier phase instead.  That quadrature is
+    why the carrier loop cannot move between them without a re-pull, which is
+    what keeps it on Q from the first epoch.
+    """
     code_set = l5_definition.code_set
     assert code_set.names == ("I", "Q")
-    np.testing.assert_array_equal(code_set.chips_per_component_chip, [1, 1])
-    np.testing.assert_array_equal(code_set.component_offset_chips, [0, 0])
     np.testing.assert_array_equal(code_set.component_code_lengths, [10230, 10230])
+    assert np.all(code_set.codes_flat != 0), "L5 transmits both components at every chip"
+    assert not code_set.share_branch("I", "Q")
 
 
 def test_primary_period_is_one_millisecond(l5_definition):

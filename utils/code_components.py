@@ -1,52 +1,49 @@
 """
 Signal-agnostic description of a GNSS signal's spreading-code structure.
 
-CHIP vs COMPONENT CHIP
-----------------------
-A **chip**, unqualified, is one position on the signal's chip clock -- the clock
-running at the signal's full chip rate: 1.023 Mcps for L1 C/A and for L2C's
-multiplexed CM/CL stream, 10.23 Mcps for L5.  Code phase is measured on this
-axis, so the integer part of a code phase *is* a chip index.
+CHIPS
+-----
+A **chip** is one position on the signal's chip clock -- the clock running at the
+signal's full chip rate: 1.023 Mcps for L1 C/A and for L2C's multiplexed CM/CL
+stream, 10.23 Mcps for L5.  Code phase is measured on this axis, so the integer
+part of a code phase *is* a chip index.
 
-A **component chip** is one position within a single component's own code
-sequence.  A component's chips can be sparser than the signal's: L2 CM chips run
-at 511.5 kcps on a 1.023 Mcps signal.
+Every component's sequence is stated on that one axis.  Component `c` contributes
 
-The two coincide only for a single-code signal.  How they relate is the
-multiplexing scheme:
+    sequence_c[k % code_length_c]
 
-    L1 C/A   one component, every chip         chip n     -> CA component chip n
-    L2C      CM and CL alternate (IS-GPS-200   chip 2n    -> CM component chip n
-             chip-by-chip time multiplexing)   chip 2n+1  -> CL component chip n
-    L5       I and Q share every chip,         chip n     -> I component chip n
-             separated by carrier phase                   -> and Q component chip n
+at chip `k` -- no per-component rate, no offset, no second kind of chip.  A
+component that is not transmitting at a given chip carries 0 there, which the
+correlator accumulates as nothing.  Time-division multiplexing is therefore data
+rather than metadata: L2C's CM is (CM_0, 0, CM_1, 0, ...) and its CL is
+(0, CL_0, 0, CL_1, ...), 20460 and 1534500 chips long respectively on the
+1.023 Mcps combined clock.
 
-Component `c` is present at chip `k` when
+    GPS L1 C/A   one component, every chip
+    GPS L2C      CM/CL interleaved chip by chip (IS-GPS-200), zero-filled apart
+    GPS L5       I/Q co-located on every chip, separated by carrier phase
+    GPS L1C      D/P co-located on every chip, separated by carrier phase
 
-    (k - component_offset_chips_c) % chips_per_component_chip_c == 0
+Storing the zeros costs one byte per chip per component and buys a correlator
+inner loop with no modulo and no divide in it -- measurably faster than deriving
+presence from a rate and an offset, and it removes the only place the sequence
+and its description could disagree.
 
-and, when present, contributes
+BRANCHES
+--------
+Components that share a chip are separated by carrier phase instead, and
+`branch` says which of the two quadrature carriers each one rides.  Nothing in
+the correlator consumes it: correlating the complex baseband against each real
+code already keeps them apart, and the 90 degrees lands in the carrier phase
+estimate.  What `branch` records is the *relative* fact -- two components on the
+same branch (L2C's CM and CL) can hand the carrier loop between them
+phase-continuously, while two on opposite branches (L5's I and Q) cannot without
+a quarter-cycle re-pull.
 
-    sequence_c[((k - component_offset_chips_c) // chips_per_component_chip_c) % code_length_c]
-
-`chips_per_component_chip_c` is how many chips pass between successive chips of
-that component -- a recurrence interval, not the width of a chip.  (In L2C each
-CM chip is transmitted as a one-chip pulse; what takes two is the gap until the
-next CM chip, which is why CM's own rate is half the signal's.)
-`component_offset_chips_c` is which of those chips it takes -- 0 for L2 CM,
-1 for L2 CL.
-
-That one rule covers every multiplexing scheme in the repository:
-
-    GPS L1 C/A   one component,  1 chip/component chip                (1.023 Mcps)
-    GPS L2C      CM/CL,          2 chips/component chip, offsets 0,1  (1.023 Mcps combined)
-    GPS L5       I/Q,            1 chip/component chip, both present  (10.23 Mcps)
-    GPS L1C      D/P,            1 chip/component chip, both present  (1.023 Mcps)
-
-L5 and L1C place their two components in carrier quadrature rather than in
-separate chips, so both are "always present" and are separated by correlating the
-same complex baseband against each real code independently -- no quadrature
-handling is needed here or in the correlator.
+The absolute value is unobservable to a receiver tracking one signal in
+isolation: L1 C/A and L2C both sit in quadrature to P(Y), which we never
+process, so their `Branch.Q` changes no behaviour.  It is recorded because it is
+true, and consumed only as a difference.
 
 Note "slot" is deliberately avoided: in GNSS it already means an orbital slot or
 a GLONASS frequency slot (see `GLONASS SLOT / FRQ #` in the RINEX reader).
@@ -58,16 +55,16 @@ Identifiers say what a quantity *is* and carry its unit as a suffix
 `code_rate_chips_per_sec` in the tracking channel.  "chips" is a unit, never a
 name on its own.
 
-Bare "chips" means the signal's chips, since that is the axis code phase lives
-on.  Only component-level quantities are qualified (`component_code_lengths`,
-`component_chip_index`) -- and inside `CodeComponent` itself even that is dropped,
-because everything there is about that one component.
+There is only one chip axis now, so "chips" never needs qualifying.  What stays
+qualified is the *per-component* array a code set flattens into
+(`component_code_lengths`, `component_code_start_indices`), because those index
+components rather than chips.
 
-`overlay`, `subcarrier` and `power_weight` describe structure that later signals
-need (tiered codes on L5/L1C, BOC/TMBOC on L1C, L1C's 25/75 power split).  They are
-carried by the data model from the outset so that adding those signals is a matter
-of configuration plus one correlator capability, rather than a redesign.  Nothing
-consumes them yet.
+`subcarrier` and `power_weight` describe structure that later signals need
+(BOC/TMBOC on L1C, L1C's 25/75 power split).  They are carried by the data model
+from the outset so that adding those signals is a matter of configuration plus
+one correlator capability, rather than a redesign.  Nothing consumes them yet.
+`branch` is carried for the same reason, and is documented above.
 
 This module is deliberately free of any GPS-specific constants; concrete signals are
 assembled in `utils.signal_interfaces`.
@@ -79,6 +76,26 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 import numpy as np
+
+
+class Branch(StrEnum):
+    """
+    Which of the two quadrature carriers a component rides.
+
+    Per IS-GPS-200/705/800, relative to the P(Y) in-phase reference:
+
+        GPS L1 C/A   Q
+        GPS L2C      CM Q, CL Q   (same branch -- see the module docstring)
+        GPS L5       I  I,  Q Q
+        GPS L1C      D  I,  P Q
+
+    Only differences between components of one signal are meaningful to a
+    receiver; there is no default because the simplest signal in the catalog
+    (L1 C/A) is on Q, so any default would be wrong somewhere obvious.
+    """
+
+    I = "I"
+    Q = "Q"
 
 
 class SubcarrierKind(StrEnum):
@@ -115,27 +132,18 @@ class Subcarrier:
 @dataclass(frozen=True)
 class CodeComponent:
     """
-    One spreading code within a signal, plus how it sits on the chip axis.
+    One spreading code within a signal, stated on the signal's chip axis.
 
-    Inside this class bare "chips" means this component's own chips.
-
-    Abstract base -- construct one of the four kinds below instead (see
-    TODO_SIGNALS.md): `BPSKComponent` (a single code, present at every chip),
-    `QPSKComponent` (one leg of a carrier-quadrature pair, e.g. L5 I/Q),
-    `TDBPSKComponent` (time-division multiplexed, e.g. L2C's CM/CL), or
-    `BOCComponent` (carries a subcarrier). All four share this same field
-    shape -- `build_code_set` and the correlator only ever see the base
-    shape -- so each subclass exists purely to name and validate one
-    multiplexing scheme; the class itself is what "type" a component is.
+    `sequence` runs at the signal's full chip rate and carries 0 at every chip
+    this component does not transmit on, so a time-multiplexed component is
+    simply a zero-filled one -- see the module docstring.  There is no second
+    kind of chip and no multiplexing metadata: what a component is, is its
+    sequence and which carrier branch it rides.
     """
 
     name: str
-    sequence: np.ndarray  # +/-1, int8
-    # Chips between successive component chips: 2 for L2C's CM and CL (each
-    # contributes one component chip every other chip), 1 for a single-code
-    # signal.  `component_offset_chips` picks which of those chips it takes.
-    chips_per_component_chip: int = 1
-    component_offset_chips: int = 0
+    sequence: np.ndarray  # +/-1 where transmitting, 0 elsewhere; int8
+    branch: Branch
     overlay: np.ndarray | None = None  # +/-1 tiered/secondary code
     subcarrier: Subcarrier | None = None
     power_weight: float = 1.0
@@ -145,11 +153,6 @@ class CodeComponent:
     symbol_period_ms: int | None = None
 
     def __post_init__(self) -> None:
-        if type(self) is CodeComponent:
-            raise TypeError(
-                "CodeComponent is abstract; construct a BPSKComponent, QPSKComponent, "
-                "TDBPSKComponent, or BOCComponent instead"
-            )
         if self.sequence.ndim != 1 or self.sequence.size == 0:
             raise ValueError(f"component {self.name!r}: sequence must be a non-empty 1-D array")
         if self.sequence.dtype != np.int8:
@@ -158,13 +161,9 @@ class CodeComponent:
                 "Some gnss_tools getters return float64 0/1 -- convert with "
                 "(1 - 2 * seq).astype(np.int8)."
             )
-        if self.chips_per_component_chip < 1:
-            raise ValueError(f"component {self.name!r}: chips_per_component_chip must be >= 1")
-        if not (0 <= self.component_offset_chips < self.chips_per_component_chip):
+        if not np.any(self.sequence):
             raise ValueError(
-                f"component {self.name!r}: component_offset_chips must satisfy "
-                f"0 <= component_offset_chips < chips_per_component_chip, got {self.component_offset_chips} "
-                f"with chips_per_component_chip {self.chips_per_component_chip}"
+                f"component {self.name!r}: sequence is all zeros, so it transmits nothing"
             )
         if self.power_weight <= 0.0:
             raise ValueError(f"component {self.name!r}: power_weight must be positive")
@@ -176,83 +175,8 @@ class CodeComponent:
 
     @property
     def code_length(self) -> int:
+        """Chips before this component's sequence repeats, zero chips included."""
         return int(self.sequence.size)
-
-    @property
-    def code_span_chips(self) -> int:
-        """
-        Chips covered by one full pass through this component's code.
-
-        For L2 CM: 2 x 10230 = 20460 chips = 20 ms, even though the code itself
-        is only 10230 component chips long.
-        """
-        return self.chips_per_component_chip * self.code_length
-
-
-@dataclass(frozen=True)
-class BPSKComponent(CodeComponent):
-    """A single spreading code, present at every chip -- e.g. GPS L1 C/A's CA code."""
-
-    def __post_init__(self) -> None:
-        super().__post_init__()
-        if self.chips_per_component_chip != 1 or self.component_offset_chips != 0:
-            raise ValueError(
-                f"component {self.name!r}: BPSKComponent is a single code at every chip; "
-                "use TDBPSKComponent for a time-multiplexed one"
-            )
-        if self.subcarrier is not None:
-            raise ValueError(f"component {self.name!r}: BPSKComponent has no subcarrier; use BOCComponent")
-
-
-@dataclass(frozen=True)
-class QPSKComponent(CodeComponent):
-    """
-    One leg of a carrier-quadrature pair sharing every chip -- e.g. GPS L5's I/Q,
-    GPS L1C's D/P. Positionally identical to BPSKComponent (both are present at
-    every chip); the separate class only tags "this is one leg of an I/Q pair",
-    which the correlator does not need to treat specially -- correlating the
-    complex baseband against each real code independently already keeps them
-    apart.
-    """
-
-    def __post_init__(self) -> None:
-        super().__post_init__()
-        if self.chips_per_component_chip != 1 or self.component_offset_chips != 0:
-            raise ValueError(
-                f"component {self.name!r}: QPSKComponent sits at every chip like its "
-                "quadrature sibling; use TDBPSKComponent for a time-multiplexed one"
-            )
-        if self.subcarrier is not None:
-            raise ValueError(f"component {self.name!r}: QPSKComponent has no subcarrier; use BOCComponent")
-
-
-@dataclass(frozen=True)
-class TDBPSKComponent(CodeComponent):
-    """Time-division multiplexed BPSK component -- e.g. GPS L2C's CM and CL."""
-
-    def __post_init__(self) -> None:
-        super().__post_init__()
-        if self.chips_per_component_chip < 2:
-            raise ValueError(
-                f"component {self.name!r}: TDBPSKComponent needs chips_per_component_chip >= 2; "
-                "a single-slot code is a BPSKComponent"
-            )
-        if self.subcarrier is not None:
-            raise ValueError(f"component {self.name!r}: TDBPSKComponent has no subcarrier; use BOCComponent")
-
-
-@dataclass(frozen=True)
-class BOCComponent(CodeComponent):
-    """
-    Component carrying a square-wave subcarrier -- e.g. future GPS L1C
-    (TMBOC), Galileo E1/E5 (CBOC). Not yet consumed by the correlator (see
-    `correlate__multicomponent`); this class exists so the shape is ready.
-    """
-
-    def __post_init__(self) -> None:
-        super().__post_init__()
-        if self.subcarrier is None:
-            raise ValueError(f"component {self.name!r}: BOCComponent requires a subcarrier")
 
 
 @dataclass(frozen=True)
@@ -266,17 +190,14 @@ class CodeSet:
 
         codes_flat[component_code_start_indices[c] : component_code_start_indices[c] + component_code_lengths[c]]
 
-    `component_code_start_indices` is a *base address* into `codes_flat`;
-    `component_offset_chips` is a *position on the chip axis*.  Unrelated
-    quantities, so they are named apart rather than both called "offset".
+    `component_code_start_indices` is a *base address* into `codes_flat`, not a
+    position on the chip axis.
     """
 
     components: tuple[CodeComponent, ...]
     codes_flat: np.ndarray  # int8, all component codes concatenated
     component_code_start_indices: np.ndarray  # int64, where each component's block starts in codes_flat
-    component_code_lengths: np.ndarray  # int64, component chips in each code
-    chips_per_component_chip: np.ndarray  # int64, chips between successive component chips
-    component_offset_chips: np.ndarray  # int64, which of those chips each component takes
+    component_code_lengths: np.ndarray  # int64, chips in each component's code
     pattern_period_chips: int  # chips before the whole pattern repeats
 
     @property
@@ -305,13 +226,26 @@ class CodeSet:
         except ValueError:
             raise KeyError(f"no component named {name!r}; have {self.names}") from None
 
+    @property
+    def branches(self) -> tuple[Branch, ...]:
+        return tuple(component.branch for component in self.components)
+
+    def share_branch(self, *names: str) -> bool:
+        """
+        True when every named component rides the same carrier branch, i.e. the
+        carrier loop can be handed between them without a quarter-cycle re-pull.
+
+        L2C's CM and CL do; L5's I and Q do not.
+        """
+        return len({self.components[self.index_of(name)].branch for name in names}) == 1
+
     def wrap_code_phase_chips(self, code_phase_chips: float) -> float:
         """
         Reduce a code phase into one full repetition of the multiplexed pattern.
 
-        Reducing by anything smaller -- e.g. one component's own length -- shifts
-        the `(k - component_offset_chips) // chips_per_component_chip` mapping and silently misaligns
-        every component once the phase runs past a code period.
+        Reducing by anything smaller -- e.g. one component's own length -- lands
+        the components at different points in their own codes and silently
+        misaligns them once the phase runs past a code period.
         """
         return float(code_phase_chips % self.pattern_period_chips)
 
@@ -323,11 +257,12 @@ def build_code_set(
     """
     Flatten components into kernel-ready arrays and derive the pattern period.
 
-    `allow_partial_coverage` waives the check that every chip belongs to some
-    component.  That check exists to catch a *transmit* topology which would leave
-    signal energy unclaimed, so it is right by default -- but a code set built to
-    score one component in isolation (L2 CL alone, on odd chips) legitimately
-    describes only part of the signal, and correlating it is exactly the intent.
+    `allow_partial_coverage` waives the check that every chip carries at least
+    one component.  That check exists to catch a *transmit* topology which would
+    leave signal energy unclaimed, so it is right by default -- but a code set
+    built to score one component in isolation (L2 CL alone, on odd chips)
+    legitimately describes only part of the signal, and correlating it is
+    exactly the intent.
     """
     components = tuple(components)
     if not components:
@@ -348,15 +283,13 @@ def build_code_set(
 
     # One repetition of the whole multiplexed pattern: every component must be back
     # at its own code origin simultaneously.
-    pattern_period_chips = int(np.lcm.reduce([c.code_span_chips for c in components]))
+    pattern_period_chips = int(np.lcm.reduce(code_lengths))
 
     return CodeSet(
         components=components,
         codes_flat=codes_flat,
         component_code_start_indices=start_indices,
         component_code_lengths=code_lengths,
-        chips_per_component_chip=np.array([c.chips_per_component_chip for c in components], dtype=np.int64),
-        component_offset_chips=np.array([c.component_offset_chips for c in components], dtype=np.int64),
         pattern_period_chips=pattern_period_chips,
     )
 
@@ -365,30 +298,31 @@ def _validate_chip_coverage(components: tuple[CodeComponent, ...]) -> None:
     """
     Catch topologies that cannot be what the caller meant.
 
-    Two components sharing both `chips_per_component_chip` and
-    `component_offset_chips` are co-located (L5 I/Q, L1C D/P) and are separated by
-    carrier phase -- that is legitimate.  But a mix that leaves some chip
-    claimed by no component means the correlator would silently skip signal
-    energy there.
-    """
-    if {c.chips_per_component_chip for c in components} == {1}:
-        return  # every component is present at every chip
+    Components may legitimately share a chip -- L5's I/Q and L1C's D/P are
+    co-located and separated by carrier phase.  What is not legitimate is a chip
+    that *no* component transmits on, because the correlator would silently skip
+    signal energy there.  Passing L2C's CM without its CL is the case this
+    catches: the odd chips would be zero in every component.
 
-    covered: set[int] = set()
-    phase_cycle = int(np.lcm.reduce([c.chips_per_component_chip for c in components]))
+    This reads the sequences rather than a description of them, over one full
+    repetition of the pattern.  Real spreading codes are +/-1, so a zero can only
+    have come from the interleaving fill, which is what makes the test sound.
+    """
+    period = int(np.lcm.reduce([c.code_length for c in components]))
+    covered = np.zeros(period, dtype=bool)
     for component in components:
-        for chip in range(phase_cycle):
-            if (
-                chip - component.component_offset_chips
-            ) % component.chips_per_component_chip == 0:
-                covered.add(chip)
-    missing = sorted(set(range(phase_cycle)) - covered)
-    if missing:
+        covered |= np.tile(component.sequence != 0, period // component.code_length)
+
+    missing = np.flatnonzero(~covered)
+    if missing.size:
+        shown = ", ".join(str(chip) for chip in missing[:8])
+        if missing.size > 8:
+            shown += ", ..."
         raise ValueError(
-            f"chips {missing} are claimed by no component "
-            f"(chips_per_component_chip={[c.chips_per_component_chip for c in components]}, "
-            f"component_offset_chips={[c.component_offset_chips for c in components]}); "
-            "the correlator would skip signal energy there"
+            f"{missing.size} of {period} chips carry no component (chips {shown}); "
+            "the correlator would skip signal energy there. If this code set "
+            "deliberately describes only part of a signal, pass "
+            "allow_partial_coverage=True."
         )
 
 
