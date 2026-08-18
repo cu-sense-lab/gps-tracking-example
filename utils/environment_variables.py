@@ -27,9 +27,9 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 dotenv.load_dotenv(REPO_ROOT / ".env")
 
-_PROCESSING_PATH: Optional[str] = os.environ.get("PROCESSING_PATH") or None
-_DATA_DIR: Optional[str] = os.environ.get("DATA_DIR") or None
-_COLLECTS_DIR: Optional[str] = os.environ.get("COLLECTS_DIR") or None
+_OUTPUTS_PATH: Optional[str] = os.environ.get("OUTPUTS_PATH") or None
+_RESOURCES_PATH: Optional[str] = os.environ.get("RESOURCES_PATH") or None
+_COLLECTS_PATH: Optional[str] = os.environ.get("COLLECTS_PATH") or None
 _EARTHDATA_USERNAME: Optional[str] = os.environ.get("EARTHDATA_USERNAME") or None
 _EARTHDATA_PASSWORD: Optional[str] = os.environ.get("EARTHDATA_PASSWORD") or None
 
@@ -47,24 +47,33 @@ def _resolve_dir(env_var: str, value: Optional[str], *, default: Optional[Path] 
     return path
 
 
-def get_data_dir() -> Path:
+def get_outputs_path() -> Path:
     """
-    `DATA_DIR`: base data directory used by `gnss_tools` for downloaded
+    `OUTPUTS_PATH`: working directory for processing outputs (acquisition/
+    tracking results, logs, etc.). Defaults to `<repo_root>/local-data` if
+    unset.
+    """
+    return _resolve_dir("OUTPUTS_PATH", _OUTPUTS_PATH, default=REPO_ROOT / "local-data")
+
+
+def get_resources_path() -> Path:
+    """
+    `RESOURCES_PATH`: base data directory used by `gnss_tools` for downloaded
     RINEX/orbit (SP3) data (`gnss_tools.rinex_io.cddis_download_utils`,
     `gnss_tools.misc.rinex_obs_utils`). No local default -- those helpers
     fall back to the current working directory if it's unset, which is
     rarely what you want, so this raises instead of guessing a path.
     """
-    return _resolve_dir("DATA_DIR", _DATA_DIR)
+    return _resolve_dir("RESOURCES_PATH", _RESOURCES_PATH)
 
 
-def get_collects_dir() -> Path:
+def get_collects_path() -> Path:
     """
-    `COLLECTS_DIR`: directory containing GNSS raw data collects, one
+    `COLLECTS_PATH`: directory containing GNSS raw data collects, one
     subdirectory per experiment (`<experiment_name>/metadata.yml` plus the
     raw IQ files it references). No local default; raises if unset.
     """
-    return _resolve_dir("COLLECTS_DIR", _COLLECTS_DIR)
+    return _resolve_dir("COLLECTS_PATH", _COLLECTS_PATH)
 
 
 def get_earthdata_credentials() -> Tuple[Optional[str], Optional[str]]:

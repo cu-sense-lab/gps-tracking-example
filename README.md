@@ -45,25 +45,25 @@ poetry install
 
 Runtime configurations (data locations and credentials) are read from a `.env` file in the root of this repository.
 Copy the template below and fill in real values for your machine. Each variable has a
-corresponding `get_*()` accessor in `utils/environment_variables.py` (e.g. `get_local_data_dir()`,
-`get_data_dir()`, `get_collects_dir()`, `get_earthdata_credentials()`) — use those instead of
+corresponding `get_*()` accessor in `utils/environment_variables.py` (e.g. `get_outputs_path()`,
+`get_resources_path()`, `get_collects_path()`, `get_earthdata_credentials()`) — use those instead of
 reading the environment directly.
 
 ```bash
 # Copy the following to `.env` and fill in real values for your machine.
 # `.env` is gitignored — never commit real paths/credentials.
 
-# Your working directory for sample collects and processing outputs
-# (raw IQ collects, acquisition/tracking results, logs, etc.). See
+# Your working directory for processing outputs
+# (acquisition/tracking results, logs, etc.). See
 # utils/environment_variables.py. Defaults to `<repo_root>/local-data` if unset.
-PROCESSING_PATH=
+OUTPUTS_PATH=
 
 # Base data directory used by gnss-tools for downloaded RINEX/orbit (SP3) data.
-DATA_DIR=
+RESOURCES_PATH=
 
-# Directory containing GNSS raw data collects, one subdirectory per experiment
-# (<experiment_name>/metadata.yml plus the raw IQ files it references).
-COLLECTS_DIR=
+# Path to directory containing GNSS raw data collects:
+# <experiment_name>/{collect_metadata.yml, <collect_id>.<ext>}
+COLLECTS_PATH=
 
 # Earthdata credentials for downloading RINEX/orbit (SP3) data from CDDIS/Earthdata.
 # helpers (gnss_tools.rinex_io.cddis_download_utils / earthdata_utils).
