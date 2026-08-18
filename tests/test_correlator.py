@@ -29,7 +29,7 @@ import gnss_tools.signals.gps_l1ca as gps_l1ca
 import gnss_tools.signals.gps_l2c as gps_l2c
 
 from utils.bpsk_correlation import correlate__multicomponent
-from utils.code_components import CodeComponent, build_code_set
+from utils.code_components import BPSKComponent, TDBPSKComponent, build_code_set
 
 from . import synthetic
 
@@ -38,15 +38,15 @@ EPL_BINS = np.array([0.5, 0.0, -0.5])  # early, prompt, late
 
 
 def _l1ca_code_set(prn: int = 1):
-    return build_code_set([CodeComponent(name="CA", sequence=synthetic.get_l1ca_code(prn))])
+    return build_code_set([BPSKComponent(name="CA", sequence=synthetic.get_l1ca_code(prn))])
 
 
 def _l2c_code_set(prn: int = 1):
     cm, cl = synthetic.get_l2c_codes(prn)
     return build_code_set(
         [
-            CodeComponent(name="CM", sequence=cm, chips_per_component_chip=2, component_offset_chips=0),
-            CodeComponent(name="CL", sequence=cl, chips_per_component_chip=2, component_offset_chips=1),
+            TDBPSKComponent(name="CM", sequence=cm, chips_per_component_chip=2, component_offset_chips=0),
+            TDBPSKComponent(name="CL", sequence=cl, chips_per_component_chip=2, component_offset_chips=1),
         ]
     )
 
@@ -132,8 +132,8 @@ def test_l2c_components_are_independent():
     _, wrong_cl = synthetic.get_l2c_codes(7)
     mismatched_set = build_code_set(
         [
-            CodeComponent(name="CM", sequence=cm, chips_per_component_chip=2, component_offset_chips=0),
-            CodeComponent(name="CL", sequence=wrong_cl, chips_per_component_chip=2, component_offset_chips=1),
+            TDBPSKComponent(name="CM", sequence=cm, chips_per_component_chip=2, component_offset_chips=0),
+            TDBPSKComponent(name="CL", sequence=wrong_cl, chips_per_component_chip=2, component_offset_chips=1),
         ]
     )
 
@@ -249,8 +249,8 @@ def test_kernel_reads_each_component_from_its_own_block():
 
     code_set = build_code_set(
         [
-            CodeComponent("A", seq_a, chips_per_component_chip=2, component_offset_chips=0),
-            CodeComponent("B", seq_b, chips_per_component_chip=2, component_offset_chips=1),
+            TDBPSKComponent("A", seq_a, chips_per_component_chip=2, component_offset_chips=0),
+            TDBPSKComponent("B", seq_b, chips_per_component_chip=2, component_offset_chips=1),
         ]
     )
     assert code_set.component_code_start_indices.tolist() == [0, length_a]
@@ -277,11 +277,11 @@ def test_kernel_reads_each_component_from_its_own_block():
 
 def test_subcarrier_signals_are_rejected_until_implemented():
     """BOC/TMBOC correlation lands with GPS L1C; until then it must not silently pass."""
-    from utils.code_components import Subcarrier, SubcarrierKind
+    from utils.code_components import BOCComponent, Subcarrier, SubcarrierKind
 
     code_set = build_code_set(
         [
-            CodeComponent(
+            BOCComponent(
                 name="P",
                 sequence=synthetic.get_l1ca_code(1),
                 subcarrier=Subcarrier(kind=SubcarrierKind.BOC_SIN, rate_hz=1.023e6),

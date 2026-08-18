@@ -18,9 +18,10 @@ import gnss_tools.signals.gps_l5 as gps_l5
 from utils import bpsk_acquisition
 from utils.bpsk_correlation import correlate__multicomponent
 from utils.signal_interfaces import (
-    SignalFamily,
+    TRACKING_POLICIES,
+    GpsL5,
     build_acquisition_code_params,
-    build_signal_definitions,
+    build_signals,
 )
 
 from . import synthetic
@@ -33,7 +34,7 @@ PRN = 1
 
 @pytest.fixture(scope="module")
 def l5_definition():
-    return build_signal_definitions(SignalFamily.L5, prns=[PRN])[f"G{PRN:02d}"]
+    return build_signals(GpsL5, prns=[PRN])[f"G{PRN:02d}"]
 
 
 def _correlate(samples, code_set, code_phase_chips, bins, carr_phase=0.0, doppler=0.0):
@@ -82,7 +83,7 @@ def test_carrier_loop_runs_on_the_pilot(l5_definition):
     Costas stays on until the overlay is stripped -- NH20 flips Q every 1 ms, so
     the pilot is not yet effectively dataless.
     """
-    policy = l5_definition.discriminator_policy
+    policy = TRACKING_POLICIES[GpsL5.signal_id].discriminator_policy
     assert policy.carrier_component == l5_definition.code_set.index_of("Q")
     assert policy.code_components == (0, 1), "delay discriminator should combine I and Q"
     assert policy.costas is True
@@ -136,7 +137,7 @@ def test_wrong_prn_does_not_correlate():
         prn=PRN, start_sec=0.0, duration_sec=1e-3, samp_rate=SAMP_RATE,
         doppler_hz=0.0, code_phase_ms=0.0, nav_bits=False, overlay=False,
     )
-    other = build_signal_definitions(SignalFamily.L5, prns=[11])["G11"]
+    other = build_signals(GpsL5, prns=[11])["G11"]
     result = _correlate(samples, other.code_set, 0.0, [0.0])
     n = len(samples)
     assert abs(result[0, 0]) < 0.1 * n
@@ -178,7 +179,7 @@ def test_early_late_are_symmetric_when_aligned(l5_definition):
 # --------------------------------------------------------------------------
 
 def _acquire(true_doppler_hz, code_phase_ms, half_bin, prn=PRN, noise_sigma=2.0, seed=0):
-    definitions = build_signal_definitions(SignalFamily.L5, prns=[prn])
+    definitions = build_signals(GpsL5, prns=[prn])
     config = bpsk_acquisition.AcquisitionConfiguration(
         # NH caps coherent integration at one primary code period; blocks are
         # combined non-coherently, so the overlay's sign flips are harmless.
@@ -197,7 +198,7 @@ def _acquire(true_doppler_hz, code_phase_ms, half_bin, prn=PRN, noise_sigma=2.0,
         sample_block=samples,
         sample_block_uptime_epoch_ms=0.0,
         acq_config=config,
-        code_parameters=build_acquisition_code_params(definitions),
+        code_parameters=build_acquisition_code_params(GpsL5, definitions),
         prob_false_alaram=1e-7,
         noise_var_method="abscorrvar",
         half_bin_doppler_search=half_bin,
@@ -238,10 +239,10 @@ def test_acquisition_rejects_an_absent_satellite():
 
     peaks = {}
     for prn in (PRN, 11):
-        definitions = build_signal_definitions(SignalFamily.L5, prns=[prn])
+        definitions = build_signals(GpsL5, prns=[prn])
         peaks[prn] = bpsk_acquisition.run_acquisition(
             sample_block=samples, sample_block_uptime_epoch_ms=0.0, acq_config=config,
-            code_parameters=build_acquisition_code_params(definitions),
+            code_parameters=build_acquisition_code_params(GpsL5, definitions),
             prob_false_alaram=1e-7, noise_var_method="abscorrvar",
         )[f"G{prn:02d}"]
 
@@ -323,13 +324,14 @@ def test_acquisition_seeds_tracking_to_convergence():
     acq_result, _ = _acquire(true_doppler_hz, code_phase_ms, half_bin=True, prn=prn)
     assert acq_result.signal_detected
 
-    definitions = build_signal_definitions(SignalFamily.L5, prns=[prn])
+    definitions = build_signals(GpsL5, prns=[prn])
     loop_params = tracking_channel.TrackingLoopParameters(
         DLL_bandwidth_hz=2.0, PLL_bandwidth_hz=20.0, FLL_bandwidth_hz=50.0,
         nominal_update_period_ms=1, corr_period_ms=1, EPL_chip_spacing=0.5,
     )
     channels = create_tracking_channels(
-        signal_definitions=definitions,
+        GpsL5,
+        signals=definitions,
         acquisition_results={f"G{prn:02d}": acq_result},
         tracking_signal_ids=[f"G{prn:02d}"],
         loop_params=loop_params,
@@ -380,7 +382,7 @@ def _track_until_synced(noise_sigma=3.0, buffers=14, buffer_ms=50, seed=4):
     from utils.signal_interfaces import create_tracking_channels
 
     true_doppler_hz, code_phase_ms = 1500.0, 0.31
-    definitions = build_signal_definitions(SignalFamily.L5, prns=[PRN])
+    definitions = build_signals(GpsL5, prns=[PRN])
     config = bpsk_acquisition.AcquisitionConfiguration(
         replica_duration_ms=1, num_blocks=20, sample_rate=SAMP_RATE,
         min_search_doppler_hz=-5000, max_search_doppler_hz=5000,
@@ -392,7 +394,7 @@ def _track_until_synced(noise_sigma=3.0, buffers=14, buffer_ms=50, seed=4):
             samp_rate=SAMP_RATE, doppler_hz=true_doppler_hz,
             code_phase_ms=code_phase_ms, noise_sigma=noise_sigma, rng=rng),
         sample_block_uptime_epoch_ms=0.0, acq_config=config,
-        code_parameters=build_acquisition_code_params(definitions),
+        code_parameters=build_acquisition_code_params(GpsL5, definitions),
         prob_false_alaram=1e-7, noise_var_method="abscorrvar",
         half_bin_doppler_search=True,
     )[f"G{PRN:02d}"]
@@ -403,7 +405,8 @@ def _track_until_synced(noise_sigma=3.0, buffers=14, buffer_ms=50, seed=4):
         nominal_update_period_ms=1, corr_period_ms=1, EPL_chip_spacing=0.5,
     )
     adapter = create_tracking_channels(
-        signal_definitions=definitions, acquisition_results={f"G{PRN:02d}": acq},
+        GpsL5,
+        signals=definitions, acquisition_results={f"G{PRN:02d}": acq},
         tracking_signal_ids=[f"G{PRN:02d}"], loop_params=loop_params,
         output_capacity=4000,
     )[f"G{PRN:02d}"]

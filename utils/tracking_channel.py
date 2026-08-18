@@ -349,6 +349,16 @@ class SignalTrackingOutputs:
         self.prompt_corr_circ_length = np.zeros(capacity, dtype=float)
         self.output_index = 0
 
+    @property
+    def valid(self) -> slice:
+        """
+        Slice covering only the epochs actually written. The arrays above are
+        pre-allocated to `capacity`; a run shorter than that leaves the tail
+        zero-filled, which silently draws a spurious line/point back through
+        (0, 0) if plotted unsliced.
+        """
+        return slice(0, self.output_index)
+
 
 @dataclass
 class CorrelationInterval:

@@ -118,6 +118,15 @@ class CodeComponent:
     One spreading code within a signal, plus how it sits on the chip axis.
 
     Inside this class bare "chips" means this component's own chips.
+
+    Abstract base -- construct one of the four kinds below instead (see
+    TODO_SIGNALS.md): `BPSKComponent` (a single code, present at every chip),
+    `QPSKComponent` (one leg of a carrier-quadrature pair, e.g. L5 I/Q),
+    `TDBPSKComponent` (time-division multiplexed, e.g. L2C's CM/CL), or
+    `BOCComponent` (carries a subcarrier). All four share this same field
+    shape -- `build_code_set` and the correlator only ever see the base
+    shape -- so each subclass exists purely to name and validate one
+    multiplexing scheme; the class itself is what "type" a component is.
     """
 
     name: str
@@ -132,6 +141,11 @@ class CodeComponent:
     power_weight: float = 1.0
 
     def __post_init__(self) -> None:
+        if type(self) is CodeComponent:
+            raise TypeError(
+                "CodeComponent is abstract; construct a BPSKComponent, QPSKComponent, "
+                "TDBPSKComponent, or BOCComponent instead"
+            )
         if self.sequence.ndim != 1 or self.sequence.size == 0:
             raise ValueError(f"component {self.name!r}: sequence must be a non-empty 1-D array")
         if self.sequence.dtype != np.int8:
@@ -164,6 +178,72 @@ class CodeComponent:
         is only 10230 component chips long.
         """
         return self.chips_per_component_chip * self.code_length
+
+
+@dataclass(frozen=True)
+class BPSKComponent(CodeComponent):
+    """A single spreading code, present at every chip -- e.g. GPS L1 C/A's CA code."""
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if self.chips_per_component_chip != 1 or self.component_offset_chips != 0:
+            raise ValueError(
+                f"component {self.name!r}: BPSKComponent is a single code at every chip; "
+                "use TDBPSKComponent for a time-multiplexed one"
+            )
+        if self.subcarrier is not None:
+            raise ValueError(f"component {self.name!r}: BPSKComponent has no subcarrier; use BOCComponent")
+
+
+@dataclass(frozen=True)
+class QPSKComponent(CodeComponent):
+    """
+    One leg of a carrier-quadrature pair sharing every chip -- e.g. GPS L5's I/Q,
+    GPS L1C's D/P. Positionally identical to BPSKComponent (both are present at
+    every chip); the separate class only tags "this is one leg of an I/Q pair",
+    which the correlator does not need to treat specially -- correlating the
+    complex baseband against each real code independently already keeps them
+    apart.
+    """
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if self.chips_per_component_chip != 1 or self.component_offset_chips != 0:
+            raise ValueError(
+                f"component {self.name!r}: QPSKComponent sits at every chip like its "
+                "quadrature sibling; use TDBPSKComponent for a time-multiplexed one"
+            )
+        if self.subcarrier is not None:
+            raise ValueError(f"component {self.name!r}: QPSKComponent has no subcarrier; use BOCComponent")
+
+
+@dataclass(frozen=True)
+class TDBPSKComponent(CodeComponent):
+    """Time-division multiplexed BPSK component -- e.g. GPS L2C's CM and CL."""
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if self.chips_per_component_chip < 2:
+            raise ValueError(
+                f"component {self.name!r}: TDBPSKComponent needs chips_per_component_chip >= 2; "
+                "a single-slot code is a BPSKComponent"
+            )
+        if self.subcarrier is not None:
+            raise ValueError(f"component {self.name!r}: TDBPSKComponent has no subcarrier; use BOCComponent")
+
+
+@dataclass(frozen=True)
+class BOCComponent(CodeComponent):
+    """
+    Component carrying a square-wave subcarrier -- e.g. future GPS L1C
+    (TMBOC), Galileo E1/E5 (CBOC). Not yet consumed by the correlator (see
+    `correlate__multicomponent`); this class exists so the shape is ready.
+    """
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if self.subcarrier is None:
+            raise ValueError(f"component {self.name!r}: BOCComponent requires a subcarrier")
 
 
 @dataclass(frozen=True)

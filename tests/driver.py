@@ -14,18 +14,14 @@ from __future__ import annotations
 
 import numpy as np
 
-import gnss_tools.signals.gps_l1ca as gps_l1ca
-import gnss_tools.signals.gps_l2c as gps_l2c
-import gnss_tools.signals.gps_l5 as gps_l5
-
 from utils import sample_streaming
 from utils import tracking_channel
-from utils.signal_interfaces import SignalFamily, build_signal_definitions
+from utils.signal_interfaces import TRACKING_POLICIES, GpsL1CA, GpsL2C, GpsL5, build_signals
 
 from . import synthetic
 from .scenarios import TrackingScenario
 
-# Loop settings mirror notebooks/gps-acq-track-configurable.ipynb.
+# Loop settings mirror notebooks/02-acquisition-and-tracking.ipynb.
 BLOCK_DURATION_MS = 1
 LOOP_KWARGS = dict(
     DLL_bandwidth_hz=2.0,
@@ -37,10 +33,10 @@ LOOP_KWARGS = dict(
     prompt_corr_circ_length_threshold=0.9,
 )
 
-_FAMILY_CONSTANTS = {
-    "L1CA": (gps_l1ca.CARRIER_FREQ, gps_l1ca.CODE_RATE),
-    "L2C": (gps_l2c.CARRIER_FREQ, gps_l2c.CODE_RATE_L2CLM),
-    "L5": (gps_l5.CARRIER_FREQ, gps_l5.CODE_RATE),
+_SIGNAL_TYPES = {
+    "L1CA": GpsL1CA,
+    "L2C": GpsL2C,
+    "L5": GpsL5,
 }
 
 _FAMILY_GENERATORS = {
@@ -69,41 +65,43 @@ def _build_channel(scenario: TrackingScenario):
     Build a channel straight from the shipped signal definitions, so the tests
     exercise the same configuration the notebook does rather than a parallel one.
     """
-    carrier_freq_hz, code_rate = _FAMILY_CONSTANTS[scenario.family]
+    signal_type = _SIGNAL_TYPES[scenario.family]
     loop_params = tracking_channel.TrackingLoopParameters(**LOOP_KWARGS)
+    policy = TRACKING_POLICIES[signal_type.signal_type_id]
 
-    signal_def = build_signal_definitions(
-        SignalFamily(scenario.family), prns=[scenario.prn]
-    )[f"G{scenario.prn:02d}"]
+    signal = build_signals(signal_type, prns=[scenario.prn])[f"G{scenario.prn:02d}"]
 
     # Seed the loops the way acquisition would: offset Doppler, offset code phase.
     seed_doppler_hz = scenario.doppler_hz - scenario.doppler_error_hz
-    seed_code_phase_ms = scenario.code_phase_ms + scenario.code_error_chips * 1e3 / code_rate
+    seed_code_phase_ms = (
+        scenario.code_phase_ms
+        + scenario.code_error_chips * 1e3 / signal_type.tracking_code_rate_chips_per_sec
+    )
     initial_state = tracking_channel.TrackingSignalState(
         uptime_epoch_ms=0.0,
         code_phase_ms=seed_code_phase_ms,
-        code_rate_ms_per_sec=(1.0 + seed_doppler_hz / carrier_freq_hz) * 1e3,
+        code_rate_ms_per_sec=(1.0 + seed_doppler_hz / signal_type.carrier_freq_hz) * 1e3,
         carrier_phase_cycles=0.0,
         carrier_rate_cyc_per_sec=seed_doppler_hz,
     )
 
     signal_params = tracking_channel.TrackingSignalParameters(
-        code_set=signal_def.code_set,
-        nominal_code_rate_chips_per_sec=signal_def.tracking_code_rate_chips_per_sec,
-        carrier_freq_hz=signal_def.carrier_freq_hz,
-        primary_period_ms=signal_def.primary_period_ms,
+        code_set=signal.code_set,
+        nominal_code_rate_chips_per_sec=signal_type.tracking_code_rate_chips_per_sec,
+        carrier_freq_hz=signal_type.carrier_freq_hz,
+        primary_period_ms=signal_type.primary_period_ms,
     )
     return tracking_channel.TrackingChannel(
         loop_params=loop_params,
         signal_params=signal_params,
         initial_signal_state=initial_state,
         output_capacity=scenario.duration_ms // BLOCK_DURATION_MS + 16,
-        discriminator_policy=signal_def.discriminator_policy,
+        discriminator_policy=policy.discriminator_policy,
         # Must mirror create_tracking_channels, or the goldens would silently
         # cover a different configuration than the notebook runs: overlay
         # wipe-off without the extended integration and policy switch it enables.
-        synced_policy=signal_def.synced_discriminator_policy,
-        synced_coherent_periods=signal_def.synced_coherent_periods,
+        synced_policy=policy.synced_discriminator_policy,
+        synced_coherent_periods=policy.synced_coherent_periods,
     )
 
 

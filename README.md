@@ -1,5 +1,19 @@
 
-## Installation
+# GNSS Processing Package
+
+The current (as of 2026) SeNSe Lab GNSS processing package is a collection of Python scripts and functions that can be used to process GNSS data.  It is designed to be modular, so that you can use only the parts you need for your own research or learning. 
+
+## Getting Started
+
+1. Clone the repository and initialize submodules:
+
+```bash
+git clone https://github.com/cu-sense-lab/gps-tracking-example
+cd gps-tracking-example
+git submodule update --init --recursive
+```
+
+2. Conda+Poetry Environment Setup
 
 If you know what you're doing and want to use your own virtual environment manager (`uv`, `venv`, etc.), go for it!
 
@@ -12,39 +26,68 @@ See install here:  https://python-poetry.org/docs/
 To set up the environment, you can run:
 
 ```bash
-conda env create -f environment.yml
+conda env create -f environment.yml --prefix ./.conda_env
 ```
 
-To activate the environment, run:
+To activate the environment, run (from the root of this repository):
 
 ```bash
-conda activate gnss_tracking_example
+conda activate ./.conda_env
 ```
 
-To install the package in editable mode, run:
+To install the packages, run:
 
 ```bash
-git submodule update --init --recursive
 poetry install
 ```
 
-Note: there is a submodule `gnss-tools` in this repository that contains some utility functions.  It is another github repository, located here:
+3. Environment Variable Setup
+
+Runtime configurations (data locations and credentials) are read from a `.env` file in the root of this repository.
+Copy the template below and fill in real values for your machine. Each variable has a
+corresponding `get_*()` accessor in `utils/environment_variables.py` (e.g. `get_local_data_dir()`,
+`get_data_dir()`, `get_collects_dir()`, `get_earthdata_credentials()`) — use those instead of
+reading the environment directly.
+
+```bash
+# Copy the following to `.env` and fill in real values for your machine.
+# `.env` is gitignored — never commit real paths/credentials.
+
+# Your working directory for sample collects and processing outputs
+# (raw IQ collects, acquisition/tracking results, logs, etc.). See
+# utils/environment_variables.py. Defaults to `<repo_root>/local-data` if unset.
+PROCESSING_PATH=
+
+# Base data directory used by gnss-tools for downloaded RINEX/orbit (SP3) data.
+DATA_DIR=
+
+# Directory containing GNSS raw data collects, one subdirectory per experiment
+# (<experiment_name>/metadata.yml plus the raw IQ files it references).
+COLLECTS_DIR=
+
+# Earthdata credentials for downloading RINEX/orbit (SP3) data from CDDIS/Earthdata.
+# helpers (gnss_tools.rinex_io.cddis_download_utils / earthdata_utils).
+EARTHDATA_USERNAME=
+EARTHDATA_PASSWORD=
+```
+
+
+## Notes
+
+- There is a submodule `gnss-tools` in this repository that contains some utility functions.  It is another github repository, located here:
 https://github.com/cu-sense-lab/gnss-tools
 
-## Usage
+- You can add your own utilities/functions to the `utils/` folder as needed.
 
-You can add your own utilities/functions to the `utils/` folder as needed.
-
-Please email me if you have any problems, and I will do my best to help!
-
-
-## Updating Environment
+- Please email me if you have any problems, and I will do my best to help!
 
 *Aside*: I had forgotten that `numba` (a package for JIT compiling Python code) is not
-compatible with Python 3.14 yet, so I had to downgrade back to 3.13.  If you already made
+currently compatible with Python 3.14 yet, so I had to downgrade back to 3.13.  If you already made
 a Python 3.14 environment, you can remake it with:
 
     conda env remove -n gnss_lectures
     conda env create -f environment.yml
     conda activate gnss_lectures
     poetry install
+
+

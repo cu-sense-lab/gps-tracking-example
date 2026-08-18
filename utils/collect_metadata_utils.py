@@ -1,8 +1,7 @@
-import os
 import logging
-from pathlib import Path
 import yaml
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 from dataclasses import dataclass
 from .sample_streaming import SampleParameters
@@ -175,8 +174,6 @@ def parse_experiment_metadata(metadata_dict: Dict[str, Any], verbose: bool = Fal
     return ExperimentMetadata.from_dict(metadata_dict, verbose=verbose)
 
 def print_experiment_available_collects_and_bands(metadata: ExperimentMetadata, print_prefix: str = ""):
-    # print(print_prefix + f"Bands: " + " ".join(metadata.band_ids))
-    # print(print_prefix + f"Channel configs: " + " ".join(metadata.channel_ids))
     print(print_prefix + f"Available bands: " + " ".join(metadata.band_ids))
     print(print_prefix + f"Available collects:")
     for collect_id in metadata.collect_ids:
@@ -202,61 +199,58 @@ def load_experiment_metadata_from_file(metadata_filepath: str, print_summary: bo
     return metadata
 
 
-import matplotlib.pyplot as plt
-from matplotlib.figure import Figure, SubFigure
-from matplotlib.axes import Axes
+def list_experiment_names(collects_dir: Path) -> List[str]:
+    """
+    Experiment names available under `<collects_dir>/`, each expected
+    to contain a `metadata.yml` (see `load_experiment_metadata_from_file`).
+    """
+    return sorted(fp.name for fp in collects_dir.iterdir() if fp.is_dir())
 
-def plot_receiver_channel_bands(
-        fig: Figure | SubFigure,
-        metadata: ExperimentMetadata,
-        include_bands: Optional[Iterable[str]] = None,
-        exclude_bands: Optional[Iterable[str]] = None,
-        samp_bandwidth_height: float = 0.5,
-        samp_center_height: float = 0.8,
-):
-    axes = fig.subplots(1, 2, sharey=True)
-    ax1: Axes = axes[0]
-    ax2: Axes = axes[1]
-    # Want to plot two axes;
-    # Left shows baseband frequencies and right shows RF frequencies
-    # Channel IDs go down the y-axis
-    band_colors = {}
-    for i, band_id in enumerate(metadata.band_ids):
-        band_colors[band_id] = f"C{i}"
-    
-    band_configurations = metadata.band_configurations
-    for i, channel_id in enumerate(metadata.channel_ids):
-        channel_config = metadata.channel_configurations[channel_id]
-        samp_bandwidth_MHz = channel_config.samp_rate / 1e6
-        is_real = not channel_config.sample_params.is_complex
-        if is_real:
-            # Only shade positive frequencies
-            ax1.fill_betweenx([i - samp_bandwidth_height / 2, i + samp_bandwidth_height / 2], 0, samp_bandwidth_MHz / 2, color="r", alpha=0.3)
-        else:
-            ax1.fill_betweenx([i - samp_bandwidth_height / 2, i + samp_bandwidth_height / 2], -samp_bandwidth_MHz / 2, samp_bandwidth_MHz / 2, color="b", alpha=0.3)
-        
-        for band_id in channel_config.band_ids:
-            band_config = band_configurations[band_id]
-            baseband_if_MHz = band_config.inter_freq / 1e6
-            rf_center_MHz = band_config.center_freq / 1e6
 
-            # Plot delta-like markers at IF (baseband) and RF center frequencies.
-            ax1.vlines(baseband_if_MHz, i - samp_center_height / 2, i + samp_center_height / 2, color="k", linewidth=2)
-            # ax1.plot([baseband_if], [i], marker="|", markersize=12, color="C0")
+@dataclass
+class ResolvedCollect:
+    """Everything needed to open one band of one collect and stream its samples."""
 
-            ax2.vlines(rf_center_MHz, i - samp_center_height / 2, i + samp_center_height / 2, color="k", linewidth=2)
-            # ax2.plot([rf_center], [i], marker="|", markersize=12, color="C1")
-            
-            rf_band_center_MHz = (band_config.center_freq - band_config.inter_freq) / 1e6
-            if is_real:
-                ax2.fill_betweenx([i - samp_bandwidth_height / 2, i + samp_bandwidth_height / 2], rf_band_center_MHz, rf_band_center_MHz + samp_bandwidth_MHz / 2, color="r", alpha=0.3)
-            else:
-                ax2.fill_betweenx([i - samp_bandwidth_height / 2, i + samp_bandwidth_height / 2], rf_band_center_MHz - samp_bandwidth_MHz / 2, rf_band_center_MHz + samp_bandwidth_MHz / 2, color="r", alpha=0.3)
-        
+    experiment_name: str
+    metadata: ExperimentMetadata
+    collect_id: str
+    band_id: str
+    collect_filepath: Path
+    samp_rate: float
+    sample_params: SampleParameters
+    inter_freq_hz: Optional[float]
 
-    ax1.set_yticks(range(len(metadata.channel_ids)))
-    ax1.set_yticklabels(metadata.channel_ids)
-    for ax in [ax1, ax2]:
-        ax.grid()
-    ax1.set_xlabel("Baseband Frequency [MHz]")
-    ax2.set_xlabel("RF Frequency [MHz]")
+
+def resolve_collect(
+    collects_dir: Path,
+    experiment_name: str,
+    collect_id: str,
+    band_id: str,
+    print_summary: bool = False,
+) -> ResolvedCollect:
+    """
+    Load `<collects_dir>/<experiment_name>/metadata.yml` and resolve
+    `collect_id`/`band_id` (see `list_experiment_names` and, once loaded, the
+    metadata's own `.collect_ids`/`.band_ids`) into a concrete file + sample
+    format, replacing the "select experiment/collect/band by hardcoded list
+    index" boilerplate every notebook otherwise repeats.
+    """
+    experiment_dir = collects_dir / experiment_name
+    metadata = load_experiment_metadata_from_file(
+        experiment_dir / "metadata.yml", print_summary=print_summary
+    )
+
+    collect_config = metadata.collects[collect_id]
+    channel_config = metadata.channel_configurations[collect_config.channel_config_id]
+    band_config = metadata.band_configurations[band_id]
+
+    return ResolvedCollect(
+        experiment_name=experiment_name,
+        metadata=metadata,
+        collect_id=collect_id,
+        band_id=band_id,
+        collect_filepath=experiment_dir / collect_config.filename,
+        samp_rate=channel_config.samp_rate,
+        sample_params=channel_config.sample_params,
+        inter_freq_hz=band_config.inter_freq,
+    )
