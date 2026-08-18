@@ -292,6 +292,26 @@ what a signal *is*, how it is *acquired*, and how it is *tracked*.
   `signal_type_id`. `build_acquisition_code_params(signal_type, signals)` and
   `create_tracking_channels(signal_type, signals, ...)` look policy up from
   there rather than reading it off the signal.
+- **What acquisition cannot locate is policy too.** `AcquisitionPolicy` also
+  carries `include_overlay` — fold the component's tiered (overlay) code into
+  the replica rather than let it break coherence, which is how L5 acquires on
+  Q × NH20 — and `ambiguous_component`, the component whose period is longer
+  than the acquisition code's and which the dwell therefore leaves unlocated
+  (L2C's CL, 75 CM periods long). `build_ambiguity_search(signal_type, signal)`
+  derives the hypothesis search from those two facts plus the signal's own
+  code spans, and `resolve_acquisition_ambiguities(...)` scores the candidates
+  over the same dwell acquisition already used, with the same coherent block
+  structure, so each hypothesis takes exactly the Doppler loss acquisition
+  survived. `create_tracking_channels` folds a confident result into the
+  seeded code phase and, via `TrackingPolicy.resolved_discriminator_policy`,
+  can move the loops onto the newly usable component. When the acquisition code
+  spans a whole overlay period (`acquisition_resolves_overlay_phase`), the
+  recovered code phase carries the overlay counter outright and the channel
+  starts already synced — no search at all.
+- `TrackingPolicy.synced_coherent_integration_ms` is a *duration*, not a count
+  of primary code periods: one epoch serves every component, so the post-sync
+  length is bounded by the shortest data symbol in the signal (10 ms for L5,
+  I's CNAV symbol) rather than by the pilot's overlay period.
 - `TrackingChannelAdapter` — the object notebooks actually hold: wraps a
   concrete `tracking_channel.TrackingChannel` + the `Signal` that configured
   it, and exposes `get_prompt_component`/`get_early_component`/

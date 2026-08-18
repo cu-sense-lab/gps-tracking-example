@@ -139,6 +139,10 @@ class CodeComponent:
     overlay: np.ndarray | None = None  # +/-1 tiered/secondary code
     subcarrier: Subcarrier | None = None
     power_weight: float = 1.0
+    # Duration of one data symbol on this component; None for a dataless pilot.
+    # This is what bounds coherent integration once any overlay is stripped: an
+    # accumulation spanning a symbol boundary partly cancels itself.
+    symbol_period_ms: int | None = None
 
     def __post_init__(self) -> None:
         if type(self) is CodeComponent:
@@ -164,6 +168,11 @@ class CodeComponent:
             )
         if self.power_weight <= 0.0:
             raise ValueError(f"component {self.name!r}: power_weight must be positive")
+        if self.symbol_period_ms is not None and self.symbol_period_ms < 1:
+            raise ValueError(
+                f"component {self.name!r}: symbol_period_ms must be >= 1 ms or None "
+                f"(dataless), got {self.symbol_period_ms}"
+            )
 
     @property
     def code_length(self) -> int:
@@ -307,8 +316,19 @@ class CodeSet:
         return float(code_phase_chips % self.pattern_period_chips)
 
 
-def build_code_set(components: tuple[CodeComponent, ...] | list[CodeComponent]) -> CodeSet:
-    """Flatten components into kernel-ready arrays and derive the pattern period."""
+def build_code_set(
+    components: tuple[CodeComponent, ...] | list[CodeComponent],
+    allow_partial_coverage: bool = False,
+) -> CodeSet:
+    """
+    Flatten components into kernel-ready arrays and derive the pattern period.
+
+    `allow_partial_coverage` waives the check that every chip belongs to some
+    component.  That check exists to catch a *transmit* topology which would leave
+    signal energy unclaimed, so it is right by default -- but a code set built to
+    score one component in isolation (L2 CL alone, on odd chips) legitimately
+    describes only part of the signal, and correlating it is exactly the intent.
+    """
     components = tuple(components)
     if not components:
         raise ValueError("a signal needs at least one code component")
@@ -317,7 +337,8 @@ def build_code_set(components: tuple[CodeComponent, ...] | list[CodeComponent]) 
     if len(set(names)) != len(names):
         raise ValueError(f"component names must be unique, got {names}")
 
-    _validate_chip_coverage(components)
+    if not allow_partial_coverage:
+        _validate_chip_coverage(components)
 
     codes_flat = np.concatenate([c.sequence for c in components]).astype(np.int8)
     code_lengths = np.array([c.code_length for c in components], dtype=np.int64)

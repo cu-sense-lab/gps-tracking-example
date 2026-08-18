@@ -14,11 +14,45 @@ class SignalReplicaCacheEntry:
 
 @dataclass
 class AcquisitionConfiguration:
+    """
+    Acquisition dwell layout.
+
+    Two lengths, and they are not the same thing:
+
+    `replica_duration_ms` is the replica -- and therefore the FFT -- length.  The
+    correlation is circular, so this must be a whole number of code periods or the
+    wraparound matches the data against the wrong chips.
+
+    `coherent_duration_ms` is how much data goes into one coherent integration.
+    It defaults to the replica length, which is what every caller did before it
+    existed.  Setting it shorter zero-pads each block up to the replica length,
+    and `num_blocks` of them are then summed by square law.
+
+    Shortening it is how a signal whose data symbol is no longer than its code
+    period gets acquired at all.  GPS L2 CM is the case in point: its 20 ms code
+    period is exactly its CNAV symbol, so a 20 ms coherent integration at an
+    arbitrary alignment straddles a symbol boundary.  There is a 50% chance of a
+    flip, and when one happens the surviving amplitude is |2a - 1| for a boundary
+    a fraction `a` of the way through -- a null when it lands mid-window.  Four
+    5 ms blocks put at most one boundary inside any single block.
+
+    The two lengths drive different things, which is the point of separating them:
+
+        Doppler grid spacing   = 1 / replica_duration    (FFT bin width)
+        Doppler response width = 1 / coherent_duration   (correlation mainlobe)
+
+    With a short coherent length the grid is finer than the response, so the
+    residual Doppler error is set by the grid rather than by the mainlobe.
+    """
+
     replica_duration_ms: int
     num_blocks: int
     sample_rate: int
     min_search_doppler_hz: float
     max_search_doppler_hz: float
+    # None means "one coherent integration per replica period", the behaviour
+    # every existing caller relies on.
+    coherent_duration_ms: float | None = None
 
     def __post_init__(self):
         self.replica_length_samples = int(
@@ -27,11 +61,30 @@ class AcquisitionConfiguration:
         self.replica_time_arr = (
             np.arange(self.replica_length_samples) / self.sample_rate
         )
-        self.block_size_samples = self.replica_length_samples
-        self.block_duration_seconds = self.block_size_samples / self.sample_rate
-        self.fft_resolution = 1 / self.block_duration_seconds
+
+        if self.coherent_duration_ms is None:
+            self.coherent_duration_ms = float(self.replica_duration_ms)
+        if not 0 < self.coherent_duration_ms <= self.replica_duration_ms:
+            raise ValueError(
+                f"coherent_duration_ms must satisfy 0 < coherent <= replica "
+                f"({self.replica_duration_ms} ms), got {self.coherent_duration_ms}"
+            )
+        self.coherent_length_samples = int(
+            self.sample_rate * self.coherent_duration_ms / 1000
+        )
+        if self.coherent_length_samples < 1:
+            raise ValueError(
+                f"coherent_duration_ms {self.coherent_duration_ms} is shorter than one "
+                f"sample period at {self.sample_rate} Hz"
+            )
+
+        # Grid spacing comes from the FFT length; mainlobe width from how much
+        # data is actually integrated.  They coincide only when the two lengths do.
+        self.fft_resolution = self.sample_rate / self.replica_length_samples
+        self.doppler_response_width_hz = self.sample_rate / self.coherent_length_samples
+
         assert self.num_blocks > 0
-        self.acq_total_duration_ms = self.num_blocks * self.replica_duration_ms
+        self.acq_total_duration_ms = self.num_blocks * self.coherent_duration_ms
         self.total_num_samples = int(
             self.acq_total_duration_ms / 1000 * self.sample_rate
         )
@@ -97,7 +150,12 @@ class AcquisitionResult:
     peak_doppler_bin: int
     peak_code_phase_bin: int
     normalized_peak_value: float
-    prob_false_alarm: float
+    # The total the caller asked for, across this signal's whole search grid, and
+    # the per-cell rate it was converted into.  Both are kept because only the
+    # first is meaningful to a human and only the second sets the threshold.
+    prob_false_alarm_total: float
+    prob_false_alarm_per_cell: float
+    num_detection_cells: int
     detection_threshold: float
     noise_var: float
     signal_detected: bool
@@ -122,12 +180,64 @@ class AcquisitionResult:
         )
 
 
+def pack_coherent_blocks(
+    sample_block: NDArray[np.complex64],
+    num_blocks: int,
+    fft_length_samples: int,
+    coherent_length_samples: int,
+) -> NDArray[np.complex64]:
+    """
+    Lay each coherent block into a full-length FFT window, zero elsewhere.
+
+    A block shorter than the replica has to be zero-padded, and *where* the data
+    sits in that window matters.  Block `j` was received at samples
+    `[j * coherent_length, ...)`, so the code had already advanced that far; its
+    correlation peak therefore sits at lag `p + j * coherent_length`.  Padding
+    every block at position 0 would leave each peak at a different lag and the
+    square-law sum would smear them across the code phase axis instead of
+    stacking them.
+
+    Placing block `j` at the offset it actually occupied within the code period --
+    `j * coherent_length` modulo the period -- puts every peak back at the same
+    lag `p`.  Equivalently: each block is the whole dwell window with everything
+    outside its own slice zeroed, so all blocks share one time origin.
+
+    Zero-padding the *data* rather than the replica is what keeps the circular
+    correlation valid: the replica stays a whole code period, so its wraparound
+    is the code's own periodic extension, while the zeros contribute nothing.
+
+    When `coherent_length == fft_length` every offset is zero and this reduces
+    exactly to the reshape it replaces.
+    """
+    required = num_blocks * coherent_length_samples
+    if len(sample_block) < required:
+        raise ValueError(
+            f"need {required} samples for {num_blocks} x {coherent_length_samples}-sample "
+            f"coherent blocks, got {len(sample_block)}"
+        )
+
+    blocks = np.zeros((num_blocks, fft_length_samples), dtype=sample_block.dtype)
+    for j in range(num_blocks):
+        src = sample_block[j * coherent_length_samples : (j + 1) * coherent_length_samples]
+        start = (j * coherent_length_samples) % fft_length_samples
+        stop = start + coherent_length_samples
+        if stop <= fft_length_samples:
+            blocks[j, start:stop] = src
+        else:
+            # The block straddles a code period boundary; it wraps, and the
+            # circular correlation handles the wrap correctly.
+            split = fft_length_samples - start
+            blocks[j, start:] = src[:split]
+            blocks[j, : stop - fft_length_samples] = src[split:]
+    return blocks
+
+
 def run_acquisition(
     sample_block: NDArray[np.complex64],
     sample_block_uptime_epoch_ms: float,
     acq_config: AcquisitionConfiguration,
     code_parameters: Dict[str, AcqSignalCodeParameters],
-    prob_false_alaram: float,
+    prob_false_alarm_total: float,
     print_progress: bool = False,
     noise_var_method: str = "abscorrmean",
     save_corr_peak_window_chips: Optional[float] = None,
@@ -137,6 +247,19 @@ def run_acquisition(
     Perform BPSK acquisition on the given sample block for all signals defined in code_parameters.
 
     Returns a dictionary mapping signal IDs to their respective AcquisitionResult.
+
+    `prob_false_alarm_total` is the chance that *any* cell in one signal's search
+    grid false-alarms -- a number that keeps its meaning when the sample rate,
+    replica length or Doppler range change.  It is converted to a per-cell rate
+    here; callers should not pre-correct it.  Across a sweep of P satellites,
+    expect about `P * prob_false_alarm_total` false acquisitions, so this is the
+    knob for trading sensitivity against false alarms:
+
+        1e-3   sensitive: ~0.03 false acquisitions per 32-PRN sweep
+        1e-6   balanced (about 1 dB stricter than 1e-3 on a large grid)
+        1e-9   conservative; the extra ~0.7 dB buys little, because what actually
+               produces false acquisitions in GNSS is cross-correlation against a
+               strong satellite, which no threshold setting addresses.
 
     Pre-computed replicas and FFTs are stored for each signal in the config `replica_cache_dict`.
     The values in the cache entries must be recomputed when acquisition parameters change or when the sampling rate changes.
@@ -158,14 +281,42 @@ def run_acquisition(
     acquisition_results: Dict[str, AcquisitionResult] = {}
 
     #
-    # Reshape sample block into M blocks of N samples
+    # Lay M coherent blocks into full-length FFT windows.  N is the replica (and
+    # FFT) length; N_coh is how much data each block actually integrates, which is
+    # shorter whenever the caller has capped coherent integration.
     M = acq_config.num_blocks
-    N = acq_config.block_size_samples
-    samples = sample_block[: M * N].reshape((M, N))
+    N = acq_config.replica_length_samples
+    N_coh = acq_config.coherent_length_samples
+    samples = pack_coherent_blocks(sample_block, M, N, N_coh)
+
+    # Convert the caller's total into the per-cell rate the threshold needs.
+    #
+    # This is deliberately not the caller's job.  The right per-cell value depends
+    # on sample rate, replica duration and Doppler range, so a hard-coded one
+    # silently stops meaning what it did the moment any of those change: 1e-7 per
+    # cell is 0.025 expected false alarms over a 250,000-cell grid and 2.5 over a
+    # 25,000,000-cell one.  The total is the quantity a person can reason about.
+    #
+    # Sidak, in the numerically stable form: 1 - (1 - p)**(1/n) cancels to exactly
+    # 0.0 once p/n drops below float64 eps, and chi2.isf(0) is inf, so the naive
+    # expression fails by detecting nothing at all rather than by erroring.
+    num_detection_cells = acq_config.num_doppler_bins * acq_config.replica_length_samples
+    if half_bin_doppler_search:
+        num_detection_cells *= 2  # the shifted pass doubles the Doppler hypotheses
+    if not 0.0 < prob_false_alarm_total < 1.0:
+        raise ValueError(
+            f"prob_false_alarm_total must be in (0, 1), got {prob_false_alarm_total}"
+        )
+    prob_false_alarm_per_cell = -np.expm1(
+        np.log1p(-prob_false_alarm_total) / num_detection_cells
+    )
     # Compute conjugated FFT of blocks, once per sub-bin Doppler hypothesis.
     # Blocks are combined non-coherently below, so applying the same phase ramp
     # from the start of each block (rather than from the start of the capture) is
-    # sufficient -- only the frequency shift within a block matters.
+    # sufficient -- only the frequency shift within a block matters.  The ramp is
+    # applied across the padded window; the padding stays zero, and the block's
+    # own position within the window contributes only a constant phase, which the
+    # square law discards.
     sub_bin_offsets_hz = [0.0]
     conj_sample_ffts = [np.conj(np.fft.fft(samples, axis=1))]
     if half_bin_doppler_search:
@@ -181,6 +332,23 @@ def run_acquisition(
 
         if print_progress:
             print(f"Acquiring signal {signal_id}...", end="")
+
+        # The correlation is circular, so the replica's wraparound is only the
+        # code's own periodic extension if the replica spans a whole number of code
+        # periods.  Half a period aliases silently: a true code phase in the
+        # uncovered part is reported inside the covered part, with a healthy peak
+        # and signal_detected set.  Cheap to check, and it is not otherwise
+        # checkable anywhere -- the config does not know the code, and the code
+        # parameters do not know the replica length.
+        code_period_ms = code_params.length_chips / code_params.rate_chips_per_sec * 1e3
+        periods_per_replica = acq_config.replica_duration_ms / code_period_ms
+        if abs(periods_per_replica - round(periods_per_replica)) > 1e-9 or periods_per_replica < 1:
+            raise ValueError(
+                f"{signal_id}: replica_duration_ms {acq_config.replica_duration_ms} must be a "
+                f"positive whole number of code periods ({code_period_ms:g} ms for "
+                f"{code_params.length_chips} chips at {code_params.rate_chips_per_sec:g} cps), "
+                f"got {periods_per_replica:g}; a partial period aliases the code phase"
+            )
 
         # Check if there is a cached replica for this signal
         if signal_id in acq_config.replica_cache_dict:
@@ -230,14 +398,19 @@ def run_acquisition(
             pass_correlation = np.zeros((len(doppler_search_bins), N))
 
             for i, roll in enumerate(doppler_search_bins):
-                # coherent integration over N samples; z_noise ~ CN(0, N*noise_var)
+                # Coherent integration over the N_coh non-zero samples of each
+                # block; the padding contributes nothing, so z_noise ~ CN(0,
+                # N_coh*noise_var) regardless of the FFT length.
                 shifted_replica_fft = np.roll(replica_samples_fft, roll)
                 corr = np.fft.ifft(
                     conj_samples_fft * shifted_replica_fft[None, :]
                 )
-                # non-coherent square-law summation over M blocks, normalized by N
+                # non-coherent square-law summation over M blocks, normalized by
+                # the number of samples actually integrated (N_coh, not N -- they
+                # differ once coherent integration is shorter than the replica, and
+                # normalizing by N would under-report the noise by N/N_coh)
                 # y_noise / noise_var ~ ChiSquared(2M)
-                pass_correlation[i] = np.sum(1 / N * np.abs(corr) ** 2, axis=0)
+                pass_correlation[i] = np.sum(1 / N_coh * np.abs(corr) ** 2, axis=0)
 
             pass_doppler_bin_idx, pass_sample_bin_idx = np.unravel_index(
                 pass_correlation.argmax(), pass_correlation.shape
@@ -269,7 +442,7 @@ def run_acquisition(
 
         normalized_peak_value = peak_val / noise_var
         chi2 = scipy.stats.chi2(df=2 * M)
-        detection_threshold = chi2.isf(prob_false_alaram)
+        detection_threshold = chi2.isf(prob_false_alarm_per_cell)
         signal_detected = normalized_peak_value > detection_threshold
 
         # The reported Doppler axis belongs to the winning pass, so it carries the
@@ -305,7 +478,9 @@ def run_acquisition(
             peak_doppler_bin,
             peak_sample_bin,
             normalized_peak_value,
-            prob_false_alaram,
+            prob_false_alarm_total,
+            prob_false_alarm_per_cell,
+            num_detection_cells,
             detection_threshold,
             noise_var,
             signal_detected,
