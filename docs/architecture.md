@@ -228,22 +228,30 @@ arrays in `L2CSignalTrackingOutputs` are `(capacity, 2)` instead of
 The only Numba-JIT code in the project, and the only genuinely per-sample
 hot loop:
 
-- `numba_correlate__bpsk__complex64` — for each input sample: multiply by
-  the current conjugated carrier replica sample (carrier wipeoff), then for
-  each of `num_bins` delay taps, look up the code chip at that tap's
-  fractional chip offset and accumulate `±carrierless` (or a scaled add for
-  non-±1 chip values, e.g. 0) into `corr_values[j]`. Carrier phase is
-  advanced by rotating `conj_carr_sample` by a precomputed
-  `conj_carr_rotation` each sample (avoids a `sin`/`cos` call per sample).
-  `correlate__delay` is the thin Python wrapper that computes the initial
-  conjugated carrier phasor/rotation and calls the kernel.
-- `numba_correlate__interleaved_bpsk__complex64` /
-  `correlate_delay_interleaved` — same structure, but the physical chip
-  index alternates between two logical codes (`code_seq_0`,
-  `code_seq_1`, e.g. L2C CM/CL) at twice the nominal chip rate; each output
-  bin is `(delay, component)` instead of just `(delay,)`.
+- `numba_correlate__multicomponent__complex64` — one kernel for every
+  signal. For each input sample: multiply by the current conjugated carrier
+  replica sample (carrier wipeoff), then for each of `num_bins` delay taps
+  and each component, look up that component's chip at the tap's chip index
+  and accumulate `±carrierless` (or a scaled add for non-±1 chip values)
+  into `corr_values[j, c]`. Carrier phase is advanced by rotating
+  `conj_carr_sample` by a precomputed `conj_carr_rotation` each sample
+  (avoids a `sin`/`cos` call per sample). `correlate__multicomponent` is the
+  thin Python wrapper that computes the initial conjugated carrier
+  phasor/rotation, wraps the code phase into the pattern period, and calls
+  the kernel.
+- There is **no separate interleaved kernel**. Every component is stated on
+  the signal's own chip axis and carries 0 where it does not transmit (see
+  §5.1 of `code_components.py`'s module docstring), so the lookup is just
+  `codes_flat[start[c] + chip_index % length[c]]` — no per-component rate,
+  offset, modulo or divide in the inner loop. L2C's CM/CL multiplexing is
+  carried by the zeros in the sequences themselves. Measured against the
+  previous rate-and-offset form, per 1 ms of samples with 9 delay bins:
+  L1 C/A 0.111 → 0.071 ms, L2C 0.144 → 0.113 ms, L5 1.137 → 0.662 ms
+  (1.3–1.7×), with bit-identical output. The cost is memory, and only for a
+  time-multiplexed signal: L2C's packed codes double, 777 kB → 1.55 MB per
+  PRN.
 
-Both kernels are `@nb.jit(nopython=True, parallel=False)` with explicit
+The kernel is `@nb.jit(nopython=True, parallel=False)` with explicit
 Numba type signatures on every argument (no signature caching via
 `cache=True`, so each fresh process pays JIT warm-up on first call).
 
@@ -279,10 +287,12 @@ what a signal *is*, how it is *acquired*, and how it is *tracked*.
   `submodules/gnss-tools/gnss_tools/signals/catalog.py`). Instantiating a
   subclass for a PRN (e.g. `GpsL5(prn=1)`) builds that satellite's
   `code_set` from `gnss_tools.signals.*` code generators (applying the
-  `1 - 2*bits` BPSK mapping) via `_build_components`, using the typed
-  component classes in `code_components.py` (`BPSKComponent`,
-  `TDBPSKComponent`, `QPSKComponent`, `BOCComponent`). `build_signals(signal_type,
-  prns)` builds a `{"G01": Signal, ...}` dict for a whole constellation.
+  `1 - 2*bits` BPSK mapping) via `_build_components`, as plain
+  `CodeComponent`s (see §5.3). A time-multiplexed signal states each component
+  zero-filled on its sibling's chips — `_interleave` does this for L2C's
+  CM/CL — so there is no per-component rate or offset anywhere.
+  `build_signals(signal_type, prns)` builds a `{"G01": Signal, ...}` dict for a
+  whole constellation.
 - `AcquisitionPolicy`/`ACQUISITION_POLICIES` and
   `TrackingPolicy`/`TRACKING_POLICIES` — deliberately *not* fields on
   `Signal`. Acquisition typically locks onto a single component (L2C

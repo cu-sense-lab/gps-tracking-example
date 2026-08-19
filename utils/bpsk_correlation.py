@@ -11,8 +11,6 @@ def numba_correlate__multicomponent__complex64(
         codes_flat: nb.int8[:],  # type: ignore
         component_code_start_indices: nb.int64[:],  # type: ignore
         component_code_lengths: nb.int64[:],  # type: ignore
-        chips_per_component_chip: nb.int64[:],  # type: ignore
-        component_offset_chips: nb.int64[:],  # type: ignore
         initial_code_phase_chips: nb.float64,  # type: ignore
         chips_per_sample: nb.float64,  # type: ignore
         bin_offsets_chips: nb.float64[:],  # type: ignore
@@ -23,19 +21,19 @@ def numba_correlate__multicomponent__complex64(
     """
     Accumulate one correlation interval for every (delay bin, code component) pair.
 
-    Component `c` is present at chip `k` when `(k - component_offset_chips[c])` is a
-    multiple of `chips_per_component_chip[c]`, and then contributes its code chip at index
-    `((k - component_offset_chips[c]) // chips_per_component_chip[c]) % component_code_lengths[c]`.  That
-    single rule expresses every multiplexing scheme in the repository -- see
-    `utils.code_components` -- so signals differ only by the arrays passed in.
+    Every component is stated on the signal's own chip axis, so component `c`
+    contributes `codes_flat[start[c] + chip_index % component_code_lengths[c]]` at
+    chip `chip_index` -- no per-component rate or offset to apply.  A component
+    that is not transmitting at that chip carries 0 there and accumulates
+    nothing, which is how time-division multiplexing (L2C's CM/CL) is expressed;
+    see `utils.code_components`.
 
     Codes are packed end to end in `codes_flat` because their lengths differ by
-    three orders of magnitude (1023 vs 767250).  Component `c`'s code lives at
+    three orders of magnitude (1023 vs 1534500).  Component `c`'s code lives at
     `codes_flat[component_code_start_indices[c] : component_code_start_indices[c] + component_code_lengths[c]]`.
 
-    `component_code_start_indices` addresses `codes_flat`; `component_offset_chips` and
-    `bin_offsets_chips` are positions on the chip axis.  Different quantities,
-    named apart.
+    `component_code_start_indices` addresses `codes_flat`; `bin_offsets_chips` is
+    a position on the chip axis.  Different quantities, named apart.
 
     `corr_values` is accumulated in place and is NOT zeroed here: a correlation
     interval may be spread across several sample buffers.
@@ -52,15 +50,10 @@ def numba_correlate__multicomponent__complex64(
             # slightly negative chip index, which must map to the previous chip.
             chip_index = int(np.floor(code_phase_chips + bin_offsets_chips[j]))
             for c in range(num_components):
-                offset_from_component_origin = chip_index - component_offset_chips[c]
-                if offset_from_component_origin % chips_per_component_chip[c] != 0:
-                    continue  # this chip belongs to another component
-                # Index within this component's own code, then displaced by where
-                # that component's block starts in the flat buffer.
-                component_chip_index = (
-                    offset_from_component_origin // chips_per_component_chip[c]
-                ) % component_code_lengths[c]
-                symbol = codes_flat[component_code_start_indices[c] + component_chip_index]
+                symbol = codes_flat[
+                    component_code_start_indices[c]
+                    + chip_index % component_code_lengths[c]
+                ]
                 if symbol == 1:
                     corr_values[j, c] += carrierless
                 elif symbol == -1:
@@ -107,8 +100,6 @@ def correlate__multicomponent(
         code_set.codes_flat,
         code_set.component_code_start_indices,
         code_set.component_code_lengths,
-        code_set.chips_per_component_chip,
-        code_set.component_offset_chips,
         wrapped_code_phase_chips,
         chips_per_sample,
         bin_offsets_chips,

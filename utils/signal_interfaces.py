@@ -47,11 +47,9 @@ from . import bpsk_acquisition
 from . import sample_streaming
 from . import tracking_channel
 from .code_components import (
-    BPSKComponent,
+    Branch,
     CodeComponent,
     CodeSet,
-    QPSKComponent,
-    TDBPSKComponent,
     build_code_set,
 )
 
@@ -77,31 +75,31 @@ LINKS: dict[LinkId, Link] = {
 }
 
 
-class SignalType(StrEnum):
-    """
-    The overall modulation a signal is built from (see TODO_SIGNALS.md).
-
-    Most of these correlate with the plain BPSK kernel -- a QPSK signal's I/Q
-    components each use it independently, and (per the TODO) a TDBPSK signal's
-    time-multiplexing is already handled generically by `code_components`.
-    Only BOC/TMBOC/CBOC's subcarrier structure needs a specialized correlator,
-    which does not exist yet (see `BOCComponent`).
-    """
-
-    BPSK = "BPSK"
-    TDBPSK = "TDBPSK"
-    QPSK = "QPSK"
-    BOC = "BOC"
-    TMBOC = "TMBOC"
-    CBOC = "CBOC"
-
-
 def _symbol_period_ms(signal_module) -> int:
     """Data symbol duration in ms: 20 for L1 C/A and L2 CNAV, 10 for L5 CNAV."""
     period_ms = 1e3 / signal_module.DATA_SYMBOL_RATE
     if period_ms != int(period_ms):
         raise ValueError(f"symbol period {period_ms} ms is not a whole millisecond")
     return int(period_ms)
+
+
+def _interleave(sequences: list[np.ndarray]) -> list[np.ndarray]:
+    """
+    Place each sequence on its own chip of a shared clock, zero elsewhere.
+
+    L2C's CM and CL alternate chip by chip on the 1.023 Mcps combined clock
+    (IS-GPS-200), so CM comes back as (CM_0, 0, CM_1, 0, ...) and CL as
+    (0, CL_0, 0, CL_1, ...).  Stating every component on the signal's own chip
+    axis is what lets one correlator serve every signal -- see
+    `utils.code_components`.
+    """
+    stride = len(sequences)
+    filled = []
+    for offset, sequence in enumerate(sequences):
+        padded = np.zeros(len(sequence) * stride, dtype=np.int8)
+        padded[offset::stride] = sequence
+        filled.append(padded)
+    return filled
 
 
 def _tiered_code(primary: np.ndarray, overlay: np.ndarray) -> np.ndarray:
@@ -135,7 +133,6 @@ class Signal(ABC):
     is the per-satellite id ("G01") assigned below."""
 
     link: ClassVar[Link]
-    signal_type: ClassVar[SignalType]
     carrier_freq_hz: ClassVar[float]
     tracking_code_rate_chips_per_sec: ClassVar[float]
     # Duration of one full pass through the primary code. Tiered-code
@@ -170,7 +167,6 @@ class GpsL1CA(Signal):
 
     signal_type_id = "GPS_L1CA"
     link = LINKS[LinkId.L1]
-    signal_type = SignalType.BPSK
     carrier_freq_hz = gps_l1ca.CARRIER_FREQ
     tracking_code_rate_chips_per_sec = gps_l1ca.CODE_RATE
     primary_period_ms = 1
@@ -179,21 +175,22 @@ class GpsL1CA(Signal):
     def _build_components(prn: int) -> list[CodeComponent]:
         code = (1 - 2 * gps_l1ca.get_GPS_L1CA_code_sequence(prn)).astype(np.int8)
         return [
-            BPSKComponent(
-                name="CA", sequence=code, symbol_period_ms=_symbol_period_ms(gps_l1ca)
+            CodeComponent(
+                name="CA", sequence=code, branch=Branch.Q,
+                symbol_period_ms=_symbol_period_ms(gps_l1ca),
             )
         ]
 
 
 class GpsL2C(Signal):
     """
-    GPS L2C: CM and CL, time-division multiplexed on the 1.023 Mcps combined
-    clock (each contributes one component chip every other chip).
+    GPS L2C: CM and CL, time-division multiplexed chip by chip on the
+    1.023 Mcps combined clock -- CM on even chips, CL on odd, each zero-filled
+    on the other's.  Both ride the quadrature branch.
     """
 
     signal_type_id = "GPS_L2C"
     link = LINKS[LinkId.L2]
-    signal_type = SignalType.TDBPSK
     carrier_freq_hz = gps_l2c.CARRIER_FREQ
     tracking_code_rate_chips_per_sec = gps_l2c.CODE_RATE_L2CLM
     # CM repeats every 20 ms; CL every 1.5 s.
@@ -203,17 +200,17 @@ class GpsL2C(Signal):
     def _build_components(prn: int) -> list[CodeComponent]:
         code_cm = (1 - 2 * gps_l2c.get_GPS_L2CM_code_sequence(prn)).astype(np.int8)
         code_cl = (1 - 2 * gps_l2c.get_GPS_L2CL_code_sequence(prn)).astype(np.int8)
+        cm, cl = _interleave([code_cm, code_cl])
         return [
-            TDBPSKComponent(
-                name="CM", sequence=code_cm, chips_per_component_chip=2,
-                component_offset_chips=0, symbol_period_ms=_symbol_period_ms(gps_l2c),
+            CodeComponent(
+                name="CM", sequence=cm, branch=Branch.Q,
+                symbol_period_ms=_symbol_period_ms(gps_l2c),
             ),
             # CL is the dataless pilot: no symbol period, so nothing caps its
-            # coherent integration but Doppler.
-            TDBPSKComponent(
-                name="CL", sequence=code_cl, chips_per_component_chip=2,
-                component_offset_chips=1,
-            ),
+            # coherent integration but Doppler.  Same branch as CM -- both sit in
+            # quadrature to P(Y) -- which is what makes the carrier handover at
+            # ambiguity resolution phase-continuous.
+            CodeComponent(name="CL", sequence=cl, branch=Branch.Q),
         ]
 
 
@@ -229,7 +226,6 @@ class GpsL5(Signal):
 
     signal_type_id = "GPS_L5"
     link = LINKS[LinkId.L5]
-    signal_type = SignalType.QPSK
     carrier_freq_hz = gps_l5.CARRIER_FREQ
     tracking_code_rate_chips_per_sec = gps_l5.CODE_RATE
     # 10230 chips at 10.23 Mcps -- the aligned correlator's existing interval
@@ -244,12 +240,14 @@ class GpsL5(Signal):
         overlay_i = (1 - 2 * gps_l5.NEUMAN_HOFFMAN_SEQ_L5I).astype(np.int8)
         overlay_q = (1 - 2 * gps_l5.NEUMAN_HOFFMAN_SEQ_L5Q).astype(np.int8)
         return [
-            QPSKComponent(
-                name="I", sequence=code_i, overlay=overlay_i,
+            CodeComponent(
+                name="I", sequence=code_i, branch=Branch.I, overlay=overlay_i,
                 symbol_period_ms=_symbol_period_ms(gps_l5),
             ),
-            # Q is the dataless pilot: no symbol period.
-            QPSKComponent(name="Q", sequence=code_q, overlay=overlay_q),
+            # Q is the dataless pilot: no symbol period.  Opposite branch to I,
+            # so moving the carrier loop between them would cost a quarter-cycle
+            # re-pull -- which is why it starts on Q and stays there.
+            CodeComponent(name="Q", sequence=code_q, branch=Branch.Q, overlay=overlay_q),
         ]
 
 
@@ -357,8 +355,9 @@ TRACKING_POLICIES: dict[str, TrackingPolicy] = {
         # carrier loop moves to it and drops Costas wrapping for the full
         # four-quadrant angle, and the delay discriminator combines both
         # equal-power components non-coherently.  Unlike L5's I/Q, CM and CL are
-        # time-multiplexed on the same in-phase carrier, so moving the carrier
-        # reference between them is phase-continuous and costs no re-pull.
+        # time-multiplexed on one carrier branch (both quadrature to P(Y)), so
+        # moving the carrier reference between them is phase-continuous and costs
+        # no re-pull -- see `CodeSet.share_branch`.
         resolved_discriminator_policy=tracking_channel.LoopDiscriminatorPolicy(
             carrier_component=1, code_components=(0, 1), costas=False
         ),
@@ -454,9 +453,7 @@ def acquisition_code_period_ms(signal_type: type[Signal], signal: Signal) -> flo
     component = signal.code_set.components[
         signal.code_set.index_of(policy.component_name)
     ]
-    rate = (
-        signal_type.tracking_code_rate_chips_per_sec / component.chips_per_component_chip
-    )
+    rate = signal_type.tracking_code_rate_chips_per_sec
     return len(acquisition_code(signal_type, signal)) / rate * 1e3
 
 
@@ -496,17 +493,17 @@ def build_ambiguity_search(
     acquired = code_set.components[code_set.index_of(policy.component_name)]
     ambiguous = code_set.components[code_set.index_of(policy.ambiguous_component)]
 
-    stride_chips = acquired.code_span_chips
-    num_hypotheses, remainder = divmod(ambiguous.code_span_chips, stride_chips)
+    stride_chips = acquired.code_length
+    num_hypotheses, remainder = divmod(ambiguous.code_length, stride_chips)
     if remainder or num_hypotheses < 2:
         raise ValueError(
             f"{signal_type.signal_type_id}: {policy.ambiguous_component!r} spans "
-            f"{ambiguous.code_span_chips} chips, which is not a whole multiple "
+            f"{ambiguous.code_length} chips, which is not a whole multiple "
             f"(>1) of {policy.component_name!r}'s {stride_chips}"
         )
 
     rate = signal_type.tracking_code_rate_chips_per_sec
-    period_sec = ambiguous.code_span_chips / rate
+    period_sec = ambiguous.code_length / rate
     return AmbiguitySearchPlan(
         code_set=build_code_set([ambiguous], allow_partial_coverage=True),
         scored_component=0,
@@ -562,22 +559,15 @@ def build_acquisition_code_params(
     signal_type: type[Signal],
     signals: dict[str, Signal],
 ) -> dict[str, bpsk_acquisition.AcqSignalCodeParameters]:
-    policy = ACQUISITION_POLICIES[signal_type.signal_type_id]
     params: dict[str, bpsk_acquisition.AcqSignalCodeParameters] = {}
     for signal_id, signal in signals.items():
-        component = signal.code_set.components[signal.code_set.index_of(policy.component_name)]
+        # Already zero-filled on any sibling's chips, so it cannot correlate
+        # against that sibling's code -- nothing for acquisition to special-case.
         sequence = acquisition_code(signal_type, signal)
         params[signal_id] = bpsk_acquisition.AcqSignalCodeParameters(
-            rate_chips_per_sec=signal_type.tracking_code_rate_chips_per_sec / component.chips_per_component_chip,
+            rate_chips_per_sec=signal_type.tracking_code_rate_chips_per_sec,
             length_chips=len(sequence),
             sequence=sequence,
-            # True when the acquisition component is one of several
-            # sharing the chip clock by time-division (e.g. L2C's CM/CL):
-            # the replica must be zero-filled on the other component's
-            # chips rather than holding this component's value across
-            # both, so it doesn't spuriously correlate against the other
-            # code.
-            is_interleaved=isinstance(component, TDBPSKComponent),
         )
     return params
 
