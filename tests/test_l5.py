@@ -59,10 +59,10 @@ def test_components_are_colocated_not_interleaved(l5_definition):
     what keeps it on Q from the first epoch.
     """
     code_set = l5_definition.code_set
-    assert code_set.names == ("I", "Q")
+    assert code_set.names == ("L5I", "L5Q")
     np.testing.assert_array_equal(code_set.component_code_lengths, [10230, 10230])
     assert np.all(code_set.codes_flat != 0), "L5 transmits both components at every chip"
-    assert not code_set.share_branch("I", "Q")
+    assert not code_set.share_branch("L5I", "L5Q")
 
 
 def test_primary_period_is_one_millisecond(l5_definition):
@@ -90,7 +90,7 @@ def test_carrier_loop_runs_on_the_pilot(l5_definition):
     the pilot is not yet effectively dataless.
     """
     policy = TRACKING_POLICIES[GpsL5.signal_type_id].discriminator_policy
-    assert policy.carrier_component == l5_definition.code_set.index_of("Q")
+    assert policy.carrier_component == l5_definition.code_set.index_of("L5Q")
     assert policy.code_components == (0, 1), "delay discriminator should combine I and Q"
     assert policy.costas is True
 
@@ -184,7 +184,7 @@ def test_early_late_are_symmetric_when_aligned(l5_definition):
 # Acquisition
 # --------------------------------------------------------------------------
 
-def _acquisition_config() -> bpsk_acquisition.AcquisitionConfiguration:
+def _acquisition_config(doppler_factor: int = 1) -> bpsk_acquisition.AcquisitionConfiguration:
     """
     The composite-Q dwell: replica = primary x NH20 = 20 ms, coherent = 5 ms x 4.
 
@@ -199,22 +199,23 @@ def _acquisition_config() -> bpsk_acquisition.AcquisitionConfiguration:
     epoch is shared across components.
     """
     return bpsk_acquisition.AcquisitionConfiguration(
-        replica_duration_ms=20,
-        coherent_duration_ms=5.0,
+        coherent_duration_replica_ms=20,
+        coherent_duration_sample_ms=5.0,
         num_blocks=4,
         sample_rate=SAMP_RATE,
         min_search_doppler_hz=-5000,
         max_search_doppler_hz=5000,
+        fine_search_factors=None if doppler_factor == 1 else (1, doppler_factor),
     )
 
 
 
 def _acquire(
-    true_doppler_hz, code_phase_ms, half_bin, prn=PRN, noise_sigma=2.0, seed=0,
+    true_doppler_hz, code_phase_ms, doppler_factor=1, prn=PRN, noise_sigma=2.0, seed=0,
     start_sec=0.0, nav_bits=True,
 ):
     definitions = build_signals(GpsL5, prns=[prn])
-    config = _acquisition_config()
+    config = _acquisition_config(doppler_factor)
     samples = synthetic.generate_l5_samples(
         prn=prn, start_sec=start_sec, duration_sec=config.acq_total_duration_ms * 1e-3,
         samp_rate=SAMP_RATE, doppler_hz=true_doppler_hz, code_phase_ms=code_phase_ms,
@@ -227,14 +228,13 @@ def _acquire(
         code_parameters=build_acquisition_code_params(GpsL5, definitions),
         prob_false_alarm_total=1e-6,
         noise_var_method="abscorrvar",
-        half_bin_doppler_search=half_bin,
     )
     return results[f"G{prn:02d}"], config
 
 
 def test_acquisition_detects_and_locates_the_signal():
     code_phase_ms = 0.31
-    result, _ = _acquire(1234.0, code_phase_ms, half_bin=True)
+    result, _ = _acquire(1234.0, code_phase_ms, doppler_factor=2)
     assert result.signal_detected
     # Code phase resolves to one sample.
     assert result.acq_code_phase_seconds * 1e3 == pytest.approx(
@@ -298,7 +298,7 @@ def test_composite_replica_separates_grid_from_response():
     replica to 25 Hz -- comfortably inside a 1 ms FLL's +/-250 Hz unambiguous range, which is
     what the half-bin search previously existed to rescue.
     """
-    _, config = _acquire(0.0, 0.0, half_bin=False)
+    _, config = _acquire(0.0, 0.0, doppler_factor=1)
     assert config.fft_resolution == pytest.approx(50.0)
     assert config.doppler_response_width_hz == pytest.approx(200.0)
 
@@ -319,7 +319,7 @@ def test_composite_code_phase_carries_the_overlay_counter():
     # index (8.31 ms for a true 7.31 ms).  Q carries no data, so the counter is exact.
     for start_ms, expected_index in ((0.0, 0), (3.0, 3), (7.0, 7), (13.0, 13)):
         result, _ = _acquire(
-            1234.0, code_phase_ms, half_bin=False, start_sec=start_ms * 1e-3
+            1234.0, code_phase_ms, doppler_factor=1, start_sec=start_ms * 1e-3
         )
         assert result.signal_detected
         phase_ms = result.acq_code_phase_seconds * 1e3
@@ -332,14 +332,14 @@ def test_composite_code_phase_carries_the_overlay_counter():
 
 
 @pytest.mark.parametrize("true_doppler_hz", [0.0, 250.0, 400.0, 500.0, 700.0, -400.0, -500.0])
-def test_half_bin_search_halves_worst_case_doppler_error(true_doppler_hz):
+def test_doppler_fine_search_shrinks_worst_case_doppler_error(true_doppler_hz):
     """
-    Also fixes the sign: mixing the samples down by half a bin makes the signal
-    appear lower, so the recovered Doppler is the bin centre *plus* the offset.
-    Getting this backwards would double the error instead of halving it.
+    Also fixes the sign: mixing the samples down by a fraction of a bin makes the
+    signal appear lower, so the recovered Doppler is the bin centre *plus* the
+    offset.  Getting this backwards would grow the error instead of shrinking it.
     """
-    coarse, config = _acquire(true_doppler_hz, 0.31, half_bin=False)
-    fine, _ = _acquire(true_doppler_hz, 0.31, half_bin=True)
+    coarse, config = _acquire(true_doppler_hz, 0.31, doppler_factor=1)
+    fine, _ = _acquire(true_doppler_hz, 0.31, doppler_factor=2)
     assert coarse.signal_detected and fine.signal_detected
 
     # Half a grid step is the worst case without the search; the half-bin pass can
@@ -350,17 +350,63 @@ def test_half_bin_search_halves_worst_case_doppler_error(true_doppler_hz):
     ) + 1e-6
 
 
-def test_half_bin_offset_is_reported_and_applied():
+def test_fine_search_offset_is_reported_and_applied():
     # 525 Hz sits on a half-bin of the 50 Hz grid, so the shifted pass must win.
-    fine, config = _acquire(525.0, 0.31, half_bin=True)
+    fine, config = _acquire(525.0, 0.31, doppler_factor=2)
     assert fine.doppler_offset_hz == pytest.approx(0.5 * config.fft_resolution)
     bin_centre = config.doppler_search_bins[fine.peak_doppler_bin] * config.fft_resolution
     assert fine.acq_doppler_hz == pytest.approx(bin_centre + fine.doppler_offset_hz)
 
 
-def test_half_bin_search_is_off_by_default():
-    """Existing L1CA/L2C callers must be unaffected."""
-    coarse, config = _acquire(400.0, 0.31, half_bin=False)
+def test_doppler_fine_search_generalises_beyond_half_a_bin():
+    """
+    The factor is a sub-division count, not a boolean: k passes at j/k of a bin
+    put the worst case at half a bin over k.  Checked at k=4 against the plain
+    search on a Doppler deliberately placed a quarter-bin off a grid point.
+    """
+    true_doppler_hz = 412.5  # 8.25 bins of 50 Hz -- a quarter bin off centre
+    coarse, config = _acquire(true_doppler_hz, 0.31, doppler_factor=1)
+    fine, _ = _acquire(true_doppler_hz, 0.31, doppler_factor=4)
+    assert coarse.signal_detected and fine.signal_detected
+
+    quarter_bin_worst_case = 0.5 * config.fft_resolution / 4
+    assert abs(fine.acq_doppler_hz - true_doppler_hz) <= quarter_bin_worst_case + 1e-6
+    assert abs(fine.acq_doppler_hz - true_doppler_hz) < abs(
+        coarse.acq_doppler_hz - true_doppler_hz
+    )
+
+
+def test_fine_search_reports_its_error_ranges():
+    plain = _acquisition_config(doppler_factor=1)
+    fine = _acquisition_config(doppler_factor=4)
+
+    assert plain.doppler_error_hz == pytest.approx(0.5 * plain.fft_resolution)
+    assert fine.doppler_error_hz == pytest.approx(0.5 * fine.fft_resolution / 4)
+    # Code phase is untouched until a code-phase factor is implemented.
+    assert fine.code_phase_error_seconds == pytest.approx(0.5 / SAMP_RATE)
+
+    assert "plain search" in plain.search_resolution_summary()
+    assert "fine search" not in plain.search_resolution_summary()
+    assert "fine search (1, 4)" in fine.search_resolution_summary()
+
+
+def test_code_phase_fine_search_is_rejected_rather_than_ignored():
+    """A factor that is accepted but does nothing would silently overstate the seed."""
+    with pytest.raises(NotImplementedError, match="code-phase fine search"):
+        bpsk_acquisition.AcquisitionConfiguration(
+            coherent_duration_replica_ms=20,
+            coherent_duration_sample_ms=5.0,
+            num_blocks=4,
+            sample_rate=SAMP_RATE,
+            min_search_doppler_hz=-5000,
+            max_search_doppler_hz=5000,
+            fine_search_factors=(2, 1),
+        )
+
+
+def test_fine_search_is_off_by_default():
+    """Callers that do not ask for a fine search must be unaffected."""
+    coarse, config = _acquire(400.0, 0.31, doppler_factor=1)
     assert coarse.doppler_offset_hz == 0.0
     assert coarse.acq_doppler_hz % config.fft_resolution == pytest.approx(0.0)
 
@@ -378,13 +424,13 @@ def test_acquisition_seeds_tracking_to_convergence():
     from utils.signal_interfaces import create_tracking_channels
 
     true_doppler_hz, code_phase_ms, prn = 1234.0, 0.31, PRN
-    acq_result, _ = _acquire(true_doppler_hz, code_phase_ms, half_bin=True, prn=prn)
+    acq_result, _ = _acquire(true_doppler_hz, code_phase_ms, doppler_factor=2, prn=prn)
     assert acq_result.signal_detected
 
     definitions = build_signals(GpsL5, prns=[prn])
     loop_params = tracking_channel.TrackingLoopParameters(
         DLL_bandwidth_hz=2.0, PLL_bandwidth_hz=20.0, FLL_bandwidth_hz=50.0,
-        coherent_integration_ms=1, EPL_chip_spacing=0.5,
+        coherent_duration_ms=1, EPL_chip_spacing=0.5,
     )
     channels = create_tracking_channels(
         GpsL5,
@@ -454,13 +500,12 @@ def _track_until_synced(noise_sigma=3.0, buffers=14, buffer_ms=50, seed=4):
         sample_block_uptime_epoch_ms=0.0, acq_config=config,
         code_parameters=build_acquisition_code_params(GpsL5, definitions),
         prob_false_alarm_total=1e-6, noise_var_method="abscorrvar",
-        half_bin_doppler_search=True,
-    )[f"G{PRN:02d}"]
+            )[f"G{PRN:02d}"]
     assert acq.signal_detected
 
     loop_params = tracking_channel.TrackingLoopParameters(
         DLL_bandwidth_hz=2.0, PLL_bandwidth_hz=20.0, FLL_bandwidth_hz=50.0,
-        coherent_integration_ms=1, EPL_chip_spacing=0.5,
+        coherent_duration_ms=1, EPL_chip_spacing=0.5,
     )
     adapter = create_tracking_channels(
         GpsL5,
@@ -476,7 +521,7 @@ def _track_until_synced(noise_sigma=3.0, buffers=14, buffer_ms=50, seed=4):
     adapter.channel.overlay_sync.status = secondary_code.OverlaySyncStatus.UNSYNCED
     adapter.channel.overlay_sync.counter = 0
     adapter.channel._set_policy(TRACKING_POLICIES[GpsL5.signal_type_id].discriminator_policy)
-    adapter.channel.coherent_integration_ms = loop_params.coherent_integration_ms
+    adapter.channel.coherent_duration_ms = loop_params.coherent_duration_ms
     adapter.channel.loop_params = loop_params
 
     synced_at_epoch = None
@@ -502,13 +547,13 @@ def test_overlay_syncs_and_switches_to_pilot_tracking():
     assert channel.overlay_sync.confidence > 2.0
 
     # Everything that must move together at the transition.
-    assert channel.coherent_integration_ms == 10, "coherent accumulation did not extend"
+    assert channel.coherent_duration_ms == 10, "coherent accumulation did not extend"
     assert channel.policy.costas is False, "pilot should drop Costas wrapping"
     assert channel.policy.code_components == (0, 1), (
         "delay discriminator should combine I and Q -- a 10 ms epoch is exactly one "
         "CNAV symbol, so I no longer cancels and is worth ~3 dB non-coherently"
     )
-    assert channel.loop_params.coherent_integration_ms == 10, "loop filter not retuned"
+    assert channel.loop_params.coherent_duration_ms == 10, "loop filter not retuned"
 
 
 def test_wipe_off_gives_n_fold_coherent_gain():
@@ -558,7 +603,7 @@ def test_extending_integration_narrows_the_loops():
     """
     adapter, _, _ = _track_until_synced()
     params = adapter.channel.loop_params
-    update_period_sec = params.coherent_integration_ms * 1e-3
+    update_period_sec = params.coherent_duration_ms * 1e-3
     for bandwidth_hz in (
         params.PLL_bandwidth_hz, params.DLL_bandwidth_hz, params.FLL_bandwidth_hz
     ):
@@ -598,7 +643,7 @@ def _seeded_channel(initial_overlay_counter, doppler_hz=1500.0, code_phase_ms=0.
     return tracking_channel.TrackingChannel(
         loop_params=tracking_channel.TrackingLoopParameters(
             DLL_bandwidth_hz=2.0, PLL_bandwidth_hz=20.0, FLL_bandwidth_hz=50.0,
-            coherent_integration_ms=1, EPL_chip_spacing=0.5,
+            coherent_duration_ms=1, EPL_chip_spacing=0.5,
         ),
         signal_params=tracking_channel.TrackingSignalParameters(
             code_set=signal.code_set,
@@ -613,7 +658,7 @@ def _seeded_channel(initial_overlay_counter, doppler_hz=1500.0, code_phase_ms=0.
         output_capacity=4000,
         discriminator_policy=policy.discriminator_policy,
         synced_policy=policy.synced_discriminator_policy,
-        synced_coherent_integration_ms=policy.synced_coherent_integration_ms,
+        synced_coherent_duration_ms=policy.synced_coherent_duration_ms,
         initial_overlay_counter=initial_overlay_counter,
     )
 
@@ -625,14 +670,14 @@ def _drive(channel, doppler_hz=1500.0, code_phase_ms=0.31, buffers=14, buffer_ms
     rng = np.random.default_rng(seed)
     extended_at_mode = None
     for i in range(buffers):
-        before = channel.coherent_integration_ms
+        before = channel.coherent_duration_ms
         channel.process_sample_buffer(sample_streaming.SampleBuffer(
             samples=synthetic.generate_l5_samples(
                 prn=PRN, start_sec=i * buffer_ms * 1e-3, duration_sec=buffer_ms * 1e-3,
                 samp_rate=SAMP_RATE, doppler_hz=doppler_hz,
                 code_phase_ms=code_phase_ms, noise_sigma=noise_sigma, rng=rng),
             start_uptime_ms=i * buffer_ms, samp_rate=SAMP_RATE))
-        if before == 1 and channel.coherent_integration_ms > 1 and extended_at_mode is None:
+        if before == 1 and channel.coherent_duration_ms > 1 and extended_at_mode is None:
             extended_at_mode = channel.loop_state.mode
     return extended_at_mode
 
@@ -656,7 +701,7 @@ def test_seeded_overlay_starts_synced_without_extending():
     channel = _seeded_channel(CORRECT_SEEDED_COUNTER)
 
     assert channel.overlay_sync.synced, "a supplied counter means no search is needed"
-    assert channel.coherent_integration_ms == 1, "must not extend before the loops have pulled in"
+    assert channel.coherent_duration_ms == 1, "must not extend before the loops have pulled in"
     assert channel.policy.costas is False, "the pilot discriminator is available at once"
 
 
@@ -669,7 +714,7 @@ def test_seeded_overlay_extends_only_once_the_pll_has_locked():
     assert extended_at_mode is tracking_channel.TrackingLoopMode.PLL, (
         "coherent integration lengthened while still in FLL"
     )
-    assert channel.coherent_integration_ms == 10
+    assert channel.coherent_duration_ms == 10
     assert channel.loop_params.PLL_bandwidth_hz < 20.0, "loop filter was not retuned"
 
 
@@ -687,7 +732,7 @@ def test_a_wrong_seeded_counter_never_locks():
     wrong = _seeded_channel((CORRECT_SEEDED_COUNTER + 5) % 20)
     _drive(wrong)
 
-    assert wrong.coherent_integration_ms == 1
+    assert wrong.coherent_duration_ms == 1
     assert wrong.loop_state.mode is tracking_channel.TrackingLoopMode.FLL
 
     right = _seeded_channel(CORRECT_SEEDED_COUNTER)
@@ -703,7 +748,7 @@ def test_seeding_a_counter_needs_a_tiered_code():
         tracking_channel.TrackingChannel(
             loop_params=tracking_channel.TrackingLoopParameters(
                 DLL_bandwidth_hz=2.0, PLL_bandwidth_hz=20.0, FLL_bandwidth_hz=50.0,
-                coherent_integration_ms=1,
+                coherent_duration_ms=1,
             ),
             signal_params=tracking_channel.TrackingSignalParameters(
                 code_set=signal.code_set,
@@ -732,18 +777,18 @@ def test_extended_epochs_start_on_a_code_phase_the_epoch_length_divides():
     real = channel.run_loop_filter
 
     def spy():
-        if channel.coherent_integration_ms > 1:
+        if channel.coherent_duration_ms > 1:
             # start of the epoch that just closed
             epoch_starts.append(
                 channel.corr_interval.start_code_phase_ms
-                - (channel.coherent_integration_ms - tracking_channel.CORRELATION_INTERVAL_MS)
+                - (channel.coherent_duration_ms - tracking_channel.CORRELATION_INTERVAL_MS)
             )
         return real()
 
     channel.run_loop_filter = spy
     _drive(channel)
 
-    assert channel.coherent_integration_ms == 10, "never extended"
+    assert channel.coherent_duration_ms == 10, "never extended"
     assert epoch_starts, "no extended epochs ran"
     epoch_ms = 10
     offenders = [s for s in epoch_starts if s % epoch_ms != 0]

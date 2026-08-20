@@ -318,7 +318,7 @@ what a signal *is*, how it is *acquired*, and how it is *tracked*.
   spans a whole overlay period (`acquisition_resolves_overlay_phase`), the
   recovered code phase carries the overlay counter outright and the channel
   starts already synced — no search at all.
-- `TrackingPolicy.synced_coherent_integration_ms` is a *duration*, not a count
+- `TrackingPolicy.synced_coherent_duration_ms` is a *duration*, not a count
   of primary code periods: one epoch serves every component, so the post-sync
   length is bounded by the shortest data symbol in the signal (10 ms for L5,
   I's CNAV symbol) rather than by the pilot's overlay period.

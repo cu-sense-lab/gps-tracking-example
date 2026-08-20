@@ -51,7 +51,7 @@ PRN = 1
 
 def _l2c_config():
     return bpsk_acquisition.AcquisitionConfiguration(
-        replica_duration_ms=20, coherent_duration_ms=5.0, num_blocks=4,
+        coherent_duration_replica_ms=20, coherent_duration_sample_ms=5.0, num_blocks=4,
         sample_rate=L2C_SAMP_RATE, min_search_doppler_hz=-2000, max_search_doppler_hz=2000,
     )
 
@@ -139,7 +139,7 @@ def test_cl_only_correlates_at_the_resolved_phase():
     samples, config = _l2c_dwell(cl_block=cl_block, noise_sigma=0.0)
     acq, signals = _acquire_l2c(samples, config)
     code_set = signals[f"G{PRN:02d}"].code_set
-    cm, cl = code_set.index_of("CM"), code_set.index_of("CL")
+    cm, cl = code_set.index_of("L2CM"), code_set.index_of("L2CL")
 
     def prompts(offset_chips):
         out = np.zeros((1, code_set.num_components), dtype=np.complex64)
@@ -195,7 +195,7 @@ def _track_l2c(signals, acq, resolutions, *, cl_block=37, buffers=4, buffer_ms=5
 
     loop_params = tracking_channel.TrackingLoopParameters(
         DLL_bandwidth_hz=2.0, PLL_bandwidth_hz=20.0, FLL_bandwidth_hz=50.0,
-        coherent_integration_ms=1, EPL_chip_spacing=0.5,
+        coherent_duration_ms=1, EPL_chip_spacing=0.5,
     )
     kwargs = dict(
         signal_type=GpsL2C, signals=signals,
@@ -238,8 +238,8 @@ def test_cl_accumulates_only_once_the_block_is_resolved():
     def mean_prompts(adapter):
         n = adapter.outputs.output_index
         tail = slice(n // 2, n)
-        cm = adapter.component_index("CM")
-        cl = adapter.component_index("CL")
+        cm = adapter.component_index("L2CM")
+        cl = adapter.component_index("L2CL")
         return (
             np.abs(adapter.outputs.prompt_corr[tail, cm]).mean(),
             np.abs(adapter.outputs.prompt_corr[tail, cl]).mean(),
@@ -349,7 +349,7 @@ def test_an_unresolved_search_warns_that_integration_is_not_active():
     }
     loop_params = tracking_channel.TrackingLoopParameters(
         DLL_bandwidth_hz=2.0, PLL_bandwidth_hz=20.0, FLL_bandwidth_hz=50.0,
-        coherent_integration_ms=1,
+        coherent_duration_ms=1,
     )
     unresolved = {
         f"G{PRN:02d}": AmbiguityResolution(
@@ -373,8 +373,8 @@ def test_an_unresolved_search_warns_that_integration_is_not_active():
 
     # Falls back to CM alone rather than guessing CL's block.
     names = signals[f"G{PRN:02d}"].code_set.names
-    assert names[adapter.channel.policy.carrier_component] == "CM"
-    assert adapter.channel.coherent_integration_ms == 1
+    assert names[adapter.channel.policy.carrier_component] == "L2CM"
+    assert adapter.channel.coherent_duration_ms == 1
 
 
 def test_a_confident_search_does_not_warn():
@@ -415,13 +415,13 @@ def test_resolving_cl_moves_the_carrier_loop_onto_the_pilot():
     names = signals[f"G{PRN:02d}"].code_set.names
 
     fallback = _track_l2c(signals, acq, None, buffers=0).channel.policy
-    assert names[fallback.carrier_component] == "CM"
-    assert tuple(names[i] for i in fallback.code_components) == ("CM",)
+    assert names[fallback.carrier_component] == "L2CM"
+    assert tuple(names[i] for i in fallback.code_components) == ("L2CM",)
     assert fallback.costas is True
 
     resolved = _track_l2c(signals, acq, resolutions, buffers=0).channel.policy
-    assert names[resolved.carrier_component] == "CL"
-    assert tuple(names[i] for i in resolved.code_components) == ("CM", "CL")
+    assert names[resolved.carrier_component] == "L2CL"
+    assert tuple(names[i] for i in resolved.code_components) == ("L2CM", "L2CL")
     assert resolved.costas is False
 
 

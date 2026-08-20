@@ -1,4 +1,4 @@
-from typing import Iterable, Optional, Sequence
+from typing import TYPE_CHECKING, Iterable, Optional, Sequence
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -9,6 +9,9 @@ from matplotlib.figure import Figure, SubFigure
 
 from . import bpsk_acquisition, tracking_channel
 from .collect_metadata_utils import ExperimentMetadata
+
+if TYPE_CHECKING:  # avoids importing signal_interfaces at runtime
+    from .signal_interfaces import TrackingChannelAdapter
 
 
 def setup_default_plotting():
@@ -120,19 +123,107 @@ def plot_welch_psd(
     freqs = np.fft.fftshift(freqs)
     psd = np.fft.fftshift(psd)
     if orig_samples is not None:
-        freqs, psd_orig = scipy.signal.welch(
+        _, psd_orig = scipy.signal.welch(
             orig_samples, fs=samp_rate, nperseg=nperseg, noverlap=noverlap,
             window="hann", return_onesided=False, scaling="density",
         )
         psd_orig = np.fft.fftshift(psd_orig)
-        ax.plot(freqs / 1e6, 10 * np.log10(psd_orig), color="gray")
+        ax.plot(freqs / 1e6, 10 * np.log10(psd_orig), color="gray", label="Original Samples")
 
-    ax.plot(freqs / 1e6, 10 * np.log10(psd), color="black")
+    ax.plot(freqs / 1e6, 10 * np.log10(psd), color="black", label="Baseband Samples")
     
     ax.set_title("Welch PSD Estimate of Raw Samples")
     ax.set_xlabel("Frequency (MHz)")
     ax.set_ylabel("Power/Frequency (dB/Hz)")
     ax.grid()
+    ax.legend()
+    return ax
+
+
+def plot_sample_histogram_and_constellation(
+    fig: Figure | SubFigure,
+    samples: np.ndarray,
+    bit_depth: int = 8,
+) -> Sequence[Axes]:
+    """
+    Two views of one buffer of raw samples: a histogram of the I and Q values,
+    and the I-vs-Q scatter ("constellation").
+
+    What a healthy collect looks like: both histograms are bell-shaped (Gaussian)
+    and centred near zero, and the scatter is a round, featureless blob. GNSS
+    signals arrive far below the noise floor, so what you are looking at is
+    essentially receiver noise -- the satellites are invisible until correlation
+    pulls them out.
+
+    What problems look like:
+      - Histogram pressed flat against the ends of the range -> the front-end gain
+        is too high and samples are clipping.
+      - Histogram squeezed into just a few values near zero -> gain too low, and
+        quantisation is throwing away the signal.
+      - Q identically zero -> the data is real-valued, not complex; check
+        `is_complex` in the collect's metadata.yml.
+      - An off-centre blob, or a ring/arc rather than a disc -> a DC bias or an
+        uncorrected carrier offset.
+
+    `bit_depth` sets the histogram range to the full span the sample format can
+    represent, so an under-driven collect is obvious by how little of the axis it
+    fills.
+    """
+    axes = fig.subplots(1, 2, width_ratios=[1.5, 1])
+    ax_hist: Axes = axes[0]
+    ax_scatter: Axes = axes[1]
+
+    hist_bins = np.arange(-(2 ** (bit_depth - 1)), 2 ** (bit_depth - 1))
+    ax_hist.hist(samples.real, bins=hist_bins, histtype="stepfilled", color="r", alpha=0.6, align="left", label="Real (I)")
+    ax_hist.hist(samples.imag, bins=hist_bins, histtype="stepfilled", color="b", alpha=0.6, align="mid", label="Imaginary (Q)")
+    ax_hist.set_xlabel("Sample Value")
+    ax_hist.set_ylabel("Count")
+    ax_hist.grid()
+    ax_hist.legend(loc="upper right")
+
+    # alpha is very low because a 40 ms buffer is ~1e6 points: the density, not
+    # any single dot, is the thing to read.
+    ax_scatter.scatter(samples.real, samples.imag, color="k", s=1, alpha=0.01, zorder=1)
+    ax_scatter.set_axisbelow(True)
+    ax_scatter.grid()
+    ax_scatter.set_xlabel("Real (I)")
+    ax_scatter.set_ylabel("Imaginary (Q)")
+    return axes
+
+
+def plot_stft_periodogram(
+    fig: Figure | SubFigure,
+    periodogram: np.ndarray,
+    samp_rate: float,
+    total_duration_s: float,
+) -> Axes:
+    """
+    Spectrogram: how the power spectrum of the collect changes over time.
+
+    `periodogram` is (num_windows, num_freq_bins), one PSD estimate per time
+    window, already fftshifted so frequency runs monotonically from -samp_rate/2
+    to +samp_rate/2. Colour is power in dB.
+
+    What to look for: a steady horizontal band across the whole capture means the
+    front end behaved consistently. Vertical stripes are momentary interference or
+    dropped samples; a band that brightens or fades over time means the gain (or
+    the antenna's view of the sky) changed mid-collect. Narrow horizontal lines
+    that persist are continuous-wave interference -- a jammer or a nearby
+    oscillator -- which is exactly the kind of thing that stops acquisition from
+    working later.
+    """
+    ax = fig.add_subplot(1, 1, 1)
+    im = ax.imshow(
+        10 * np.log10(periodogram.T),
+        aspect="auto",
+        origin="lower",
+        extent=[0, total_duration_s, -samp_rate / 2e6, samp_rate / 2e6],
+        interpolation="nearest",
+    )
+    ax.set_xlabel("Time [s]")
+    ax.set_ylabel("Frequency [MHz]")
+    ax.set_title("STFT Periodogram")
+    fig.colorbar(im, ax=ax, label="Power/Frequency [dB/Hz]")
     return ax
 
 
@@ -248,6 +339,98 @@ def plot_acquisition_correlation_histogram(
     ax.grid()
     ax.set_xlim(0, hist_max_val)
     return ax
+
+
+def plot_acquisition_dwell_layout(
+    fig: Figure | SubFigure,
+    acq_config: bpsk_acquisition.AcquisitionConfiguration,
+    symbol_period_ms: Optional[float] = None,
+    symbol_phase_ms: float = 0.0,
+) -> Sequence[Axes]:
+    """
+    Why acquisition has two lengths, drawn from the configuration itself.
+
+    Left panel -- the dwell in time.  `num_blocks` coherent blocks of
+    `coherent_duration_sample_ms` are taken back to back from the stream, and each
+    is zero-padded out to `coherent_duration_replica_ms` before its FFT (the
+    correlation is circular, so the FFT length is the replica length).  If
+    `symbol_period_ms` is given, data symbol boundaries are drawn: a sign flip
+    *between* blocks is harmless because the blocks are combined by square law,
+    but one *inside* a block cancels part of that block's own integration.
+    `symbol_phase_ms` offsets that boundary grid: acquisition does not know the
+    symbol alignment, so the realistic picture is an arbitrary offset, and keeping
+    blocks short is what bounds the damage whatever the offset turns out to be.
+
+    Right panel -- the same two lengths in frequency.  Grid ticks are the Doppler
+    bins the FFT actually produces, spaced `1 / T_replica`.  The curve is the
+    coherent response, whose mainlobe is `1 / T_coherent` wide.  A short coherent
+    length therefore widens the response without widening the grid, which is what
+    lets a short integration still be located to a fine Doppler.
+    """
+    axes = fig.subplots(1, 2, width_ratios=[1.4, 1])
+    ax_time: Axes = axes[0]
+    ax_freq: Axes = axes[1]
+
+    t_coh = float(acq_config.coherent_duration_sample_ms)
+    t_rep = float(acq_config.coherent_duration_replica_ms)
+    num_blocks = acq_config.num_blocks
+
+    for m in range(num_blocks):
+        y = num_blocks - 1 - m
+        ax_time.broken_barh([(0.0, t_coh)], (y - 0.32, 0.64),
+                            facecolors="tab:blue", edgecolor="k", linewidth=0.5)
+        if t_rep > t_coh:
+            ax_time.broken_barh([(t_coh, t_rep - t_coh)], (y - 0.32, 0.64),
+                                facecolors="lightgrey", edgecolor="k",
+                                linewidth=0.5, hatch="//")
+        ax_time.text(t_coh / 2, y, f"block {m}", ha="center", va="center",
+                     fontsize=8, color="white")
+        if symbol_period_ms:
+            # Symbol boundaries as this block sees them: the block starts at
+            # m * t_coh in the stream, so the grid is offset into the window.
+            k = 0
+            while True:
+                edge = symbol_phase_ms + k * symbol_period_ms - m * t_coh
+                if edge >= t_coh:
+                    break
+                if edge > 0:
+                    ax_time.plot([edge, edge], [y - 0.32, y + 0.32],
+                                 color="tab:red", lw=2)
+                k += 1
+
+    ax_time.set_yticks(range(num_blocks))
+    ax_time.set_yticklabels([f"{num_blocks - 1 - i}" for i in range(num_blocks)])
+    ax_time.set_ylabel("Block")
+    ax_time.set_xlabel("Time within the FFT window [ms]")
+    ax_time.set_xlim(0, t_rep)
+    ax_time.set_title(f"Dwell: {num_blocks} x {t_coh:g} ms coherent, {t_rep:g} ms replica")
+    handles = [
+        plt.Rectangle((0, 0), 1, 1, facecolor="tab:blue", edgecolor="k", label="data integrated"),
+        plt.Rectangle((0, 0), 1, 1, facecolor="lightgrey", edgecolor="k", hatch="//", label="zero padding"),
+    ]
+    if symbol_period_ms:
+        handles.append(plt.Line2D([0], [0], color="tab:red", lw=2,
+                                  label=f"symbol boundary ({symbol_period_ms:g} ms)"))
+    ax_time.legend(handles=handles, fontsize=7, loc="upper right")
+
+    # --- frequency ---
+    grid_hz = acq_config.fft_resolution
+    response_hz = acq_config.doppler_response_width_hz
+    span = 3 * response_hz
+    f = np.linspace(-span, span, 1001)
+    ax_freq.plot(f, np.abs(np.sinc(f / response_hz)), color="k", lw=2,
+                 label=f"response, {response_hz:.0f} Hz wide")
+    ticks = np.arange(-span, span + grid_hz, grid_hz)
+    ax_freq.vlines(ticks, 0, 0.12, color="tab:orange", lw=1.5,
+                   label=f"Doppler bins, {grid_hz:.0f} Hz apart")
+    ax_freq.set_xlabel("Doppler offset from the true value [Hz]")
+    ax_freq.set_ylabel("Normalised correlation")
+    ax_freq.set_title("Grid spacing vs response width")
+    ax_freq.set_xlim(-span, span)
+    ax_freq.set_ylim(0, 1.1)
+    ax_freq.grid()
+    ax_freq.legend(fontsize=7, loc="upper right")
+    return axes
 
 
 # --- tracking-result diagnostics --------------------------------------------
@@ -383,3 +566,103 @@ def plot_epl_magnitude_and_code_error(
         ax.grid()
     fig.align_labels()
     return axes
+
+
+def plot_tracking_prompt_and_doppler(
+    fig: Figure | SubFigure,
+    adapter: "TrackingChannelAdapter",
+    sig_id: str,
+    title: Optional[str] = None,
+) -> Sequence[Axes]:
+    """
+    The standard "is this channel actually locked?" plot, for one satellite.
+
+    Top panel: the prompt correlator's in-phase (I) and quadrature (Q) values over
+    time, for whichever component the carrier loop is running on (CA for L1 C/A,
+    CM for L2C, the Q pilot for L5). Bottom panel: the Doppler frequency the loop
+    has settled on.
+
+    What locked looks like: all the power sits on I while Q stays clustered around
+    zero -- that is the phase-locked loop doing its job, rotating the signal onto
+    the real axis. Doppler is a smooth, slowly drifting line of a few kHz, changing
+    by only a few Hz per second as the satellite moves.
+
+    How many bands I forms depends on which component the carrier loop is using:
+
+      - A **data-bearing** component (L1 C/A's CA, L2C's CM) shows I in two
+        horizontal bands, one positive and one negative.  The jumps between them
+        are navigation data bits flipping the sign of the signal.
+      - A **dataless pilot** (L5's Q, L2C's CL once resolved) shows I as a single
+        band with no flips at all.  Nothing modulates a pilot, which is exactly
+        why the carrier loop prefers one where it exists.
+
+    What losing lock looks like: I and Q both scatter symmetrically around zero
+    with no visible bands, and Doppler wanders erratically over hundreds or
+    thousands of Hz. A channel that never locked at all looks like this from the
+    start -- usually a false acquisition.
+
+    The carrier component is read from the channel's live policy rather than the
+    signal type's default, because overlay sync can move the carrier loop onto a
+    different component partway through the run (L5 does exactly this).
+    """
+    outputs = adapter.outputs
+    component_names = adapter.signal.component_names
+    carrier_index = adapter.channel.policy.carrier_component
+    carrier_prompt = adapter.get_prompt_component(component=carrier_index)
+
+    # `outputs` pre-allocates output_capacity epochs and fills only the first
+    # `output_index`; `outputs.valid` slices off the unwritten zero tail, which
+    # would otherwise draw a spurious line back to (0, 0).
+    plot_time = outputs.uptime_epoch_ms[outputs.valid] * 1e-3
+    doppler_freq_hz = outputs.doppler_freq_hz[outputs.valid]
+
+    axes = fig.subplots(2, 1, sharex=True)
+    axes[0].scatter(plot_time, carrier_prompt.real, s=2, color="tab:red", label="In-phase")
+    axes[0].scatter(plot_time, carrier_prompt.imag, s=2, color="tab:blue", label="Quadrature")
+    axes[0].set_ylabel(f"Prompt ({component_names[carrier_index]})")
+    axes[0].set_title(title if title is not None else f"Tracking: {sig_id}")
+    axes[0].legend(markerscale=10)
+    axes[0].grid(True)
+
+    axes[1].plot(plot_time, doppler_freq_hz, lw=1.5, color="tab:green")
+    axes[1].set_ylabel("Doppler [Hz]")
+    axes[1].set_xlabel("Uptime [s]")
+    axes[1].grid(True)
+    fig.align_labels()
+    return axes
+
+
+def plot_component_prompt_magnitudes(
+    fig: Figure | SubFigure,
+    adapter: "TrackingChannelAdapter",
+    sig_id: str,
+    title: Optional[str] = None,
+) -> Axes:
+    """
+    Prompt correlation magnitude of every code component of a multi-component
+    signal, on one set of axes. Meaningless for a single-component signal such as
+    L1 C/A, so callers should skip it when `len(component_names) == 1`.
+
+    What to expect:
+      - L5: I and Q carry equal power, so the two traces should sit on top of each
+        other. A large gap means one component is not being tracked properly.
+      - L2C: CM and CL each transmit on only half the chip slots, so both sit near
+        half the magnitude a single full-rate code would reach -- and they should
+        be roughly equal to each other.
+
+    Magnitude is used rather than I/Q because it is insensitive to carrier phase:
+    it answers "how much signal power is this component recovering", not "is the
+    phase right".
+    """
+    ax = fig.add_subplot(1, 1, 1)
+    outputs = adapter.outputs
+    plot_time = outputs.uptime_epoch_ms[outputs.valid] * 1e-3
+    for index, name in enumerate(adapter.signal.component_names):
+        prompt = adapter.get_prompt_component(component=index)
+        ax.scatter(plot_time, np.abs(prompt), s=2, label=f"{name}", color=f"C{index}")
+    ax.set_title(title if title is not None else f"Components: {sig_id}")
+    ax.set_ylabel("Prompt Magnitude")
+    ax.set_xlabel("Uptime [s]")
+    ax.grid(True)
+    ax.legend(markerscale=10)
+    return ax
