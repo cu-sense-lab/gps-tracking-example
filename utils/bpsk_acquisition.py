@@ -302,6 +302,25 @@ class AcquisitionResult:
         return float(10.0 * np.log10(self.normalized_peak_value / (2 * self.config.num_blocks)))
 
     @property
+    def fine_peak_snr_db(self) -> float | None:
+        """
+        The refined peak on the same dB-above-noise scale as `peak_snr_db`, or None
+        when no fine search ran.
+
+        Divides by the **coarse** `noise_var`: the fine grid holds only a few dozen
+        cells clustered on a peak, nowhere near a fair sample of the noise, and
+        detection was decided on the coarse statistics regardless.
+        """
+        if self.fine_correlation_result is None:
+            return None
+        peak = float(
+            self.fine_correlation_result.correlation_matrix[
+                self.fine_peak_doppler_bin, self.fine_peak_code_phase_bin
+            ]
+        )
+        return float(10.0 * np.log10(peak / self.noise_var / (2 * self.config.num_blocks)))
+
+    @property
     def detection_threshold_db(self) -> float:
         """The detection threshold on the same dB-above-noise scale as `peak_snr_db`."""
         return float(10.0 * np.log10(self.detection_threshold / (2 * self.config.num_blocks)))
@@ -635,8 +654,17 @@ def run_acquisition(
             f"(p_fa {prob_false_alarm_total:g} over {num_detection_cells:,} cells/PRN)"
         )
         print()
-        print(f"  {'PRN':<5} {'SNR [dB]':>9} {'Doppler [Hz]':>13} {'Code phase [ms' + ambiguity + ']':>22}")
-        print(f"  {'-' * 5} {'-' * 9} {'-' * 13} {'-' * 22}")
+        # With a fine search configured every column carries `coarse => fine`, so
+        # the columns are widened and the code phase gains decimals -- one sample is
+        # 4.5e-5 ms at 22 Msps, invisible at the 3 decimals the plain table uses.
+        showing_fine = acq_config.fine_search is not None
+        snr_w, dopp_w, cp_w = (18, 21, 25) if showing_fine else (9, 13, 22)
+        cp_header = "Code phase [ms" + ambiguity + "]"
+        if showing_fine:
+            print("Detected signals show  coarse => fine.")
+            print()
+        print(f"  {'PRN':<5} {'SNR [dB]':>{snr_w}} {'Doppler [Hz]':>{dopp_w}} {cp_header:>{cp_w}}")
+        print(f"  {'-' * 5} {'-' * snr_w} {'-' * dopp_w} {'-' * cp_w}")
 
     for signal_id, code_params in code_parameters.items():
 
@@ -823,11 +851,25 @@ def run_acquisition(
         if print_progress:
             # Doppler and code phase are only meaningful where a peak was actually
             # detected; a dash is honest about the rest being the noise maximum.
-            doppler = f"{acq_result.acq_doppler_hz:+.0f}" if signal_detected else "-"
-            code_phase = f"{acq_result.acq_code_phase_ms:.3f}" if signal_detected else "-"
+            fine_snr = acq_result.fine_peak_snr_db
+            if not signal_detected:
+                snr = f"{acq_result.peak_snr_db:.1f}"
+                doppler = code_phase = "-"
+            elif fine_snr is None:
+                snr = f"{acq_result.peak_snr_db:.1f}"
+                doppler = f"{acq_result.acq_doppler_hz:+.0f}"
+                code_phase = f"{acq_result.acq_code_phase_ms:.3f}"
+            else:
+                snr = f"{acq_result.peak_snr_db:.1f} => {fine_snr:.1f}"
+                doppler = (
+                    f"{acq_result.coarse_doppler_hz:+.0f} => {acq_result.acq_doppler_hz:+.0f}"
+                )
+                code_phase = (
+                    f"{acq_result.coarse_code_phase_seconds * 1e3:.5f} => "
+                    f"{acq_result.acq_code_phase_ms:.5f}"
+                )
             print(
-                f"  {signal_id:<5} {acq_result.peak_snr_db:9.1f} {doppler:>13} "
-                f"{code_phase:>22}"
+                f"  {signal_id:<5} {snr:>{snr_w}} {doppler:>{dopp_w}} {code_phase:>{cp_w}}"
             )
 
     return acquisition_results

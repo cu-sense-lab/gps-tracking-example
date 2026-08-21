@@ -486,7 +486,6 @@ def plot_acquisition_code_phase_slices(
     acq_results: dict[str, bpsk_acquisition.AcquisitionResult],
     signal_ids: Optional[Sequence[str]] = None,
     window_chips: float = 3.0,
-    use_fine: bool = False,
 ) -> Axes:
     """
     Correlation power against code delay, one curve per signal, each taken at its
@@ -536,68 +535,93 @@ def plot_acquisition_code_phase_slices(
         ax.set_title("No signals acquired")
         return ax
 
-    for signal_id in signal_ids:
-        result = acq_results[signal_id]
-        corr = result.correlation_result
-        if use_fine and result.fine_correlation_result is not None:
-            corr = result.fine_correlation_result
-
-        # Which row holds the peak, and which Doppler that row should carry, differ
-        # between the two sources -- the coarse window is built around the *coarse*
-        # peak, while `acq_doppler_hz` reports the refined one once a fine search
-        # has run.  Comparing the coarse window against the refined Doppler is an
-        # off-by-one-bin error that would quietly plot a neighbouring row.
-        if corr is result.fine_correlation_result:
-            peak_row = result.fine_peak_doppler_bin
-            expected_hz = result.acq_doppler_hz
-        else:
-            # The retained coarse window is centred on the coarse peak and NaN-filled
-            # where it overhangs the grid, so the peak is the middle row by
-            # construction.  Verified rather than assumed.
-            peak_row = corr.correlation_matrix.shape[0] // 2
-            expected_hz = result.coarse_doppler_hz
-        if not np.isclose(corr.doppler_bins_hz[peak_row], expected_hz):
-            raise ValueError(
-                f"{signal_id}: row {peak_row} is {corr.doppler_bins_hz[peak_row]:.1f} Hz but the "
-                f"peak is at {expected_hz:.1f} Hz; the Doppler window is not centred "
-                "on the peak"
-            )
+    def _slice(result, corr, peak_row, reference_seconds):
+        """One Doppler row of `corr`, in dB above noise, against delay in chips."""
         power = corr.correlation_matrix[peak_row]
-
-        # dB above the expected noise level: the peak of a noise-only cell is
-        # chi-squared with 2M degrees of freedom and so averages 2M * noise_var.
         with np.errstate(divide="ignore", invalid="ignore"):
             power_db = 10.0 * np.log10(
                 power / result.noise_var / (2 * result.config.num_blocks)
             )
-
-        # Same distinction on the delay axis: the coarse grid is indexed off the
-        # coarse peak, so referencing it to a refined code phase would shift every
-        # curve by the refinement.
-        reference_seconds = (
-            result.acq_code_phase_seconds
-            if corr is result.fine_correlation_result
-            else result.coarse_code_phase_seconds
-        )
         delay_chips = (
             corr.code_phase_bins_seconds - reference_seconds
         ) * result.acquisition_code_rate_chips_per_sec
         keep = np.abs(delay_chips) <= window_chips
         order = np.argsort(delay_chips[keep])
-        ax.plot(
-            delay_chips[keep][order], power_db[keep][order],
-            marker="o", markersize=3, lw=1.5,
-            label=f"{signal_id}  {result.peak_snr_db:.1f} dB",
-        )
+        return delay_chips[keep][order], power_db[keep][order]
+
+    any_fine = False
+    for index, signal_id in enumerate(signal_ids):
+        result = acq_results[signal_id]
+        colour = f"C{index}"
+        fine = result.fine_correlation_result
+
+        # Both curves are referenced to the FINE peak, so the coarse curve's own
+        # displacement from zero is visible -- that offset is exactly what the
+        # refinement corrected, and hiding it by giving each curve its own origin
+        # would throw away the most informative thing in the figure.
+        #
+        # The *unwrapped* fine peak is the reference: the fine delay axis is a local
+        # axis that may run past the code period, and `acq_code_phase_seconds` is
+        # wrapped, so mixing the two would offset the coarse curve by a whole period
+        # near the boundary.
+        if fine is not None:
+            reference_seconds = float(
+                fine.code_phase_bins_seconds[result.fine_peak_code_phase_bin]
+            )
+        else:
+            reference_seconds = result.coarse_code_phase_seconds
+
+        # The retained coarse window is centred on the coarse peak and NaN-filled
+        # where it overhangs the grid, so the peak is its middle row by
+        # construction.  Verified rather than assumed: a silent off-by-one would
+        # plot a neighbouring Doppler bin and understate the whole curve.
+        coarse_row = result.correlation_result.correlation_matrix.shape[0] // 2
+        if not np.isclose(
+            result.correlation_result.doppler_bins_hz[coarse_row], result.coarse_doppler_hz
+        ):
+            raise ValueError(
+                f"{signal_id}: coarse row {coarse_row} is "
+                f"{result.correlation_result.doppler_bins_hz[coarse_row]:.1f} Hz but the coarse "
+                f"peak is at {result.coarse_doppler_hz:.1f} Hz; the retained Doppler window is "
+                "not centred on the peak"
+            )
+
+        x, y = _slice(result, result.correlation_result, coarse_row, reference_seconds)
+        # Faded, same colour and marker: the eye should read the pair as one signal
+        # measured two ways, not as two signals.
+        ax.plot(x, y, ".-", color=colour, alpha=0.35, markersize=6, lw=1.2)
+
+        if fine is not None:
+            any_fine = True
+            if not np.isclose(
+                fine.doppler_bins_hz[result.fine_peak_doppler_bin], result.acq_doppler_hz
+            ):
+                raise ValueError(
+                    f"{signal_id}: fine row {result.fine_peak_doppler_bin} is "
+                    f"{fine.doppler_bins_hz[result.fine_peak_doppler_bin]:.1f} Hz but the refined "
+                    f"peak is at {result.acq_doppler_hz:.1f} Hz"
+                )
+            x, y = _slice(result, fine, result.fine_peak_doppler_bin, reference_seconds)
+            ax.plot(x, y, ".-", color=colour, alpha=1.0, markersize=6, lw=1.6)
+
+        snr = result.peak_snr_db
+        fine_snr = result.fine_peak_snr_db
+        label = f"{signal_id}  {snr:.1f} dB"
+        if fine_snr is not None:
+            label = f"{signal_id}  {snr:.1f} => {fine_snr:.1f} dB"
+        ax.plot([], [], ".-", color=colour, markersize=6, label=label)
 
     threshold_db = acq_results[signal_ids[0]].detection_threshold_db
     ax.axhline(threshold_db, color="k", ls="--", lw=1.5,
                label=f"detection threshold ({threshold_db:.2f} dB)")
+    if any_fine:
+        ax.plot([], [], ".-", color="0.4", alpha=0.35, markersize=6, label="faded: coarse")
+        ax.plot([], [], ".-", color="0.4", alpha=1.0, markersize=6, label="solid: fine")
 
     # Noise cells scatter several dB below the 0 dB mean, so clamp the floor rather
     # than letting one deep null squash every curve.
     ax.set_ylim(bottom=max(-12.0, ax.get_ylim()[0]))
-    ax.set_xlabel("Code delay relative to peak [chips]")
+    ax.set_xlabel("Code delay relative to the refined peak [chips]")
     ax.set_ylabel("Correlation power [dB above noise]")
     ax.set_title("Acquisition correlation vs code delay")
     ax.grid(True)
