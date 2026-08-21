@@ -255,7 +255,13 @@ def plot_acquisition_doppler_slices(
     fig: Figure | SubFigure,
     acq_results: dict[str, bpsk_acquisition.AcquisitionResult],
 ) -> Axes:
-    """Correlation-vs-Doppler slice through each signal's peak code-phase bin."""
+    """
+    Correlation-vs-Doppler slice through each signal's peak code-phase bin.
+
+    Needs the full Doppler grid, so the results must come from an acquisition run
+    with `save_corr_doppler_window_bins=None`; with the default window this
+    degenerates to the three retained rows.
+    """
     ax = fig.add_subplot(1, 1, 1)
     cmap = plt.get_cmap("tab20b")
     for i, (signal_id, acq_result) in enumerate(acq_results.items()):
@@ -282,15 +288,25 @@ def plot_acquisition_delay_doppler_map(
 ) -> Axes:
     """Delay-Doppler correlation heatmap for one signal's acquisition result, zoomed to the peak."""
     ax = fig.add_subplot(1, 1, 1)
-    acq_config = acq_result.config
     correlation = acq_result.correlation_result.correlation_matrix
     num_doppler_bins, num_code_phases = correlation.shape
-    extent = [0, num_code_phases, acq_config.min_search_doppler_hz, acq_config.max_search_doppler_hz]
+
+    # The Doppler extent comes from the rows actually retained, not from the config's
+    # full search range: `save_corr_doppler_window_bins` keeps only a few rows around
+    # the peak, and labelling them +/-5 kHz would be a lie.  The delay axis is kept
+    # whole, so `peak_code_phase_bin` indexes it directly and the zoom below works.
+    doppler_hz = acq_result.correlation_result.doppler_bins_hz
+    half_row = 0.5 * acq_result.correlation_result.doppler_resolution_hz
+    extent = [0, num_code_phases, doppler_hz[0] - half_row, doppler_hz[-1] + half_row]
+
+    # NaN rows (a window overhanging the grid) should read as absent, not as zero.
+    cmap = plt.get_cmap("plasma").copy()
+    cmap.set_bad(color="0.85")
 
     peak_code_phase_bin = acq_result.peak_code_phase_bin
     im = ax.imshow(
         correlation, extent=extent, aspect="auto", interpolation="nearest",
-        cmap="plasma", origin="lower", vmin=0,
+        cmap=cmap, origin="lower", vmin=0,
     )
     ax.set_xlim(peak_code_phase_bin - code_phase_window_samples, peak_code_phase_bin + code_phase_window_samples)
     ax.set_xlabel("Code Phase [samples]")
@@ -311,19 +327,27 @@ def plot_acquisition_correlation_histogram(
     chi-squared distribution (df = 2 * num_blocks) that non-coherent
     square-law summation should follow under noise alone, and the detection
     threshold used to declare acquisition.
+
+    Needs the *whole* search grid, so the result must come from an acquisition run
+    with `save_corr_doppler_window_bins=None`.  A retained Doppler window is
+    centred on the peak and is not a fair sample of the noise distribution.
     """
     ax = fig.add_subplot(1, 1, 1)
     corr_matrix = acq_result.correlation_result.correlation_matrix
 
-    y_noise_mean = np.mean(corr_matrix)
+    # nanmean/NaN-drop: a result kept with `save_corr_doppler_window_bins` NaN-fills
+    # any Doppler row that fell outside the searched grid, and plain np.mean of an
+    # array containing NaN is NaN.
+    y_noise_mean = np.nanmean(corr_matrix)
     sigma_n = np.sqrt(y_noise_mean / (2 * num_blocks))
     normalized_corr_matrix = corr_matrix / sigma_n**2
 
     hist_bins = np.linspace(0, hist_max_val, 100)
-    hist = np.histogram(normalized_corr_matrix.flatten(), bins=hist_bins)[0]
+    finite_values = normalized_corr_matrix[np.isfinite(normalized_corr_matrix)]
+    hist = np.histogram(finite_values, bins=hist_bins)[0]
 
     ax.bar(hist_bins[:-1], hist, width=hist_bins[1] - hist_bins[0], color="blue", alpha=0.7)
-    x_vals = np.linspace(0, np.max(normalized_corr_matrix), 1000)
+    x_vals = np.linspace(0, np.nanmax(normalized_corr_matrix), 1000)
     chi2_pdf = scipy.stats.chi2.pdf(x_vals, df=2 * num_blocks)
     ax.plot(
         x_vals, chi2_pdf * np.max(hist) / np.max(chi2_pdf), color="red", linewidth=2,
@@ -440,6 +464,110 @@ def plot_acquisition_dwell_layout(
     ax_freq.grid()
     ax_freq.legend(fontsize=7, loc="upper right")
     return axes
+
+
+def plot_acquisition_code_phase_slices(
+    fig: Figure | SubFigure,
+    acq_results: dict[str, bpsk_acquisition.AcquisitionResult],
+    signal_ids: Optional[Sequence[str]] = None,
+    window_chips: float = 3.0,
+) -> Axes:
+    """
+    Correlation power against code delay, one curve per signal, each taken at its
+    own peak Doppler bin.
+
+    This is the view for reading **multipath**, which lives in the delay dimension:
+    a reflection is always delayed relative to the direct path, so it shows up as
+    asymmetry about zero -- a shoulder on the late side, a broadened or flattened
+    peak -- rather than as a change in peak height.
+
+    Delay is plotted relative to each signal's own peak, so the curves are
+    comparable; absolute code phase is in the acquisition table.  Power is in dB
+    above the expected noise level, the same scale as `AcquisitionResult.
+    peak_snr_db` and that table, so every noise floor sits at 0 dB and every peak
+    reads its own SNR.  The detection threshold is drawn as one horizontal line --
+    it depends only on the per-cell false-alarm rate and `num_blocks`, so it is a
+    property of the sweep rather than of any signal.
+
+    A healthy dwell is a sharp peak at delay zero, far above the line, falling to a
+    flat floor within about a chip either side.  A false acquisition is a low,
+    shapeless bump that barely clears it.
+
+    Resolution is set by the sample rate, and it is coarse: at 22 Msps against a
+    10.23 Mcps code there are only 2.15 samples per chip -- one sample is 45.5 ns,
+    13.6 m, 0.465 chips, and the ideal +/-1 chip correlation triangle spans just
+    4.3 samples.  Multipath appears as asymmetry across a handful of points, not as
+    a smoothly resolved shoulder.  Anything finer needs a higher sample rate or an
+    interpolated peak.
+
+    **Do not read asymmetry as multipath without checking the sign.**  With 2.15
+    samples per chip the true peak almost never lands on a sample, so the two
+    neighbours are unequal purely from where the sampling grid happened to fall.
+    On the rooftop collect the late-minus-early difference is -6.4, +5.8 and
+    -0.8 dB for G01, G14 and G30 -- random in sign, which is the signature of
+    sub-sample placement.  Multipath is a *delayed* reflection, so it skews late
+    consistently, across satellites and over time.  A single dwell cannot separate
+    the two; a run of dwells can.
+
+    Signals are taken from `acq_results` by default only where `signal_detected` is
+    set; elsewhere the "peak" is a noise maximum whose neighbourhood means nothing.
+    """
+    if signal_ids is None:
+        signal_ids = sorted(sid for sid, r in acq_results.items() if r.signal_detected)
+
+    ax = fig.add_subplot(1, 1, 1)
+    if not signal_ids:
+        ax.set_title("No signals acquired")
+        return ax
+
+    for signal_id in signal_ids:
+        result = acq_results[signal_id]
+        corr = result.correlation_result
+
+        # The retained window is centred on the peak and NaN-filled where it
+        # overhangs the search grid, so the peak is the middle row by construction.
+        # Verified rather than assumed, because a silent off-by-one here would plot
+        # a neighbouring Doppler bin and quietly understate every peak.
+        centre_row = corr.correlation_matrix.shape[0] // 2
+        if not np.isclose(corr.doppler_bins_hz[centre_row], result.acq_doppler_hz):
+            raise ValueError(
+                f"{signal_id}: centre row is {corr.doppler_bins_hz[centre_row]:.1f} Hz but the "
+                f"peak is at {result.acq_doppler_hz:.1f} Hz; the retained Doppler window is "
+                "not centred on the peak"
+            )
+        power = corr.correlation_matrix[centre_row]
+
+        # dB above the expected noise level: the peak of a noise-only cell is
+        # chi-squared with 2M degrees of freedom and so averages 2M * noise_var.
+        with np.errstate(divide="ignore", invalid="ignore"):
+            power_db = 10.0 * np.log10(
+                power / result.noise_var / (2 * result.config.num_blocks)
+            )
+
+        delay_chips = (
+            corr.code_phase_bins_seconds - result.acq_code_phase_seconds
+        ) * result.acquisition_code_rate_chips_per_sec
+        keep = np.abs(delay_chips) <= window_chips
+        order = np.argsort(delay_chips[keep])
+        ax.plot(
+            delay_chips[keep][order], power_db[keep][order],
+            marker="o", markersize=3, lw=1.5,
+            label=f"{signal_id}  {result.peak_snr_db:.1f} dB",
+        )
+
+    threshold_db = acq_results[signal_ids[0]].detection_threshold_db
+    ax.axhline(threshold_db, color="k", ls="--", lw=1.5,
+               label=f"detection threshold ({threshold_db:.2f} dB)")
+
+    # Noise cells scatter several dB below the 0 dB mean, so clamp the floor rather
+    # than letting one deep null squash every curve.
+    ax.set_ylim(bottom=max(-12.0, ax.get_ylim()[0]))
+    ax.set_xlabel("Code delay relative to peak [chips]")
+    ax.set_ylabel("Correlation power [dB above noise]")
+    ax.set_title("Acquisition correlation vs code delay")
+    ax.grid(True)
+    ax.legend(fontsize=8, ncol=2)
+    return ax
 
 
 # --- tracking-result diagnostics --------------------------------------------

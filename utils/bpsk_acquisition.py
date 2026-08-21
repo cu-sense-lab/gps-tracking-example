@@ -3,6 +3,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple
 import numpy as np
 from numpy.typing import NDArray
+import scipy.fft
 import scipy.stats
 
 
@@ -232,6 +233,9 @@ class AcquisitionResult:
     # was correlated against, because that code repeats within the replica.  For
     # L5 acquired on Q x NH20 that is 20 ms; for L1 C/A it is 1 ms.
     code_phase_ambiguity_ms: float = 0.0
+    # Chip rate of the code that was correlated against, so a delay axis can be
+    # expressed in chips without the caller having to look it up.
+    acquisition_code_rate_chips_per_sec: float = 0.0
 
     @property
     def peak_snr_db(self) -> float:
@@ -330,7 +334,7 @@ def run_acquisition(
     prob_false_alarm_total: float,
     print_progress: bool = False,
     noise_var_method: str = "abscorrmean",
-    save_corr_peak_window_chips: Optional[float] = None,
+    save_corr_doppler_window_bins: Optional[int] = 1,
 ) -> Dict[str, AcquisitionResult]:
     """
     Perform BPSK acquisition on the given sample block for all signals defined in code_parameters.
@@ -356,6 +360,22 @@ def run_acquisition(
     Options for noise variance estimation:
         "abscorrmean": compute noise variance from the mean of abs(corr)**2 matrix
         "abscorrvar": compute noise variance from the square root of the variance of abs(corr)**2 matrix
+
+    `save_corr_doppler_window_bins` controls how much of each signal's
+    delay-Doppler matrix is *kept* in the returned `CorrelationResult`; detection
+    itself always uses the whole thing.  `1` (the default) keeps the peak Doppler
+    bin and one either side, with the full code-delay axis -- 704 MB per signal
+    becomes about 5 MB, which matters because a 32-PRN sweep otherwise retains
+    ~22 GB.  The delay axis is the one worth keeping: multipath lives there, and at
+    22 Msps one code-phase bin is 45 ns, about 14 m.  `None` keeps the full grid,
+    which is needed for anything reading the Doppler response
+    (`plotting.plot_acquisition_doppler_slices`) or the whole-grid noise
+    distribution (`plotting.plot_acquisition_correlation_histogram`).
+
+    Rows outside the searched grid are filled with NaN rather than clipped away, so
+    the retained matrix is always `2 * window + 1` rows and the peak is always the
+    centre row -- true even for a signal whose Doppler lands at the edge of the
+    search range.  Consumers must use the `nan*` reductions.
 
     Sub-bin Doppler refinement is configured by `acq_config.fine_search_factors`.
     A Doppler factor of `k` repeats the search with the samples shifted down by
@@ -410,14 +430,17 @@ def run_acquisition(
     # own position within the window contributes only a constant phase, which the
     # square law discards.
     sub_bin_offsets_hz = [0.0]
-    conj_sample_ffts = [np.conj(np.fft.fft(samples, axis=1))]
+    # scipy.fft rather than numpy: it releases the GIL and threads across the
+    # blocks with workers=-1.  Single-threaded scipy is *slower* than numpy here,
+    # so the workers argument is not optional.
+    conj_sample_ffts = [np.conj(scipy.fft.fft(samples, axis=1, workers=-1))]
     block_time_arr = np.arange(N) / acq_config.sample_rate
     for j in range(1, acq_config.doppler_factor):
         # Mixing the samples down by j/k of a bin makes the signal appear that much
         # lower, so the recovered Doppler is the bin centre plus the offset.
         offset_hz = j * acq_config.fft_resolution / acq_config.doppler_factor
         shifted_samples = samples * np.exp(-2j * np.pi * offset_hz * block_time_arr)[None, :]
-        conj_sample_ffts.append(np.conj(np.fft.fft(shifted_samples, axis=1)))
+        conj_sample_ffts.append(np.conj(scipy.fft.fft(shifted_samples, axis=1, workers=-1)))
         sub_bin_offsets_hz.append(offset_hz)
 
     if print_progress:
@@ -487,22 +510,35 @@ def run_acquisition(
         doppler_offset_hz = 0.0
 
         for conj_samples_fft, sub_bin_offset_hz in zip(conj_sample_ffts, sub_bin_offsets_hz):
-            pass_correlation = np.zeros((len(doppler_search_bins), N))
+            # Match the sample precision rather than always using float64: real
+            # collects are complex64, where float64 here only doubles the write
+            # bandwidth.  Tests that feed complex128 keep their precision.
+            pass_correlation = np.zeros(
+                (len(doppler_search_bins), N),
+                dtype=np.float32 if samples.dtype == np.complex64 else np.float64,
+            )
 
             for i, roll in enumerate(doppler_search_bins):
                 # Coherent integration over the N_coh non-zero samples of each
                 # block; the padding contributes nothing, so z_noise ~ CN(0,
                 # N_coh*noise_var) regardless of the FFT length.
                 shifted_replica_fft = np.roll(replica_samples_fft, roll)
-                corr = np.fft.ifft(
-                    conj_samples_fft * shifted_replica_fft[None, :]
+                corr = scipy.fft.ifft(
+                    conj_samples_fft * shifted_replica_fft[None, :], axis=1, workers=-1
                 )
                 # non-coherent square-law summation over M blocks, normalized by
                 # the number of samples actually integrated (N_coh, not N -- they
                 # differ once coherent integration is shorter than the replica, and
                 # normalizing by N would under-report the noise by N/N_coh)
                 # y_noise / noise_var ~ ChiSquared(2M)
-                pass_correlation[i] = np.sum(1 / N_coh * np.abs(corr) ** 2, axis=0)
+                #
+                # einsum rather than np.sum(np.abs(corr)**2): `abs` then `**2`
+                # each materialise a full (M, N) temporary, and this is a third of
+                # the inner loop.  Same value to ~2e-7 relative.
+                pass_correlation[i] = (
+                    np.einsum("ij,ij->j", corr.real, corr.real)
+                    + np.einsum("ij,ij->j", corr.imag, corr.imag)
+                ) / N_coh
 
             pass_doppler_bin_idx, pass_sample_bin_idx = np.unravel_index(
                 pass_correlation.argmax(), pass_correlation.shape
@@ -537,30 +573,32 @@ def run_acquisition(
 
         # The reported Doppler axis belongs to the winning pass, so it carries the
         # same sub-bin offset as the peak.
-        start_doppler_hz = (
-            acq_config.doppler_search_bins[0] * acq_config.fft_resolution + doppler_offset_hz
-        )
-        if save_corr_peak_window_chips is not None:
-            half_window_size_samples = int(
-                save_corr_peak_window_chips / code_params.rate_chips_per_sec * acq_config.sample_rate
-            )
-            i0 = max(0, peak_sample_bin - half_window_size_samples)
-            i1 = min(N, peak_sample_bin + half_window_size_samples)
-            corr_result = CorrelationResult(
-                correlation[:, i0:i1],
-                start_doppler_hz,
-                acq_config.fft_resolution,
-                i0 / acq_config.sample_rate,
-                1 / acq_config.sample_rate,
-            )
+        if save_corr_doppler_window_bins is None:
+            retained = correlation
+            first_row_fft_bin = acq_config.doppler_search_bins[0]
         else:
-            corr_result = CorrelationResult(
-                correlation,
-                start_doppler_hz,
-                acq_config.fft_resolution,
-                0.0,
-                1 / acq_config.sample_rate,
-            )
+            # Keep `peak +/- window` Doppler rows and the whole delay axis.  Rows
+            # off either end of the searched grid are NaN rather than dropped, so
+            # the shape is the same for every signal and the peak is always the
+            # centre row -- no consumer has to go looking for it.
+            window = int(save_corr_doppler_window_bins)
+            retained = np.full((2 * window + 1, N), np.nan, dtype=correlation.dtype)
+            src0 = max(0, peak_doppler_bin - window)
+            src1 = min(acq_config.num_doppler_bins, peak_doppler_bin + window + 1)
+            dst0 = max(0, window - peak_doppler_bin)
+            retained[dst0 : dst0 + (src1 - src0)] = correlation[src0:src1]
+            # From the UNCLAMPED first row, so the Doppler axis stays correct across
+            # the NaN rows; doppler_search_bins[src0] would be wrong whenever the
+            # window overhangs the grid.
+            first_row_fft_bin = acq_config.doppler_search_bins[peak_doppler_bin] - window
+
+        corr_result = CorrelationResult(
+            retained,
+            first_row_fft_bin * acq_config.fft_resolution + doppler_offset_hz,
+            acq_config.fft_resolution,
+            0.0,
+            1 / acq_config.sample_rate,
+        )
 
         acq_result = AcquisitionResult(
             sample_block_uptime_epoch_ms,
@@ -578,6 +616,7 @@ def run_acquisition(
             acq_config,
             doppler_offset_hz=doppler_offset_hz,
             code_phase_ambiguity_ms=code_period_ms,
+            acquisition_code_rate_chips_per_sec=code_params.rate_chips_per_sec,
         )
 
         acquisition_results[signal_id] = acq_result

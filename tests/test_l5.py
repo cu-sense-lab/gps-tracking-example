@@ -184,7 +184,9 @@ def test_early_late_are_symmetric_when_aligned(l5_definition):
 # Acquisition
 # --------------------------------------------------------------------------
 
-def _acquisition_config(doppler_factor: int = 1) -> bpsk_acquisition.AcquisitionConfiguration:
+def _acquisition_config(
+    doppler_factor: int = 1, doppler_hz: tuple[float, float] = (-5000, 5000)
+) -> bpsk_acquisition.AcquisitionConfiguration:
     """
     The composite-Q dwell: replica = primary x NH20 = 20 ms, coherent = 5 ms x 4.
 
@@ -203,8 +205,8 @@ def _acquisition_config(doppler_factor: int = 1) -> bpsk_acquisition.Acquisition
         coherent_duration_sample_ms=5.0,
         num_blocks=4,
         sample_rate=SAMP_RATE,
-        min_search_doppler_hz=-5000,
-        max_search_doppler_hz=5000,
+        min_search_doppler_hz=doppler_hz[0],
+        max_search_doppler_hz=doppler_hz[1],
         fine_search_factors=None if doppler_factor == 1 else (1, doppler_factor),
     )
 
@@ -212,10 +214,10 @@ def _acquisition_config(doppler_factor: int = 1) -> bpsk_acquisition.Acquisition
 
 def _acquire(
     true_doppler_hz, code_phase_ms, doppler_factor=1, prn=PRN, noise_sigma=2.0, seed=0,
-    start_sec=0.0, nav_bits=True,
+    start_sec=0.0, nav_bits=True, doppler_hz=(-5000, 5000), window_bins=1,
 ):
     definitions = build_signals(GpsL5, prns=[prn])
-    config = _acquisition_config(doppler_factor)
+    config = _acquisition_config(doppler_factor, doppler_hz)
     samples = synthetic.generate_l5_samples(
         prn=prn, start_sec=start_sec, duration_sec=config.acq_total_duration_ms * 1e-3,
         samp_rate=SAMP_RATE, doppler_hz=true_doppler_hz, code_phase_ms=code_phase_ms,
@@ -228,6 +230,7 @@ def _acquire(
         code_parameters=build_acquisition_code_params(GpsL5, definitions),
         prob_false_alarm_total=1e-6,
         noise_var_method="abscorrvar",
+        save_corr_doppler_window_bins=window_bins,
     )
     return results[f"G{prn:02d}"], config
 
@@ -402,6 +405,100 @@ def test_code_phase_fine_search_is_rejected_rather_than_ignored():
             max_search_doppler_hz=5000,
             fine_search_factors=(2, 1),
         )
+
+
+def test_retained_correlation_keeps_full_delay_and_a_doppler_window():
+    """
+    Multipath lives in the delay dimension, so that axis is kept whole and the
+    Doppler axis is cut down to the peak and its neighbours.  Retaining the whole
+    grid is ~700 MB per PRN, which a 32-PRN sweep cannot afford.
+    """
+    windowed, config = _acquire(1234.0, 0.31, window_bins=1)
+    full, _ = _acquire(1234.0, 0.31, window_bins=None)
+
+    assert windowed.correlation_result.correlation_matrix.shape == (
+        3, config.replica_length_samples
+    )
+    assert full.correlation_result.correlation_matrix.shape == (
+        config.num_doppler_bins, config.replica_length_samples
+    )
+    assert windowed.acq_doppler_hz == full.acq_doppler_hz
+    assert windowed.acq_code_phase_seconds == full.acq_code_phase_seconds
+
+
+def test_retained_doppler_axis_stays_absolute_and_centred_on_the_peak():
+    """
+    The stored matrix is a window, but its axis must still read true Doppler --
+    the same discipline `start_code_phase_seconds` follows.  Reporting it relative
+    to the window would silently move every plotted peak to 0 Hz.
+    """
+    result, config = _acquire(1234.0, 0.31, window_bins=1)
+    doppler_hz = result.correlation_result.doppler_bins_hz
+
+    assert len(doppler_hz) == 3
+    assert doppler_hz[1] == pytest.approx(result.acq_doppler_hz)
+    assert doppler_hz[0] == pytest.approx(result.acq_doppler_hz - config.fft_resolution)
+    assert doppler_hz[2] == pytest.approx(result.acq_doppler_hz + config.fft_resolution)
+
+
+@pytest.mark.parametrize("edge", ["low", "high"])
+def test_doppler_window_overhanging_the_grid_is_nan_filled_not_clipped(edge):
+    """
+    A peak at the edge of the search range leaves the window with nowhere to take a
+    row from.  NaN-filling rather than clipping keeps the shape fixed and the peak
+    in the centre, which is what lets consumers index the centre row instead of
+    hunting for the peak.
+    """
+    true_doppler_hz = 1000.0
+    # Put the searched range so the peak lands in the first (or last) bin.
+    span = 400.0
+    doppler_hz = (
+        (true_doppler_hz, true_doppler_hz + span) if edge == "low"
+        else (true_doppler_hz - span, true_doppler_hz + 1.0)
+    )
+    result, config = _acquire(true_doppler_hz, 0.31, doppler_hz=doppler_hz, window_bins=1)
+    assert result.signal_detected
+
+    matrix = result.correlation_result.correlation_matrix
+    assert matrix.shape[0] == 3, "shape must not depend on where the peak landed"
+
+    peak_index = result.peak_doppler_bin
+    overhangs_low = peak_index == 0
+    overhangs_high = peak_index == config.num_doppler_bins - 1
+    assert overhangs_low or overhangs_high, "test did not place the peak at an edge"
+
+    if overhangs_low:
+        assert np.all(np.isnan(matrix[0])), "row below the grid must be NaN"
+    if overhangs_high:
+        assert np.all(np.isnan(matrix[2])), "row above the grid must be NaN"
+    assert np.all(np.isfinite(matrix[1])), "the peak row must still hold data"
+
+    # The axis stays correct across the NaN rows, so it is still evenly spaced and
+    # still centred on the peak.
+    doppler_bins_hz = result.correlation_result.doppler_bins_hz
+    assert doppler_bins_hz[1] == pytest.approx(result.acq_doppler_hz)
+    assert np.allclose(np.diff(doppler_bins_hz), config.fft_resolution)
+
+
+def test_correlation_histogram_survives_nan_rows():
+    """
+    NaN-filling is the cost of the fixed shape, and `np.mean` of anything holding a
+    NaN is NaN -- so the one plot that reduces over the whole matrix has to use the
+    nan-aware forms or it silently produces nothing.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from utils import plotting
+
+    result, _ = _acquire(1000.0, 0.31, doppler_hz=(1000.0, 1400.0), window_bins=1)
+    assert np.isnan(result.correlation_result.correlation_matrix).any()
+
+    fig = plt.figure()
+    ax = plotting.plot_acquisition_correlation_histogram(fig, result, num_blocks=4)
+    heights = [p.get_height() for p in ax.containers[0]]
+    plt.close(fig)
+    assert np.isfinite(heights).all() and sum(heights) > 0
 
 
 def test_fine_search_is_off_by_default():
