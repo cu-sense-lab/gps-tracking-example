@@ -863,11 +863,27 @@ def plot_prompt_circ_length(
     error in far enough for the PLL to take over.
 
     Epochs filtered by the FLL and by the PLL are drawn in different colours, with
-    the switching threshold and the handover instant both marked -- on a strong
-    signal the FLL stretch is only a few epochs wide.  Expect a short FLL stretch while the loop
-    pulls in, a crossing of the threshold, then PLL for the rest of the run.
-    Dropping back towards the threshold under PLL is the signature of a channel
-    about to lose lock; a channel that never leaves FLL never locked at all.
+    the switching threshold and the handover instant both marked.
+
+    **A dip just after the handover is expected, and is not a loss of signal.**
+    The FLL controls frequency only, so it hands over holding whatever carrier
+    phase error it happens to have -- a third of a cycle is typical.  The PLL then
+    drives that to zero over the next ten or so epochs, and it is the *sweep* of
+    phase during that correction, not any drop in power, that spreads the history's
+    phasors and pulls this metric down.  Prompt magnitude is flat throughout;
+    `plot_prompt_components` is where a real power loss would show.
+
+    Two consequences.  The dip's depth scales with the phase error the FLL left.
+    And it **lags the handover by up to `history_size` epochs**, because this is a
+    sliding window: it bottoms once the window is maximally filled with sweep-era
+    phases and recovers as they scroll out.  Read the bottom of the dip as "the
+    correction finished about ten epochs ago", not as something happening then.
+
+    The threshold rarely gates anything for a healthy signal, whose coherence is
+    already above it at the first epoch; the binding condition is `history_filled`,
+    so the FLL runs for exactly `history_size` epochs and then hands over.  A
+    channel that never leaves FLL never locked at all, and one sagging back towards
+    the threshold later in a run is about to lose lock.
     """
     outputs = adapter.outputs
     valid = outputs.valid
