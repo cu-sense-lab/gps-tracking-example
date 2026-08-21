@@ -293,6 +293,84 @@ class TrackingLoopState:
         return float(np.abs(np.mean(np.exp(1j * angles))))
 
 
+def estimate_cn0_vsm(prompt_power: np.ndarray, integration_time_s: float) -> float:
+    """
+    Carrier-to-noise density from prompt power, by the variance summing method.
+
+    VSM (Van Dierendonck) separates signal from noise using the second and fourth
+    moments of the prompt magnitude, which is all it needs -- no knowledge of the
+    data bits, the carrier phase error or the overlay sign, because none of those
+    survive `|P|**2`.  That is what makes it usable before the secondary code is
+    synchronised, and why its input needs no wipe-off.
+
+        mu2 = E[|P|^2]                    mu4 = E[|P|^4]
+        Pd  = sqrt(2*mu2^2 - mu4)         Pn  = mu2 - Pd
+        C/N0 = (Pd / Pn) / T
+
+    `integration_time_s` must be the integration time of the samples given, and the
+    samples must all share it: C/N0 is a *density*, so the whole result scales with
+    this number.  Feeding it epochs of mixed length silently reports the wrong
+    answer, which is why the channel collects one correlation interval at a time.
+
+    Returns NaN rather than raising where the estimator degenerates -- the
+    discriminant goes negative at low C/N0, and the noise term vanishes at very
+    high -- because a NaN leaves a gap in the record while an exception would take
+    down a whole tracking run over one bad window.
+    """
+    if prompt_power.size == 0:
+        return float("nan")
+    mu2 = float(np.mean(prompt_power))
+    mu4 = float(np.mean(prompt_power ** 2))
+    discriminant = 2.0 * mu2 ** 2 - mu4
+    if discriminant <= 0.0:
+        return float("nan")
+    signal_power = float(np.sqrt(discriminant))
+    noise_power = mu2 - signal_power
+    if noise_power <= 0.0:
+        return float("nan")
+    return float(10.0 * np.log10((signal_power / noise_power) / integration_time_s))
+
+
+@dataclass
+class CN0EstimatorParameters:
+    """
+    How the C/N0 estimate is windowed.
+
+    `period_ms` samples -- one correlation interval each -- go into every estimate,
+    and a new one is emitted every `hop_ms = period_ms * (1 - overlap_fraction)`.
+    Longer periods trade time resolution for a steadier number: measured on the
+    rooftop collect, the estimate's 1-sigma spread is about 0.6-0.9 dB at 100 ms,
+    0.4-0.9 dB at 200 ms and 0.1-0.2 dB at 1000 ms.
+
+    Note the period must be well under the tracked duration or there is nothing to
+    plot: at the 1000 ms default, one second of tracking yields exactly one point.
+    """
+
+    period_ms: int = 1000
+    overlap_fraction: float = 0.5
+    enabled: bool = True
+
+    def __post_init__(self) -> None:
+        # VSM's fourth moment is the fragile one, and below roughly a hundred
+        # samples it stops being trustworthy.  Refusing beats quietly returning a
+        # number nobody can tell is wrong.
+        if self.period_ms < 100:
+            raise ValueError(
+                f"period_ms must be at least 100 correlation intervals for the "
+                f"fourth-moment estimate to be meaningful, got {self.period_ms}"
+            )
+        if not 0.0 <= self.overlap_fraction < 1.0:
+            raise ValueError(
+                f"overlap_fraction must be in [0, 1), got {self.overlap_fraction}"
+            )
+        self.hop_ms = int(round(self.period_ms * (1.0 - self.overlap_fraction)))
+        if self.hop_ms < 1:
+            raise ValueError(
+                f"period_ms {self.period_ms} at overlap {self.overlap_fraction} gives a "
+                f"hop of {self.hop_ms} intervals; it must be at least 1"
+            )
+
+
 # One correlation interval, in milliseconds.
 #
 # !!! DO NOT CHANGE THIS. !!!
@@ -308,10 +386,10 @@ class TrackingLoopState:
 #      milliseconds.  That is what guarantees no interval straddles a boundary,
 #      and it only holds while this divides all of them.  At 3 ms, an L2C interval
 #      [18, 21) would cross the CNAV symbol boundary at 20.
-#   3. `coherent_integration_ms` is expressed in milliseconds and converted to a
+#   3. `coherent_duration_ms` is expressed in milliseconds and converted to a
 #      count of intervals by dividing by this.
 #
-# To integrate longer, raise `coherent_integration_ms`.  Intervals are folded --
+# To integrate longer, raise `coherent_duration_ms`.  Intervals are folded --
 # with overlay wipe-off between them -- to build the epoch, which is exactly why
 # extending integration never means lengthening the interval.
 CORRELATION_INTERVAL_MS = 1
@@ -322,35 +400,35 @@ class TrackingLoopParameters:
     """
     Loop bandwidths and how long one coherent accumulation lasts.
 
-    `coherent_integration_ms` is the whole story on integration length: it is the
+    `coherent_duration_ms` is the whole story on integration length: it is the
     epoch the discriminators see, the update period the loop gains are built for,
     and (divided by `CORRELATION_INTERVAL_MS`) the number of intervals folded into
     each epoch.  It must divide the shortest interval over which the components
-    driving the loops hold a constant sign -- see `validate_coherent_integration`,
+    driving the loops hold a constant sign -- see `validate_coherent_duration`,
     which the channel calls on construction.
     """
 
     DLL_bandwidth_hz: float
     PLL_bandwidth_hz: float
     FLL_bandwidth_hz: float
-    coherent_integration_ms: int = CORRELATION_INTERVAL_MS
+    coherent_duration_ms: int = CORRELATION_INTERVAL_MS
     EPL_chip_spacing: float = 0.5
     prompt_corr_circ_length_threshold: float = 0.9
 
     @property
     def intervals_per_epoch(self) -> int:
-        return self.coherent_integration_ms // CORRELATION_INTERVAL_MS
+        return self.coherent_duration_ms // CORRELATION_INTERVAL_MS
 
     def __post_init__(self):
         if (
-            self.coherent_integration_ms < CORRELATION_INTERVAL_MS
-            or self.coherent_integration_ms % CORRELATION_INTERVAL_MS
+            self.coherent_duration_ms < CORRELATION_INTERVAL_MS
+            or self.coherent_duration_ms % CORRELATION_INTERVAL_MS
         ):
             raise ValueError(
-                f"coherent_integration_ms must be a positive multiple of "
-                f"{CORRELATION_INTERVAL_MS} ms, got {self.coherent_integration_ms}"
+                f"coherent_duration_ms must be a positive multiple of "
+                f"{CORRELATION_INTERVAL_MS} ms, got {self.coherent_duration_ms}"
             )
-        update_period_seconds = self.coherent_integration_ms * 1e-3
+        update_period_seconds = self.coherent_duration_ms * 1e-3
         # 1st-order DLL
         # Gain = 4 * Bn * T, where Bn is the DLL bandwidth in Hz and T is the update period in seconds
         self.DLL_filter_coeff = 4.0 * update_period_seconds * self.DLL_bandwidth_hz
@@ -379,7 +457,7 @@ class SignalTrackingOutputs:
     makes it impossible to silently broadcast one component across all columns.
     """
 
-    def __init__(self, capacity: int, num_components: int = 1):
+    def __init__(self, capacity: int, num_components: int = 1, cn0_capacity: int = 0):
         self.capacity = capacity
         self.num_components = num_components
         self.uptime_epoch_ms = np.zeros(capacity, dtype=float)
@@ -393,7 +471,19 @@ class SignalTrackingOutputs:
         self.code_phase_ms = np.zeros(capacity, dtype=float)
         self.delta_omega = np.zeros(capacity, dtype=float)
         self.prompt_corr_circ_length = np.zeros(capacity, dtype=float)
+        # Which carrier loop actually filtered this epoch.  Recorded because the
+        # FLL->PLL handover is invisible in the correlator outputs alone, and
+        # reading a lock transient correctly means knowing which loop was running.
+        self.pll_mode = np.zeros(capacity, dtype=bool)
         self.output_index = 0
+
+        # C/N0 lands on its own cadence -- one estimate per hop of correlation
+        # intervals, not one per epoch -- so it gets its own arrays and its own
+        # index rather than being forced onto the epoch axis.
+        self.cn0_capacity = cn0_capacity
+        self.cn0_dbhz = np.zeros((cn0_capacity, num_components), dtype=float)
+        self.cn0_uptime_ms = np.zeros(cn0_capacity, dtype=float)
+        self.cn0_index = 0
 
     @property
     def valid(self) -> slice:
@@ -404,6 +494,11 @@ class SignalTrackingOutputs:
         (0, 0) if plotted unsliced.
         """
         return slice(0, self.output_index)
+
+    @property
+    def cn0_valid(self) -> slice:
+        """Slice covering only the C/N0 estimates actually written."""
+        return slice(0, self.cn0_index)
 
 
 @dataclass
@@ -445,10 +540,10 @@ def _wrap_cycles(cycles: float, half_range: float) -> float:
 MAX_BANDWIDTH_TIME_PRODUCT = 0.1
 
 
-def validate_coherent_integration(
+def validate_coherent_duration(
     signal_params: TrackingSignalParameters,
     policy: LoopDiscriminatorPolicy,
-    coherent_integration_ms: int,
+    coherent_duration_ms: int,
     overlay_stripped: bool,
 ) -> None:
     """
@@ -486,14 +581,14 @@ def validate_coherent_integration(
         else:
             continue  # dataless pilot with no overlay in the way
 
-        if coherent_integration_ms > limit_ms:
+        if coherent_duration_ms > limit_ms:
             raise ValueError(
-                f"coherent_integration_ms {coherent_integration_ms} exceeds {limit_ms} ms, "
+                f"coherent_duration_ms {coherent_duration_ms} exceeds {limit_ms} ms, "
                 f"the period of {reason}; the accumulation would span a sign change"
             )
-        if limit_ms % coherent_integration_ms:
+        if limit_ms % coherent_duration_ms:
             raise ValueError(
-                f"coherent_integration_ms {coherent_integration_ms} does not divide {limit_ms} ms, "
+                f"coherent_duration_ms {coherent_duration_ms} does not divide {limit_ms} ms, "
                 f"the period of {reason}; epochs are anchored to multiples of their own "
                 f"length, so some epoch would straddle a boundary"
             )
@@ -530,7 +625,7 @@ def _retune_for_update_period(
         DLL_bandwidth_hz=min(loop_params.DLL_bandwidth_hz, bandwidth_cap_hz),
         PLL_bandwidth_hz=min(loop_params.PLL_bandwidth_hz, bandwidth_cap_hz),
         FLL_bandwidth_hz=min(loop_params.FLL_bandwidth_hz, bandwidth_cap_hz),
-        coherent_integration_ms=int(update_period_ms),
+        coherent_duration_ms=int(update_period_ms),
         EPL_chip_spacing=loop_params.EPL_chip_spacing,
         prompt_corr_circ_length_threshold=loop_params.prompt_corr_circ_length_threshold,
     )
@@ -553,8 +648,9 @@ class TrackingChannel:
         discriminator_policy: LoopDiscriminatorPolicy | None = None,
         correlator_config: DelayDopplerCorrelatorConfig | None = None,
         synced_policy: LoopDiscriminatorPolicy | None = None,
-        synced_coherent_integration_ms: int = CORRELATION_INTERVAL_MS,
+        synced_coherent_duration_ms: int = CORRELATION_INTERVAL_MS,
         initial_overlay_counter: int | None = None,
+        cn0_params: CN0EstimatorParameters | None = None,
     ) -> None:
         self.loop_params = loop_params
         self.signal_params = signal_params
@@ -570,8 +666,30 @@ class TrackingChannel:
 
         self.signal_state = initial_signal_state
         self.loop_state = TrackingLoopState(mode=TrackingLoopMode.FLL)
+        # --- C/N0 estimator ---------------------------------------------------
+        # Sized from the epoch budget: output_capacity epochs of the *initial*
+        # coherent duration is the run length in ms, and a channel that later
+        # extends covers the same wall time in fewer epochs, so this stays an
+        # over-estimate rather than truncating the record.
+        self.cn0_params = cn0_params if cn0_params is not None else CN0EstimatorParameters()
+        run_duration_ms = output_capacity * loop_params.coherent_duration_ms
+        cn0_capacity = (
+            run_duration_ms // self.cn0_params.hop_ms + 2 if self.cn0_params.enabled else 0
+        )
+        # One correlation interval per slot; filled before the epoch machinery
+        # touches anything, so the samples are always CORRELATION_INTERVAL_MS long
+        # whatever the coherent duration happens to be.
+        self._cn0_power = np.zeros(
+            (self.cn0_params.period_ms, num_components), dtype=float
+        )
+        self._cn0_fill = 0          # how many slots hold real data yet
+        self._cn0_write = 0         # ring write position
+        self._cn0_since_estimate = 0
+
         self.outputs = SignalTrackingOutputs(
-            capacity=output_capacity, num_components=num_components
+            capacity=output_capacity,
+            num_components=num_components,
+            cn0_capacity=cn0_capacity,
         )
 
         if correlator_config is None:
@@ -609,31 +727,50 @@ class TrackingChannel:
         self.overlay_sync = secondary_code.build_synchroniser(
             self._overlays, reference_index=self.policy.carrier_component
         )
-        self.coherent_integration_ms = loop_params.coherent_integration_ms
+        self.coherent_duration_ms = loop_params.coherent_duration_ms
         self._epoch_interval_count = 0
+
+        # --- epoch grid anchoring --------------------------------------------
+        # Epochs open on a data symbol boundary, so an epoch never straddles one
+        # and epoch zero coincides with symbol zero -- which is what later makes
+        # the symbols demodulable without a separate alignment search.
+        #
+        # The period is the shortest symbol among *all* components, not the one
+        # driving the loops: on L5 the carrier loop runs on the dataless Q pilot,
+        # which has no symbol of its own, while I's 10 ms CNAV symbol is what the
+        # shared epoch has to respect.  A signal that is pilot-only everywhere has
+        # no boundary to find, and falls back to anchoring on the epoch length.
+        symbol_periods = [
+            c.symbol_period_ms
+            for c in signal_params.code_set.components
+            if c.symbol_period_ms is not None
+        ]
+        self._epoch_anchor_period_ms: int | None = min(symbol_periods) if symbol_periods else None
+        # Cleared whenever the epoch length changes, so the new grid re-anchors.
+        self._epoch_grid_anchored = False
         self._unit_signs = np.ones(num_components, dtype=np.int8)
         self._synced_policy = synced_policy
-        self._synced_coherent_integration_ms = synced_coherent_integration_ms
+        self._synced_coherent_duration_ms = synced_coherent_duration_ms
         # Loop gains scale with the update period, so extending the coherent
         # accumulation demands a retuned filter.  Built up front to keep the
         # transition free of allocation and surprises.
         self._synced_loop_params = (
-            _retune_for_update_period(loop_params, synced_coherent_integration_ms)
-            if synced_coherent_integration_ms > loop_params.coherent_integration_ms
+            _retune_for_update_period(loop_params, synced_coherent_duration_ms)
+            if synced_coherent_duration_ms > loop_params.coherent_duration_ms
             else loop_params
         )
 
         # (validation follows)
         # Both configurations are checked up front, so a bad choice fails at
         # construction rather than part-way through a run.
-        validate_coherent_integration(
-            signal_params, self.policy, loop_params.coherent_integration_ms,
+        validate_coherent_duration(
+            signal_params, self.policy, loop_params.coherent_duration_ms,
             overlay_stripped=initial_overlay_counter is not None,
         )
-        if synced_coherent_integration_ms > loop_params.coherent_integration_ms:
-            validate_coherent_integration(
+        if synced_coherent_duration_ms > loop_params.coherent_duration_ms:
+            validate_coherent_duration(
                 signal_params, synced_policy or self.policy,
-                synced_coherent_integration_ms, overlay_stripped=True,
+                synced_coherent_duration_ms, overlay_stripped=True,
             )
 
         # An overlay phase recovered by acquisition skips the post-lock search
@@ -681,7 +818,7 @@ class TrackingChannel:
 
         What does NOT happen here is lengthening the coherent accumulation.  That
         is limited by Doppler error rather than by the overlay, so it waits for
-        lock -- see `_maybe_extend_coherent_integration`.
+        lock -- see `_maybe_extend_coherent_duration`.
         """
         if self._synced_policy is not None:
             self._set_policy(self._synced_policy)
@@ -692,7 +829,7 @@ class TrackingChannel:
         self.correlator.reset_epoch()
         self._epoch_interval_count = 0
 
-    def _maybe_extend_coherent_integration(self) -> None:
+    def _maybe_extend_coherent_duration(self) -> None:
         """
         Lengthen the coherent accumulation, once the carrier is actually tracked.
 
@@ -711,40 +848,33 @@ class TrackingChannel:
         update period, so a 20 ms epoch driving gains built for 1 ms is a 20x
         mistuning.  The two must not be separated.
         """
-        if self.coherent_integration_ms == self._synced_coherent_integration_ms:
+        if self.coherent_duration_ms == self._synced_coherent_duration_ms:
             return
         if self.overlay_sync is None or not self.overlay_sync.synced:
             return
         if self.loop_state.mode is not TrackingLoopMode.PLL:
             return
 
-        # Start the longer epochs on a code phase that the epoch length divides.
+        # Switch exactly on a symbol boundary, so the longer grid is anchored the
+        # moment it starts.
         #
-        # A single interval is safe wherever it starts, because every period that
-        # matters -- code, data symbol, overlay chip -- is a whole number of
-        # milliseconds and intervals are integer-ms aligned.  An epoch of N
-        # intervals is not: begun at an arbitrary code phase it can span a data
-        # symbol boundary and cancel itself.  Anchoring epoch starts to multiples
-        # of N milliseconds of code phase makes the tiling deterministic and
-        # independent of wherever acquisition happened to land, so an epoch
-        # straddles a boundary only if N genuinely fails to divide that period --
-        # a configuration choice, visible up front, rather than an accident of
-        # code phase.
-        #
-        # For L5 it also lands every epoch on NH20 index 0.
-        #
-        # Costs at most N-1 intervals of delay, once.
-        epoch_ms = self._synced_coherent_integration_ms
+        # Waiting here rather than switching now and dropping intervals until the
+        # boundary is what keeps the transition lossless: the shorter epochs keep
+        # producing output right up to the boundary.  Only a grid with no shorter
+        # length to fall back on -- one configured multi-interval from the start --
+        # has to discard intervals instead (see `_complete_interval`).
+        anchor_ms = self._epoch_anchor_period_ms or self._synced_coherent_duration_ms
         next_interval_code_phase_ms = (
             self.corr_interval.start_code_phase_ms + self.corr_interval.duration_ms
         )
-        if next_interval_code_phase_ms % epoch_ms != 0:
+        if next_interval_code_phase_ms % anchor_ms != 0:
             return
 
-        self.coherent_integration_ms = self._synced_coherent_integration_ms
+        self.coherent_duration_ms = self._synced_coherent_duration_ms
         self.loop_params = self._synced_loop_params
         self.correlator.reset_epoch()
         self._epoch_interval_count = 0
+        self._epoch_grid_anchored = True
 
     def run_loop_filter(self) -> None:
         # Update signal state to reflect parameters at current correlation epoch.
@@ -784,7 +914,7 @@ class TrackingChannel:
         # The FLL turns a phase difference into a rate and so needs this before the
         # corrections below exist, hence the prior.  Strictly it wants the PREVIOUS
         # epoch's span, since the two prompts it differences are one epoch apart; the
-        # two differ only on the single epoch where `coherent_integration_ms` changes,
+        # two differ only on the single epoch where `coherent_duration_ms` changes,
         # and that transition is gated on PLL lock, where `delta_omega` is logged but
         # does not drive the loop.
         _, next_epoch_uptime_ms = self.corr_interval.compute_start_and_stop_uptime_ms(
@@ -837,6 +967,10 @@ class TrackingChannel:
         )
 
         filt_code_phase_error_chips = self.loop_params.DLL_filter_coeff * delta_eta
+        # Captured before the branch below, which may switch the mode: the epoch
+        # that triggers the handover is still filtered by the FLL, so that is the
+        # mode this epoch should be logged under.
+        epoch_used_pll = self.loop_state.mode is TrackingLoopMode.PLL
         if self.loop_state.mode == TrackingLoopMode.FLL:
             if (
                 self.loop_state.history_filled
@@ -887,6 +1021,7 @@ class TrackingChannel:
             self.outputs.code_phase_ms[idx] = code_phase_ms
             self.outputs.delta_omega[idx] = delta_omega
             self.outputs.prompt_corr_circ_length[idx] = circ_length
+            self.outputs.pll_mode[idx] = epoch_used_pll
             self.outputs.output_index += 1
 
         # ---- prior for the next epoch: the posterior, propagated to its start. ----
@@ -911,7 +1046,48 @@ class TrackingChannel:
         # Checked every epoch rather than only on the FLL->PLL edge, so that a
         # channel started directly in PLL, or synced from acquisition after lock,
         # still picks it up.  It is a no-op once applied.
-        self._maybe_extend_coherent_integration()
+        self._maybe_extend_coherent_duration()
+
+    def _record_interval_for_cn0(self) -> None:
+        """
+        Feed one correlation interval's prompt power to the C/N0 estimator.
+
+        Called at the very top of `_complete_interval`, which is deliberate on two
+        counts.  It runs before `fold()`, so the sample is one raw interval and is
+        unaffected by `coherent_duration_ms` -- the estimate's integration time has
+        to be the interval, not the epoch.  And it runs before the epoch-anchoring
+        return, because an interval dropped while waiting for a symbol boundary is
+        a perfectly good correlation; it is discarded for epoch-tiling reasons, and
+        excluding it would punch a hole in the C/N0 record at the start of every
+        channel.
+        """
+        params = self.cn0_params
+        if not params.enabled or self.outputs.cn0_capacity == 0:
+            return
+
+        # Prompt is delay tap 1; every component, since magnitude costs nothing to
+        # keep and comparing I against Q is the point.
+        prompt = self.correlator.corr_grid[1, 0, :]
+        self._cn0_power[self._cn0_write] = np.abs(prompt) ** 2
+        self._cn0_write = (self._cn0_write + 1) % params.period_ms
+        self._cn0_fill = min(self._cn0_fill + 1, params.period_ms)
+        self._cn0_since_estimate += 1
+
+        if self._cn0_fill < params.period_ms or self._cn0_since_estimate < params.hop_ms:
+            return
+        self._cn0_since_estimate = 0
+
+        idx = self.outputs.cn0_index
+        if idx >= self.outputs.cn0_capacity:
+            return
+        integration_time_s = CORRELATION_INTERVAL_MS * 1e-3
+        for component in range(self.outputs.num_components):
+            self.outputs.cn0_dbhz[idx, component] = estimate_cn0_vsm(
+                self._cn0_power[:, component], integration_time_s
+            )
+        # Stamped at the end of the window the estimate covers.
+        self.outputs.cn0_uptime_ms[idx] = self.signal_state.uptime_epoch_ms
+        self.outputs.cn0_index += 1
 
     def _complete_interval(self) -> None:
         """
@@ -924,6 +1100,8 @@ class TrackingChannel:
         intervals here.  A signal with no overlay folds with unit signs and an
         epoch of one interval, which is arithmetically the old behaviour.
         """
+        self._record_interval_for_cn0()
+
         if self.overlay_sync is None:
             signs = self._unit_signs
         else:
@@ -941,10 +1119,57 @@ class TrackingChannel:
             signs = self.overlay_sync.signs(self._overlays)
             self.overlay_sync.advance()
 
+        # Open the epoch grid on a data symbol boundary.
+        #
+        # `validate_coherent_duration` rejects an epoch length that does not divide
+        # every component's symbol period, but divisibility only keeps epochs
+        # inside those boundaries if the grid is *anchored*.  The seeded code phase
+        # is wherever acquisition landed, so a grid begun there is offset by an
+        # arbitrary number of milliseconds: on L5 a 5 ms epoch started at code
+        # phase 3 crosses the 10 ms CNAV symbol on every other epoch, and I
+        # collapses whenever consecutive symbols differ while the dataless Q looks
+        # perfect.
+        #
+        # Anchoring on the symbol period rather than merely on the epoch length is
+        # the stronger choice, and it is deliberate: both avoid straddling, but
+        # only this one makes epoch zero coincide with symbol zero, so the symbols
+        # can later be read off the epoch index without a separate search.
+        #
+        # Anchoring happens once per grid -- at construction and again after every
+        # change of epoch length -- not at every epoch.  Once the first epoch is on
+        # a boundary, the epoch length divides the symbol period and the tiling
+        # stays on it.  Intervals before the boundary are dropped: at most
+        # `symbol_period - 1` of them, once.  The caller resets the interval grid
+        # immediately after this returns, and the epoch accumulator is already
+        # empty whenever the interval count is zero.
+        #
+        # A caveat worth stating: this locates the boundary in *code phase*, so it
+        # is a true symbol boundary only for a signal whose acquisition recovers
+        # symbol phase -- L5 via the NH20 counter, L2C via CM's 20 ms period.  GPS
+        # L1 C/A carries no symbol phase in its 1 ms code, so its grid is anchored
+        # deterministically but arbitrarily, and real bit synchronisation remains a
+        # separate step this repository does not implement.
+        # A single-interval epoch is exempt: it cannot straddle anything, because
+        # every period that matters is a whole number of milliseconds and intervals
+        # are integer-ms aligned.  Waiting for a boundary would only throw away
+        # intervals, and symbol alignment is still recoverable afterwards since
+        # every symbol boundary is also an epoch boundary.  So the wait here only
+        # ever applies to a channel configured multi-interval from construction:
+        # the post-lock extension anchors by waiting at the shorter length instead
+        # (see `_maybe_extend_coherent_duration`), which discards nothing.
+        if not self._epoch_grid_anchored:
+            if self.coherent_duration_ms <= CORRELATION_INTERVAL_MS:
+                self._epoch_grid_anchored = True
+            else:
+                anchor_ms = self._epoch_anchor_period_ms or self.coherent_duration_ms
+                if self.corr_interval.start_code_phase_ms % anchor_ms:
+                    return
+                self._epoch_grid_anchored = True
+
         self.correlator.fold(signs)
         self._epoch_interval_count += 1
 
-        if self._epoch_interval_count >= self.coherent_integration_ms // CORRELATION_INTERVAL_MS:
+        if self._epoch_interval_count >= self.coherent_duration_ms // CORRELATION_INTERVAL_MS:
             self.run_loop_filter()
             self.correlator.reset_epoch()
             self._epoch_interval_count = 0
