@@ -399,6 +399,17 @@ def refine_acquisition_peak(
       non-coherent sum.  The fine search therefore recovers drift as well as
       scalloping, and only matches the coarse value where the drift is negligible.
 
+      This is a **bias**, not just a loss, and that is the more important half.
+      With the blocks' peaks spread across the dwell the coarse argmax lands on a
+      compromise somewhere toward the dwell's middle, whereas the code phase every
+      consumer wants is the one at `sample_block_uptime_epoch_ms` -- the dwell's
+      *start*, which is where `create_tracking_channels` seeds the channel.  The
+      fine search states each block's phase explicitly from that origin, so it
+      reports the start.  Measured against synthetic truth, the refined estimate is
+      exact at 0, 1000, 2450, 4000 and -2450 Hz, while the coarse one walks off by
+      up to a full bin in the direction of the drift.  Half the dwell is the worst
+      case: 0.435 chips at 5 kHz on L5 over 10 ms.
+
     Blocks are combined by square law with carrier phase zero in each, exactly as
     in acquisition and in `ambiguity_resolution.resolve_code_ambiguity`: only the
     rotation *within* a block matters.
