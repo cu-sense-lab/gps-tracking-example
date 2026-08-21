@@ -285,25 +285,40 @@ def plot_acquisition_delay_doppler_map(
     fig: Figure | SubFigure,
     acq_result: bpsk_acquisition.AcquisitionResult,
     code_phase_window_samples: int = 150,
+    use_fine: bool = False,
 ) -> Axes:
     """Delay-Doppler correlation heatmap for one signal's acquisition result, zoomed to the peak."""
     ax = fig.add_subplot(1, 1, 1)
-    correlation = acq_result.correlation_result.correlation_matrix
+    source = acq_result.correlation_result
+    if use_fine:
+        if acq_result.fine_correlation_result is None:
+            raise ValueError(
+                f"{acq_result.signal_id}: no fine search result -- it runs only on a "
+                "detection, and only when acq_config.fine_search is set"
+            )
+        source = acq_result.fine_correlation_result
+    correlation = source.correlation_matrix
     num_doppler_bins, num_code_phases = correlation.shape
 
     # The Doppler extent comes from the rows actually retained, not from the config's
     # full search range: `save_corr_doppler_window_bins` keeps only a few rows around
     # the peak, and labelling them +/-5 kHz would be a lie.  The delay axis is kept
     # whole, so `peak_code_phase_bin` indexes it directly and the zoom below works.
-    doppler_hz = acq_result.correlation_result.doppler_bins_hz
-    half_row = 0.5 * acq_result.correlation_result.doppler_resolution_hz
+    doppler_hz = source.doppler_bins_hz
+    half_row = 0.5 * source.doppler_resolution_hz
     extent = [0, num_code_phases, doppler_hz[0] - half_row, doppler_hz[-1] + half_row]
 
     # NaN rows (a window overhanging the grid) should read as absent, not as zero.
     cmap = plt.get_cmap("plasma").copy()
     cmap.set_bad(color="0.85")
 
-    peak_code_phase_bin = acq_result.peak_code_phase_bin
+    if use_fine:
+        # The fine grid IS the zoom, and its columns are fractional samples about
+        # the peak, so the coarse sample-index window does not apply.
+        code_phase_window_samples = num_code_phases
+    peak_code_phase_bin = (
+        num_code_phases // 2 if use_fine else acq_result.peak_code_phase_bin
+    )
     im = ax.imshow(
         correlation, extent=extent, aspect="auto", interpolation="nearest",
         cmap=cmap, origin="lower", vmin=0,
@@ -471,6 +486,7 @@ def plot_acquisition_code_phase_slices(
     acq_results: dict[str, bpsk_acquisition.AcquisitionResult],
     signal_ids: Optional[Sequence[str]] = None,
     window_chips: float = 3.0,
+    use_fine: bool = False,
 ) -> Axes:
     """
     Correlation power against code delay, one curve per signal, each taken at its
@@ -523,19 +539,30 @@ def plot_acquisition_code_phase_slices(
     for signal_id in signal_ids:
         result = acq_results[signal_id]
         corr = result.correlation_result
+        if use_fine and result.fine_correlation_result is not None:
+            corr = result.fine_correlation_result
 
-        # The retained window is centred on the peak and NaN-filled where it
-        # overhangs the search grid, so the peak is the middle row by construction.
-        # Verified rather than assumed, because a silent off-by-one here would plot
-        # a neighbouring Doppler bin and quietly understate every peak.
-        centre_row = corr.correlation_matrix.shape[0] // 2
-        if not np.isclose(corr.doppler_bins_hz[centre_row], result.acq_doppler_hz):
+        # Which row holds the peak, and which Doppler that row should carry, differ
+        # between the two sources -- the coarse window is built around the *coarse*
+        # peak, while `acq_doppler_hz` reports the refined one once a fine search
+        # has run.  Comparing the coarse window against the refined Doppler is an
+        # off-by-one-bin error that would quietly plot a neighbouring row.
+        if corr is result.fine_correlation_result:
+            peak_row = result.fine_peak_doppler_bin
+            expected_hz = result.acq_doppler_hz
+        else:
+            # The retained coarse window is centred on the coarse peak and NaN-filled
+            # where it overhangs the grid, so the peak is the middle row by
+            # construction.  Verified rather than assumed.
+            peak_row = corr.correlation_matrix.shape[0] // 2
+            expected_hz = result.coarse_doppler_hz
+        if not np.isclose(corr.doppler_bins_hz[peak_row], expected_hz):
             raise ValueError(
-                f"{signal_id}: centre row is {corr.doppler_bins_hz[centre_row]:.1f} Hz but the "
-                f"peak is at {result.acq_doppler_hz:.1f} Hz; the retained Doppler window is "
-                "not centred on the peak"
+                f"{signal_id}: row {peak_row} is {corr.doppler_bins_hz[peak_row]:.1f} Hz but the "
+                f"peak is at {expected_hz:.1f} Hz; the Doppler window is not centred "
+                "on the peak"
             )
-        power = corr.correlation_matrix[centre_row]
+        power = corr.correlation_matrix[peak_row]
 
         # dB above the expected noise level: the peak of a noise-only cell is
         # chi-squared with 2M degrees of freedom and so averages 2M * noise_var.
@@ -544,8 +571,16 @@ def plot_acquisition_code_phase_slices(
                 power / result.noise_var / (2 * result.config.num_blocks)
             )
 
+        # Same distinction on the delay axis: the coarse grid is indexed off the
+        # coarse peak, so referencing it to a refined code phase would shift every
+        # curve by the refinement.
+        reference_seconds = (
+            result.acq_code_phase_seconds
+            if corr is result.fine_correlation_result
+            else result.coarse_code_phase_seconds
+        )
         delay_chips = (
-            corr.code_phase_bins_seconds - result.acq_code_phase_seconds
+            corr.code_phase_bins_seconds - reference_seconds
         ) * result.acquisition_code_rate_chips_per_sec
         keep = np.abs(delay_chips) <= window_chips
         order = np.argsort(delay_chips[keep])

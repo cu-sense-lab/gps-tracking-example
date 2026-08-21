@@ -3,6 +3,9 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple
 import numpy as np
 from numpy.typing import NDArray
+
+from .bpsk_correlation import correlate__multicomponent
+from .code_components import Branch, CodeComponent, build_code_set
 import scipy.fft
 import scipy.stats
 
@@ -11,6 +14,60 @@ import scipy.stats
 class SignalReplicaCacheEntry:
     replica_samples: np.ndarray
     replica_fft: np.ndarray
+
+
+@dataclass
+class FineSearchParameters:
+    """
+    Localised refinement of an already-detected peak.
+
+    The coarse search resolves delay to one sample and Doppler to one FFT bin, and
+    the residual costs real signal power.  At 22 Msps against a 10.23 Mcps code one
+    delay bin is 0.465 chips, so a worst-case half-bin error sits at 0.233 chips on
+    the correlation triangle -- **-2.3 dB**.  The equivalent Doppler error, half of
+    a 50 Hz bin over a 5 ms coherent integration, costs only -0.22 dB.  Delay is
+    worth an order of magnitude more here, which is why the default window is wider
+    on delay than on Doppler.
+
+    Halfwidths are in *coarse bins*, so their physical span depends on the sample
+    rate and the code: +/-3 bins is +/-1.40 chips on L5 at 22 Msps, but +/-0.14
+    chips on L1 C/A at the same rate.
+
+    The refined grid is a uniform sub-division that **contains the coarse bins**:
+    offsets run over `[-halfwidth*factor, +halfwidth*factor]` in steps of
+    `1 / factor` of a bin, so with halfwidth 3 and factor 2 the taps are
+    -3, -2.5, -2, ... +2.5, +3 bins and the coarse bins are the even ones.  That
+    subset property is what makes the fine grid directly comparable to the coarse
+    one.
+    """
+
+    delay_factor: int = 2
+    doppler_factor: int = 2
+    delay_halfwidth_bins: int = 3
+    doppler_halfwidth_bins: int = 1
+
+    def __post_init__(self) -> None:
+        if self.delay_factor < 1 or self.doppler_factor < 1:
+            raise ValueError(
+                f"fine search factors must be >= 1, got delay={self.delay_factor}, "
+                f"doppler={self.doppler_factor}"
+            )
+        # A halfwidth of 0 would search only the coarse peak itself.  The true peak
+        # can sit up to half a bin away, so the window has to be at least one bin
+        # wide to bracket it at all.
+        if self.delay_halfwidth_bins < 1 or self.doppler_halfwidth_bins < 1:
+            raise ValueError(
+                f"fine search halfwidths must be >= 1 bin to bracket the true peak, got "
+                f"delay={self.delay_halfwidth_bins}, doppler={self.doppler_halfwidth_bins}"
+            )
+
+    @property
+    def num_delay_taps(self) -> int:
+        return 2 * self.delay_halfwidth_bins * self.delay_factor + 1
+
+    @property
+    def num_doppler_hypotheses(self) -> int:
+        return 2 * self.doppler_halfwidth_bins * self.doppler_factor + 1
 
 
 @dataclass
@@ -45,15 +102,13 @@ class AcquisitionConfiguration:
     With a short coherent length the grid is finer than the response, so the
     residual Doppler error is set by the grid rather than by the mainlobe.
 
-    `fine_search_factors` is `(code_phase_factor, doppler_factor)`: how many
-    sub-divisions of each search bin to test.  `(1, 4)` searches the code phase on
-    the plain sample grid and the Doppler at quarter-bin spacing, cutting the
-    worst-case Doppler error to a quarter.  `None` means `(1, 1)` -- one
-    hypothesis per bin, the plain search.  Cost scales with the product.
+    `fine_search` optionally refines each *detected* peak afterwards, over a small
+    window around it -- see `FineSearchParameters`.  `None` disables it, which is
+    the default: the coarse search alone is unchanged by this feature.
 
     The search grid decides how far off the seed handed to tracking can be:
 
-        code phase, worst case = +/- 0.5 sample / code_phase_factor
+        code phase, worst case = +/- 0.5 sample / delay_factor
         Doppler,    worst case = +/- 0.5 * fft_resolution / doppler_factor
 
     Both are reported by `search_resolution_summary()`.
@@ -67,8 +122,8 @@ class AcquisitionConfiguration:
     # None means "one coherent integration per replica period", the behaviour
     # every existing caller relies on.
     coherent_duration_sample_ms: float | None = None
-    # (code_phase_factor, doppler_factor); None means (1, 1).
-    fine_search_factors: tuple[int, int] | None = None
+    # Refinement of detected peaks; None disables it.
+    fine_search: FineSearchParameters | None = None
 
     def __post_init__(self):
         self.replica_length_samples = int(
@@ -111,30 +166,16 @@ class AcquisitionConfiguration:
         )
         self.num_doppler_bins = len(self.doppler_search_bins)
 
-        # --- fine search -----------------------------------------------------
-        code_phase_factor, doppler_factor = self.fine_search_factors or (1, 1)
-        if code_phase_factor < 1 or doppler_factor < 1:
-            raise ValueError(
-                f"fine_search_factors must be >= 1, got {self.fine_search_factors}"
-            )
-        if code_phase_factor != 1:
-            # The Doppler side is a re-mix of the same samples, so sub-dividing it
-            # is the search that already exists, run at more offsets.  Code phase
-            # is not: the bin *is* the sample spacing, so sub-dividing it needs
-            # either interpolation of the correlation peak or a resampled replica.
-            raise NotImplementedError(
-                f"code-phase fine search (factor {code_phase_factor}) is not implemented yet; "
-                "use fine_search_factors=(1, N) for now"
-            )
-        self.code_phase_factor = code_phase_factor
-        self.doppler_factor = doppler_factor
-
-        # Worst-case seeding error: half a bin, divided by the sub-division.
+        # Worst-case seeding error: half a bin, divided by any refinement.
+        delay_factor = self.fine_search.delay_factor if self.fine_search else 1
+        doppler_factor = self.fine_search.doppler_factor if self.fine_search else 1
         self.code_phase_bin_seconds = 1.0 / self.sample_rate
-        self.code_phase_error_seconds = 0.5 * self.code_phase_bin_seconds / code_phase_factor
+        self.code_phase_error_seconds = 0.5 * self.code_phase_bin_seconds / delay_factor
         self.doppler_error_hz = 0.5 * self.fft_resolution / doppler_factor
 
         self.replica_cache_dict: Dict[str, SignalReplicaCacheEntry] = {}
+        # One-component code sets for the fine search, built on first use.
+        self.fine_code_set_cache: Dict[str, Any] = {}
 
     def search_resolution_summary(self) -> str:
         """
@@ -153,10 +194,12 @@ class AcquisitionConfiguration:
             f"(+/-{coarse_code_ns * 1e-9 * speed_of_light_m_per_s:.1f} m), "
             f"Doppler +/-{coarse_dopp_hz:.1f} Hz",
         ]
-        if self.fine_search_factors is not None:
+        if self.fine_search is not None:
             fine_code_ns = self.code_phase_error_seconds * 1e9
             lines.append(
-                f"  fine search {self.fine_search_factors} -> code phase +/-{fine_code_ns:.1f} ns "
+                f"  fine search (delay x{self.fine_search.delay_factor}, "
+                f"Doppler x{self.fine_search.doppler_factor}) -> "
+                f"code phase +/-{fine_code_ns:.1f} ns "
                 f"(+/-{fine_code_ns * 1e-9 * speed_of_light_m_per_s:.1f} m), "
                 f"Doppler +/-{self.doppler_error_hz:.1f} Hz"
             )
@@ -172,6 +215,9 @@ class AcqSignalCodeParameters:
     # already zero-filled on its sibling's chips and cannot spuriously correlate
     # against that sibling's code. See `utils.code_components`.
     sequence: NDArray[np.int8]
+    # Needed by the fine search to slave the code rate to Doppler.  At 2450 Hz on
+    # L5 the code drifts 0.107 chips per 5 ms block, so this is not optional there.
+    carrier_freq_hz: float = 0.0
 
 
 @dataclass
@@ -225,10 +271,15 @@ class AcquisitionResult:
     signal_detected: bool
     correlation_result: CorrelationResult
     config: AcquisitionConfiguration
-    # Sub-bin refinement, in Hz, from the half-bin Doppler search.  Zero when the
-    # peak came from the plain integer-bin pass (and for all signals when the
-    # search is disabled).
-    doppler_offset_hz: float = 0.0
+    # Localised refinement of this peak, when `config.fine_search` is set and the
+    # signal was detected.  Its axes are absolute, but the delay axis is a *local,
+    # unwrapped* one about the peak: near the end of the code period it runs past
+    # the period rather than wrapping, so that it stays monotonic and plottable.
+    # Consumers wanting a code phase must use `acq_code_phase_seconds`, which
+    # wraps; doing arithmetic on this axis directly will not.
+    fine_correlation_result: CorrelationResult | None = None
+    fine_peak_doppler_bin: int = 0
+    fine_peak_code_phase_bin: int = 0
     # The recovered code phase is only pinned modulo the period of the code that
     # was correlated against, because that code repeats within the replica.  For
     # L5 acquired on Q x NH20 that is 20 ms; for L1 C/A it is 1 ms.
@@ -261,17 +312,153 @@ class AcquisitionResult:
         return self.acq_code_phase_seconds * 1e3
 
     @property
-    def acq_doppler_hz(self) -> float:
-        return (
+    def coarse_doppler_hz(self) -> float:
+        """Doppler from the coarse grid, whether or not a fine search ran."""
+        return float(
             self.config.doppler_search_bins[self.peak_doppler_bin] * self.config.fft_resolution
-            + self.doppler_offset_hz
+        )
+
+    @property
+    def coarse_code_phase_seconds(self) -> float:
+        """Code phase from the coarse grid, whether or not a fine search ran."""
+        return self.peak_code_phase_bin / self.config.sample_rate
+
+    @property
+    def acq_doppler_hz(self) -> float:
+        """The best available Doppler: refined when a fine search ran, else coarse."""
+        if self.fine_correlation_result is None:
+            return self.coarse_doppler_hz
+        return float(
+            self.fine_correlation_result.doppler_bins_hz[self.fine_peak_doppler_bin]
         )
 
     @property
     def acq_code_phase_seconds(self) -> float:
-        return (
-            self.peak_code_phase_bin / self.config.sample_rate
+        """
+        The best available code phase: refined when a fine search ran, else coarse.
+
+        Wrapped into one period of the acquisition code.  The fine grid's own delay
+        axis is deliberately left unwrapped so it stays monotonic, so a peak found
+        just past the end of the code period comes back here reduced -- which is
+        what tracking and `resolve_acquisition_ambiguities` need.
+        """
+        if self.fine_correlation_result is None:
+            return self.coarse_code_phase_seconds
+        seconds = float(
+            self.fine_correlation_result.code_phase_bins_seconds[self.fine_peak_code_phase_bin]
         )
+        period_seconds = self.code_phase_ambiguity_ms * 1e-3
+        return seconds % period_seconds if period_seconds > 0 else seconds
+
+
+def refine_acquisition_peak(
+    sample_block: NDArray[np.complex64],
+    acq_config: AcquisitionConfiguration,
+    code_params: "AcqSignalCodeParameters",
+    code_set,
+    coarse_doppler_hz: float,
+    coarse_code_phase_seconds: float,
+) -> tuple[NDArray[np.float64], int, int]:
+    """
+    Re-score a detected peak on a finer grid, over a small window around it.
+
+    Returns `(grid, peak_doppler_index, peak_delay_index)` where `grid` is
+    `(num_doppler_hypotheses, num_delay_taps)` on the same scale as the coarse
+    correlation -- `|corr|^2 / N_coh` summed over blocks -- so the two are directly
+    comparable at the bins they share.
+
+    Two differences from the coarse search, both deliberate:
+
+    * The delay axis is evaluated directly rather than by FFT, so it can sit at
+      fractional samples.  `correlate__multicomponent` fills every tap from one
+      pass over the samples, which is why the delay dimension is nearly free and
+      only Doppler costs extra passes.
+    * The code rate is slaved to Doppler (`nominal * (1 + doppler / carrier)`).
+      The coarse replica runs at the nominal rate, so it does not model the code
+      drifting within the dwell -- 0.107 chips per 5 ms block at 2450 Hz on L5,
+      which lands the four blocks' peaks 0.107 chips apart and smears the
+      non-coherent sum.  The fine search therefore recovers drift as well as
+      scalloping, and only matches the coarse value where the drift is negligible.
+
+    Blocks are combined by square law with carrier phase zero in each, exactly as
+    in acquisition and in `ambiguity_resolution.resolve_code_ambiguity`: only the
+    rotation *within* a block matters.
+    """
+    fine = acq_config.fine_search
+    assert fine is not None
+
+    samples = np.ascontiguousarray(sample_block, dtype=np.complex64)
+    n_coh = acq_config.coherent_length_samples
+    nominal_rate = code_params.rate_chips_per_sec
+
+    # Delay taps, in chips, relative to the coarse peak.  Uniform sub-division of a
+    # sample, so the coarse bins are the multiples of `delay_factor`.
+    tap_index = np.arange(
+        -fine.delay_halfwidth_bins * fine.delay_factor,
+        fine.delay_halfwidth_bins * fine.delay_factor + 1,
+    )
+    tap_seconds = tap_index / (acq_config.sample_rate * fine.delay_factor)
+    taps_chips = np.ascontiguousarray(tap_seconds * nominal_rate, dtype=np.float64)
+
+    doppler_index = np.arange(
+        -fine.doppler_halfwidth_bins * fine.doppler_factor,
+        fine.doppler_halfwidth_bins * fine.doppler_factor + 1,
+    )
+    doppler_hz = coarse_doppler_hz + doppler_index * (
+        acq_config.fft_resolution / fine.doppler_factor
+    )
+
+    grid = np.zeros((len(doppler_hz), len(taps_chips)), dtype=np.float64)
+    corr = np.zeros((len(taps_chips), code_set.num_components), dtype=np.complex64)
+
+    for d, doppler in enumerate(doppler_hz):
+        code_rate = nominal_rate * (1.0 + doppler / code_params.carrier_freq_hz)
+        base_chips = coarse_code_phase_seconds * nominal_rate
+        for block in range(acq_config.num_blocks):
+            start = block * n_coh
+            block_samples = samples[start : start + n_coh]
+            if len(block_samples) < n_coh:
+                break
+            code_phase_chips = base_chips + (start / acq_config.sample_rate) * code_rate
+            corr.fill(0.0)
+            correlate__multicomponent(
+                block_samples,
+                acq_config.sample_rate,
+                0.0,
+                float(doppler),
+                code_set,
+                code_rate,
+                code_phase_chips,
+                taps_chips,
+                corr,
+            )
+            # Same normalisation as the coarse path, so the grids are comparable.
+            grid[d] += np.abs(corr[:, 0].astype(np.complex128)) ** 2 / n_coh
+
+    peak_d, peak_t = np.unravel_index(grid.argmax(), grid.shape)
+    return grid, int(peak_d), int(peak_t)
+
+
+def _acquisition_code_set(code_params: "AcqSignalCodeParameters"):
+    """
+    A one-component `CodeSet` over the acquisition sequence, for the fine search.
+
+    It must be the *acquisition* code, not the signal's tracking code set: on L5
+    the acquisition code is the composite Q x NH20, and refining against plain Q
+    would let the overlay's sign flips cancel across a coherent block.
+
+    `allow_partial_coverage` is required and correct here -- L2C acquires on CM
+    alone, which is zero on CL's chips, and `build_code_set`'s own docstring names
+    scoring one component in isolation as exactly this case.
+    """
+    component = CodeComponent(
+        name="acquisition",
+        sequence=np.ascontiguousarray(code_params.sequence, dtype=np.int8),
+        # Branch is meaningful only as a *difference* between components of one
+        # signal; this set has a single component, so the choice cannot matter.
+        branch=Branch.I,
+    )
+    return build_code_set([component], allow_partial_coverage=True)
 
 
 def pack_coherent_blocks(
@@ -406,11 +593,11 @@ def run_acquisition(
     # Sidak, in the numerically stable form: 1 - (1 - p)**(1/n) cancels to exactly
     # 0.0 once p/n drops below float64 eps, and chi2.isf(0) is inf, so the naive
     # expression fails by detecting nothing at all rather than by erroring.
+    # The fine search deliberately does NOT enter this count.  It runs only on peaks
+    # already declared detections, over a neighbourhood the threshold was never
+    # asked about, so inflating the cell count for it would tighten the Sidak
+    # correction and quietly desensitise the coarse search that does the deciding.
     num_detection_cells = acq_config.num_doppler_bins * acq_config.replica_length_samples
-    # Each sub-bin pass is another set of Doppler hypotheses, and every hypothesis
-    # is another chance to false-alarm, so the grid the threshold is set for grows
-    # with the factor.
-    num_detection_cells *= acq_config.doppler_factor
     if not 0.0 < prob_false_alarm_total < 1.0:
         raise ValueError(
             f"prob_false_alarm_total must be in (0, 1), got {prob_false_alarm_total}"
@@ -429,19 +616,10 @@ def run_acquisition(
     # applied across the padded window; the padding stays zero, and the block's
     # own position within the window contributes only a constant phase, which the
     # square law discards.
-    sub_bin_offsets_hz = [0.0]
     # scipy.fft rather than numpy: it releases the GIL and threads across the
     # blocks with workers=-1.  Single-threaded scipy is *slower* than numpy here,
     # so the workers argument is not optional.
-    conj_sample_ffts = [np.conj(scipy.fft.fft(samples, axis=1, workers=-1))]
-    block_time_arr = np.arange(N) / acq_config.sample_rate
-    for j in range(1, acq_config.doppler_factor):
-        # Mixing the samples down by j/k of a bin makes the signal appear that much
-        # lower, so the recovered Doppler is the bin centre plus the offset.
-        offset_hz = j * acq_config.fft_resolution / acq_config.doppler_factor
-        shifted_samples = samples * np.exp(-2j * np.pi * offset_hz * block_time_arr)[None, :]
-        conj_sample_ffts.append(np.conj(scipy.fft.fft(shifted_samples, axis=1, workers=-1)))
-        sub_bin_offsets_hz.append(offset_hz)
+    conj_samples_fft = np.conj(scipy.fft.fft(samples, axis=1, workers=-1))
 
     if print_progress:
         # The code period is what code phase is ambiguous over; state it in the
@@ -501,57 +679,42 @@ def run_acquisition(
 
         doppler_search_bins = acq_config.doppler_search_bins
 
-        # Search each sub-bin Doppler hypothesis and keep whichever peaks highest.
-        # With a Doppler factor of 1 there is exactly one hypothesis and this
-        # reduces to the plain single pass.
-        correlation = None
-        peak_doppler_bin = peak_sample_bin = 0
-        peak_val = -np.inf
-        doppler_offset_hz = 0.0
+        # Match the sample precision rather than always using float64: real
+        # collects are complex64, where float64 here only doubles the write
+        # bandwidth.  Tests that feed complex128 keep their precision.
+        correlation = np.zeros(
+            (len(doppler_search_bins), N),
+            dtype=np.float32 if samples.dtype == np.complex64 else np.float64,
+        )
 
-        for conj_samples_fft, sub_bin_offset_hz in zip(conj_sample_ffts, sub_bin_offsets_hz):
-            # Match the sample precision rather than always using float64: real
-            # collects are complex64, where float64 here only doubles the write
-            # bandwidth.  Tests that feed complex128 keep their precision.
-            pass_correlation = np.zeros(
-                (len(doppler_search_bins), N),
-                dtype=np.float32 if samples.dtype == np.complex64 else np.float64,
+        for i, roll in enumerate(doppler_search_bins):
+            # Coherent integration over the N_coh non-zero samples of each block;
+            # the padding contributes nothing, so z_noise ~ CN(0, N_coh*noise_var)
+            # regardless of the FFT length.
+            shifted_replica_fft = np.roll(replica_samples_fft, roll)
+            corr = scipy.fft.ifft(
+                conj_samples_fft * shifted_replica_fft[None, :], axis=1, workers=-1
             )
+            # non-coherent square-law summation over M blocks, normalized by the
+            # number of samples actually integrated (N_coh, not N -- they differ
+            # once coherent integration is shorter than the replica, and
+            # normalizing by N would under-report the noise by N/N_coh)
+            # y_noise / noise_var ~ ChiSquared(2M)
+            #
+            # einsum rather than np.sum(np.abs(corr)**2): `abs` then `**2` each
+            # materialise a full (M, N) temporary, and this is a third of the
+            # inner loop.  Same value to ~2e-7 relative.
+            correlation[i] = (
+                np.einsum("ij,ij->j", corr.real, corr.real)
+                + np.einsum("ij,ij->j", corr.imag, corr.imag)
+            ) / N_coh
 
-            for i, roll in enumerate(doppler_search_bins):
-                # Coherent integration over the N_coh non-zero samples of each
-                # block; the padding contributes nothing, so z_noise ~ CN(0,
-                # N_coh*noise_var) regardless of the FFT length.
-                shifted_replica_fft = np.roll(replica_samples_fft, roll)
-                corr = scipy.fft.ifft(
-                    conj_samples_fft * shifted_replica_fft[None, :], axis=1, workers=-1
-                )
-                # non-coherent square-law summation over M blocks, normalized by
-                # the number of samples actually integrated (N_coh, not N -- they
-                # differ once coherent integration is shorter than the replica, and
-                # normalizing by N would under-report the noise by N/N_coh)
-                # y_noise / noise_var ~ ChiSquared(2M)
-                #
-                # einsum rather than np.sum(np.abs(corr)**2): `abs` then `**2`
-                # each materialise a full (M, N) temporary, and this is a third of
-                # the inner loop.  Same value to ~2e-7 relative.
-                pass_correlation[i] = (
-                    np.einsum("ij,ij->j", corr.real, corr.real)
-                    + np.einsum("ij,ij->j", corr.imag, corr.imag)
-                ) / N_coh
-
-            pass_doppler_bin_idx, pass_sample_bin_idx = np.unravel_index(
-                pass_correlation.argmax(), pass_correlation.shape
-            )
-            pass_peak_val = pass_correlation[pass_doppler_bin_idx, pass_sample_bin_idx]
-            if pass_peak_val > peak_val:
-                correlation = pass_correlation
-                peak_doppler_bin = int(pass_doppler_bin_idx)
-                peak_sample_bin = int(pass_sample_bin_idx)
-                peak_val = float(pass_peak_val)
-                doppler_offset_hz = sub_bin_offset_hz
-
-        assert correlation is not None  # at least one hypothesis is always searched
+        peak_doppler_bin_idx, peak_sample_bin_idx = np.unravel_index(
+            correlation.argmax(), correlation.shape
+        )
+        peak_doppler_bin = int(peak_doppler_bin_idx)
+        peak_sample_bin = int(peak_sample_bin_idx)
+        peak_val = float(correlation[peak_doppler_bin, peak_sample_bin])
 
         # Estimate noise distribution
         # y_noise = X * noise_var
@@ -573,6 +736,40 @@ def run_acquisition(
 
         # The reported Doppler axis belongs to the winning pass, so it carries the
         # same sub-bin offset as the peak.
+        # --- fine search ------------------------------------------------------
+        # Gated on detection by construction: a peak that did not clear the
+        # threshold is a noise maximum, and refining its neighbourhood would only
+        # dress up noise as a measurement.
+        fine_correlation_result = None
+        fine_peak_doppler_bin = 0
+        fine_peak_code_phase_bin = 0
+        if acq_config.fine_search is not None and signal_detected:
+            fine = acq_config.fine_search
+            code_set = acq_config.fine_code_set_cache.get(signal_id)
+            if code_set is None:
+                code_set = _acquisition_code_set(code_params)
+                acq_config.fine_code_set_cache[signal_id] = code_set
+
+            coarse_doppler_hz = (
+                acq_config.doppler_search_bins[peak_doppler_bin] * acq_config.fft_resolution
+            )
+            coarse_code_phase_seconds = peak_sample_bin / acq_config.sample_rate
+            fine_grid, fine_peak_doppler_bin, fine_peak_code_phase_bin = refine_acquisition_peak(
+                sample_block,
+                acq_config,
+                code_params,
+                code_set,
+                coarse_doppler_hz,
+                coarse_code_phase_seconds,
+            )
+            fine_correlation_result = CorrelationResult(
+                fine_grid,
+                coarse_doppler_hz - fine.doppler_halfwidth_bins * acq_config.fft_resolution,
+                acq_config.fft_resolution / fine.doppler_factor,
+                coarse_code_phase_seconds - fine.delay_halfwidth_bins / acq_config.sample_rate,
+                1.0 / (acq_config.sample_rate * fine.delay_factor),
+            )
+
         if save_corr_doppler_window_bins is None:
             retained = correlation
             first_row_fft_bin = acq_config.doppler_search_bins[0]
@@ -594,7 +791,7 @@ def run_acquisition(
 
         corr_result = CorrelationResult(
             retained,
-            first_row_fft_bin * acq_config.fft_resolution + doppler_offset_hz,
+            first_row_fft_bin * acq_config.fft_resolution,
             acq_config.fft_resolution,
             0.0,
             1 / acq_config.sample_rate,
@@ -614,8 +811,10 @@ def run_acquisition(
             signal_detected,
             corr_result,
             acq_config,
-            doppler_offset_hz=doppler_offset_hz,
             code_phase_ambiguity_ms=code_period_ms,
+            fine_correlation_result=fine_correlation_result,
+            fine_peak_doppler_bin=fine_peak_doppler_bin,
+            fine_peak_code_phase_bin=fine_peak_code_phase_bin,
             acquisition_code_rate_chips_per_sec=code_params.rate_chips_per_sec,
         )
 

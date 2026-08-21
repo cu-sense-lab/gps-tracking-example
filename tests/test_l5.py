@@ -185,7 +185,8 @@ def test_early_late_are_symmetric_when_aligned(l5_definition):
 # --------------------------------------------------------------------------
 
 def _acquisition_config(
-    doppler_factor: int = 1, doppler_hz: tuple[float, float] = (-5000, 5000)
+    fine_search: bpsk_acquisition.FineSearchParameters | None = None,
+    doppler_hz: tuple[float, float] = (-5000, 5000),
 ) -> bpsk_acquisition.AcquisitionConfiguration:
     """
     The composite-Q dwell: replica = primary x NH20 = 20 ms, coherent = 5 ms x 4.
@@ -207,17 +208,17 @@ def _acquisition_config(
         sample_rate=SAMP_RATE,
         min_search_doppler_hz=doppler_hz[0],
         max_search_doppler_hz=doppler_hz[1],
-        fine_search_factors=None if doppler_factor == 1 else (1, doppler_factor),
+        fine_search=fine_search,
     )
 
 
 
 def _acquire(
-    true_doppler_hz, code_phase_ms, doppler_factor=1, prn=PRN, noise_sigma=2.0, seed=0,
+    true_doppler_hz, code_phase_ms, fine_search=None, prn=PRN, noise_sigma=2.0, seed=0,
     start_sec=0.0, nav_bits=True, doppler_hz=(-5000, 5000), window_bins=1,
 ):
     definitions = build_signals(GpsL5, prns=[prn])
-    config = _acquisition_config(doppler_factor, doppler_hz)
+    config = _acquisition_config(fine_search, doppler_hz)
     samples = synthetic.generate_l5_samples(
         prn=prn, start_sec=start_sec, duration_sec=config.acq_total_duration_ms * 1e-3,
         samp_rate=SAMP_RATE, doppler_hz=true_doppler_hz, code_phase_ms=code_phase_ms,
@@ -237,7 +238,7 @@ def _acquire(
 
 def test_acquisition_detects_and_locates_the_signal():
     code_phase_ms = 0.31
-    result, _ = _acquire(1234.0, code_phase_ms, doppler_factor=2)
+    result, _ = _acquire(1234.0, code_phase_ms, fine_search=bpsk_acquisition.FineSearchParameters())
     assert result.signal_detected
     # Code phase resolves to one sample.
     assert result.acq_code_phase_seconds * 1e3 == pytest.approx(
@@ -301,7 +302,7 @@ def test_composite_replica_separates_grid_from_response():
     replica to 25 Hz -- comfortably inside a 1 ms FLL's +/-250 Hz unambiguous range, which is
     what the half-bin search previously existed to rescue.
     """
-    _, config = _acquire(0.0, 0.0, doppler_factor=1)
+    _, config = _acquire(0.0, 0.0, fine_search=None)
     assert config.fft_resolution == pytest.approx(50.0)
     assert config.doppler_response_width_hz == pytest.approx(200.0)
 
@@ -322,7 +323,7 @@ def test_composite_code_phase_carries_the_overlay_counter():
     # index (8.31 ms for a true 7.31 ms).  Q carries no data, so the counter is exact.
     for start_ms, expected_index in ((0.0, 0), (3.0, 3), (7.0, 7), (13.0, 13)):
         result, _ = _acquire(
-            1234.0, code_phase_ms, doppler_factor=1, start_sec=start_ms * 1e-3
+            1234.0, code_phase_ms, fine_search=None, start_sec=start_ms * 1e-3
         )
         assert result.signal_detected
         phase_ms = result.acq_code_phase_seconds * 1e3
@@ -334,77 +335,178 @@ def test_composite_code_phase_carries_the_overlay_counter():
         assert phase_ms % 1.0 == pytest.approx(code_phase_ms, abs=2e-3)
 
 
-@pytest.mark.parametrize("true_doppler_hz", [0.0, 250.0, 400.0, 500.0, 700.0, -400.0, -500.0])
-def test_doppler_fine_search_shrinks_worst_case_doppler_error(true_doppler_hz):
+FINE = bpsk_acquisition.FineSearchParameters
+
+
+def test_fine_grid_contains_the_coarse_bins():
     """
-    Also fixes the sign: mixing the samples down by a fraction of a bin makes the
-    signal appear lower, so the recovered Doppler is the bin centre *plus* the
-    offset.  Getting this backwards would grow the error instead of shrinking it.
+    The fine grid is a uniform sub-division that lands *on* the coarse bins, not a
+    shifted grid beside them.  Everything else here compares fine against coarse at
+    a shared bin, so this property is what makes those comparisons meaningful.
     """
-    coarse, config = _acquire(true_doppler_hz, 0.31, doppler_factor=1)
-    fine, _ = _acquire(true_doppler_hz, 0.31, doppler_factor=2)
-    assert coarse.signal_detected and fine.signal_detected
+    result, config = _acquire(0.0, 0.31, fine_search=FINE())
+    fine = result.fine_correlation_result
+    assert fine is not None
 
-    # Half a grid step is the worst case without the search; the half-bin pass can
-    # only improve on it.
-    assert abs(fine.acq_doppler_hz - true_doppler_hz) <= 0.5 * config.fft_resolution + 1e-6
-    assert abs(fine.acq_doppler_hz - true_doppler_hz) <= abs(
-        coarse.acq_doppler_hz - true_doppler_hz
-    ) + 1e-6
+    delays = fine.code_phase_bins_seconds
+    dopplers = fine.doppler_bins_hz
+    assert len(delays) == FINE().num_delay_taps == 13
+    assert len(dopplers) == FINE().num_doppler_hypotheses == 5
 
-
-def test_fine_search_offset_is_reported_and_applied():
-    # 525 Hz sits on a half-bin of the 50 Hz grid, so the shifted pass must win.
-    fine, config = _acquire(525.0, 0.31, doppler_factor=2)
-    assert fine.doppler_offset_hz == pytest.approx(0.5 * config.fft_resolution)
-    bin_centre = config.doppler_search_bins[fine.peak_doppler_bin] * config.fft_resolution
-    assert fine.acq_doppler_hz == pytest.approx(bin_centre + fine.doppler_offset_hz)
+    # Step is one bin over the factor, and the centre coincides with the coarse peak.
+    assert (delays[1] - delays[0]) == pytest.approx(1 / (SAMP_RATE * 2))
+    assert (dopplers[1] - dopplers[0]) == pytest.approx(config.fft_resolution / 2)
+    assert delays[len(delays) // 2] == pytest.approx(result.coarse_code_phase_seconds)
+    assert dopplers[len(dopplers) // 2] == pytest.approx(result.coarse_doppler_hz)
 
 
-def test_doppler_fine_search_generalises_beyond_half_a_bin():
+def test_fine_and_coarse_agree_bin_for_bin_when_there_is_no_drift():
     """
-    The factor is a sub-division count, not a boolean: k passes at j/k of a bin
-    put the worst case at half a bin over k.  Checked at k=4 against the plain
-    search on a Doppler deliberately placed a quarter-bin off a grid point.
+    The fine grid is evaluated in the time domain, the coarse one by FFT.  At zero
+    Doppler there is no code drift for the fine search to correct, so the two must
+    produce the *same number* at a shared bin.  Nothing else catches a normalisation
+    error between the two paths.
     """
-    true_doppler_hz = 412.5  # 8.25 bins of 50 Hz -- a quarter bin off centre
-    coarse, config = _acquire(true_doppler_hz, 0.31, doppler_factor=1)
-    fine, _ = _acquire(true_doppler_hz, 0.31, doppler_factor=4)
-    assert coarse.signal_detected and fine.signal_detected
-
-    quarter_bin_worst_case = 0.5 * config.fft_resolution / 4
-    assert abs(fine.acq_doppler_hz - true_doppler_hz) <= quarter_bin_worst_case + 1e-6
-    assert abs(fine.acq_doppler_hz - true_doppler_hz) < abs(
-        coarse.acq_doppler_hz - true_doppler_hz
+    result, _ = _acquire(
+        0.0, 0.31, noise_sigma=0.0,
+        fine_search=FINE(delay_factor=1, doppler_factor=1,
+                         delay_halfwidth_bins=1, doppler_halfwidth_bins=1),
     )
+    centre = float(result.fine_correlation_result.correlation_matrix[1, 1])
+    coarse_peak = result.normalized_peak_value * result.noise_var
+    assert centre == pytest.approx(coarse_peak, rel=1e-3)
+
+
+def test_fine_search_corrects_code_drift_the_coarse_search_cannot():
+    """
+    The coarse replica runs at the nominal chip rate, so it does not model the code
+    drifting within the dwell -- 0.107 chips per 5 ms block at 2450 Hz on L5, which
+    leaves the four blocks' peaks displaced from each other.  The fine search slaves
+    the code rate to Doppler and recovers it.
+
+    Compared **peak to peak**, not bin to bin: at the coarse peak's own bin the fine
+    value is lower, because the coarse value there is inflated by exactly the
+    smearing being corrected.
+    """
+    true_code_phase_ms = 0.31
+    coarse_only, _ = _acquire(2450.0, true_code_phase_ms, noise_sigma=0.0)
+    refined, _ = _acquire(
+        2450.0, true_code_phase_ms, noise_sigma=0.0,
+        fine_search=FINE(delay_factor=4, doppler_factor=1,
+                         delay_halfwidth_bins=4, doppler_halfwidth_bins=1),
+    )
+    true_seconds = true_code_phase_ms * 1e-3
+    coarse_error = abs(coarse_only.coarse_code_phase_seconds - true_seconds) * SAMP_RATE
+    fine_error = abs(refined.acq_code_phase_seconds - true_seconds) * SAMP_RATE
+
+    assert coarse_error > 0.5, "expected the coarse search to be displaced by drift"
+    assert fine_error < 0.3, f"fine search should recover it, got {fine_error:.3f} samples"
+
+    fine_peak = float(refined.fine_correlation_result.correlation_matrix.max())
+    coarse_peak = refined.normalized_peak_value * refined.noise_var
+    assert fine_peak > coarse_peak
+
+
+@pytest.mark.parametrize("offset_samples", [0.0, 0.25, 0.5, -0.25, -0.5])
+def test_fine_search_bounds_the_delay_error_by_half_a_fine_step(offset_samples):
+    """The refined estimate must land within half a fine step of the truth."""
+    code_phase_ms = (7750 + offset_samples) / SAMP_RATE * 1e3
+    result, _ = _acquire(
+        0.0, code_phase_ms, noise_sigma=0.0,
+        fine_search=FINE(delay_factor=4, doppler_factor=1,
+                         delay_halfwidth_bins=3, doppler_halfwidth_bins=1),
+    )
+    error_samples = abs(result.acq_code_phase_seconds - code_phase_ms * 1e-3) * SAMP_RATE
+    assert error_samples <= 0.5 / 4 + 1e-6
+
+
+def test_fine_search_near_the_code_period_boundary_wraps_only_the_scalar():
+    """
+    A peak a sample short of the code period leaves the window hanging over the end.
+    The correlation is still right (the kernel wraps code phase internally) and the
+    stored axis stays monotonic -- deliberately unwrapped, or it could not be
+    plotted -- while the reported scalar comes back inside one period.
+    """
+    config = _acquisition_config()
+    period_seconds = config.coherent_duration_replica_ms * 1e-3
+    # One sample short of the end of the 20 ms composite code.
+    code_phase_ms = (period_seconds - 1.0 / SAMP_RATE) * 1e3
+
+    result, _ = _acquire(
+        0.0, code_phase_ms, noise_sigma=0.0,
+        fine_search=FINE(delay_halfwidth_bins=3, doppler_halfwidth_bins=1),
+    )
+    assert result.signal_detected
+
+    axis = result.fine_correlation_result.code_phase_bins_seconds
+    assert np.all(np.diff(axis) > 0), "the stored delay axis must stay monotonic"
+    assert axis[-1] > period_seconds, "this case is only interesting if the window overhangs"
+
+    wrapped = result.acq_code_phase_seconds
+    assert 0.0 <= wrapped < period_seconds, f"scalar must be wrapped, got {wrapped}"
+
+
+def test_fine_search_only_runs_on_a_detection():
+    """Refining a noise maximum would dress noise up as a measurement."""
+    definitions = build_signals(GpsL5, prns=[PRN])
+    config = _acquisition_config(FINE())
+    rng = np.random.default_rng(3)
+    noise = (
+        rng.normal(0, 5, config.total_num_samples)
+        + 1j * rng.normal(0, 5, config.total_num_samples)
+    ).astype(np.complex64)
+    results = bpsk_acquisition.run_acquisition(
+        sample_block=noise,
+        sample_block_uptime_epoch_ms=0.0,
+        acq_config=config,
+        code_parameters=build_acquisition_code_params(GpsL5, definitions),
+        prob_false_alarm_total=1e-9,
+        noise_var_method="abscorrvar",
+    )
+    result = results[f"G{PRN:02d}"]
+    assert not result.signal_detected
+    assert result.fine_correlation_result is None
+    assert result.acq_doppler_hz == result.coarse_doppler_hz
+
+
+def test_fine_search_leaves_the_detection_statistics_alone():
+    """
+    Detection is decided on the coarse grid, whose false-alarm statistics were
+    derived for it.  Enabling a post-detection refinement must not move the
+    threshold, the cell count, or the value being thresholded.
+    """
+    plain, _ = _acquire(1234.0, 0.31)
+    refined, _ = _acquire(1234.0, 0.31, fine_search=FINE())
+    assert refined.signal_detected == plain.signal_detected
+    assert refined.num_detection_cells == plain.num_detection_cells
+    assert refined.detection_threshold == pytest.approx(plain.detection_threshold)
+    assert refined.normalized_peak_value == pytest.approx(plain.normalized_peak_value)
+
+
+def test_fine_search_is_off_by_default_and_leaves_estimates_coarse():
+    result, _ = _acquire(1234.0, 0.31)
+    assert result.fine_correlation_result is None
+    assert result.acq_doppler_hz == result.coarse_doppler_hz
+    assert result.acq_code_phase_seconds == result.coarse_code_phase_seconds
 
 
 def test_fine_search_reports_its_error_ranges():
-    plain = _acquisition_config(doppler_factor=1)
-    fine = _acquisition_config(doppler_factor=4)
+    plain = _acquisition_config()
+    fine = _acquisition_config(FINE(delay_factor=4, doppler_factor=4))
 
     assert plain.doppler_error_hz == pytest.approx(0.5 * plain.fft_resolution)
     assert fine.doppler_error_hz == pytest.approx(0.5 * fine.fft_resolution / 4)
-    # Code phase is untouched until a code-phase factor is implemented.
-    assert fine.code_phase_error_seconds == pytest.approx(0.5 / SAMP_RATE)
+    assert plain.code_phase_error_seconds == pytest.approx(0.5 / SAMP_RATE)
+    assert fine.code_phase_error_seconds == pytest.approx(0.5 / SAMP_RATE / 4)
 
-    assert "plain search" in plain.search_resolution_summary()
     assert "fine search" not in plain.search_resolution_summary()
-    assert "fine search (1, 4)" in fine.search_resolution_summary()
+    assert "delay x4" in fine.search_resolution_summary()
 
 
-def test_code_phase_fine_search_is_rejected_rather_than_ignored():
-    """A factor that is accepted but does nothing would silently overstate the seed."""
-    with pytest.raises(NotImplementedError, match="code-phase fine search"):
-        bpsk_acquisition.AcquisitionConfiguration(
-            coherent_duration_replica_ms=20,
-            coherent_duration_sample_ms=5.0,
-            num_blocks=4,
-            sample_rate=SAMP_RATE,
-            min_search_doppler_hz=-5000,
-            max_search_doppler_hz=5000,
-            fine_search_factors=(2, 1),
-        )
+def test_fine_search_rejects_a_window_too_narrow_to_bracket_the_peak():
+    """A halfwidth of 0 searches only the coarse peak, which can be half a bin off."""
+    with pytest.raises(ValueError, match="halfwidths must be >= 1"):
+        FINE(delay_halfwidth_bins=0)
 
 
 def test_retained_correlation_keeps_full_delay_and_a_doppler_window():
@@ -501,13 +603,6 @@ def test_correlation_histogram_survives_nan_rows():
     assert np.isfinite(heights).all() and sum(heights) > 0
 
 
-def test_fine_search_is_off_by_default():
-    """Callers that do not ask for a fine search must be unaffected."""
-    coarse, config = _acquire(400.0, 0.31, doppler_factor=1)
-    assert coarse.doppler_offset_hz == 0.0
-    assert coarse.acq_doppler_hz % config.fft_resolution == pytest.approx(0.0)
-
-
 # --------------------------------------------------------------------------
 # Acquisition handing off to tracking
 # --------------------------------------------------------------------------
@@ -521,7 +616,7 @@ def test_acquisition_seeds_tracking_to_convergence():
     from utils.signal_interfaces import create_tracking_channels
 
     true_doppler_hz, code_phase_ms, prn = 1234.0, 0.31, PRN
-    acq_result, _ = _acquire(true_doppler_hz, code_phase_ms, doppler_factor=2, prn=prn)
+    acq_result, _ = _acquire(true_doppler_hz, code_phase_ms, fine_search=bpsk_acquisition.FineSearchParameters(), prn=prn)
     assert acq_result.signal_detected
 
     definitions = build_signals(GpsL5, prns=[prn])

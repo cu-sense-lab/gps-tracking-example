@@ -568,6 +568,7 @@ def build_acquisition_code_params(
             rate_chips_per_sec=signal_type.tracking_code_rate_chips_per_sec,
             length_chips=len(sequence),
             sequence=sequence,
+            carrier_freq_hz=signal_type.carrier_freq_hz,
         )
     return params
 
