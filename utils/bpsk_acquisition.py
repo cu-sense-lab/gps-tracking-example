@@ -658,7 +658,7 @@ def run_acquisition(
             1e3 * p.length_chips / p.rate_chips_per_sec for p in code_parameters.values()
         }
         ambiguity = (
-            f", mod {code_periods_ms.pop():g}" if len(code_periods_ms) == 1 else ""
+            f", mod {code_periods_ms.pop():g} ms" if len(code_periods_ms) == 1 else ""
         )
         print(
             f"Detection threshold: {threshold_db:.2f} dB above noise "
@@ -669,8 +669,12 @@ def run_acquisition(
         # the columns are widened and the code phase gains decimals -- one sample is
         # 4.5e-5 ms at 22 Msps, invisible at the 3 decimals the plain table uses.
         showing_fine = acq_config.fine_search is not None
-        snr_w, dopp_w, cp_w = (18, 21, 25) if showing_fine else (9, 13, 22)
-        cp_header = "Code phase [ms" + ambiguity + "]"
+        # Code phase in whole nanoseconds with thousands separators: the groups fall
+        # on ms | us | ns, so 17,566,500 reads off directly, and one sample (45 ns at
+        # 22 Msps) is plainly visible -- it is not at 3 decimals of a millisecond.
+        cp_header = "Code phase [ns" + ambiguity + "]"
+        snr_w, dopp_w = (18, 21) if showing_fine else (9, 13)
+        cp_w = max(len(cp_header), 24 if showing_fine else 10)
         if showing_fine:
             print("Detected signals show  coarse => fine.")
             print()
@@ -862,6 +866,9 @@ def run_acquisition(
         if print_progress:
             # Doppler and code phase are only meaningful where a peak was actually
             # detected; a dash is honest about the rest being the noise maximum.
+            def _ns(seconds: float) -> str:
+                return f"{round(seconds * 1e9):,}"
+
             fine_snr = acq_result.fine_peak_snr_db
             if not signal_detected:
                 snr = f"{acq_result.peak_snr_db:.1f}"
@@ -869,15 +876,15 @@ def run_acquisition(
             elif fine_snr is None:
                 snr = f"{acq_result.peak_snr_db:.1f}"
                 doppler = f"{acq_result.acq_doppler_hz:+.0f}"
-                code_phase = f"{acq_result.acq_code_phase_ms:.3f}"
+                code_phase = _ns(acq_result.acq_code_phase_seconds)
             else:
                 snr = f"{acq_result.peak_snr_db:.1f} => {fine_snr:.1f}"
                 doppler = (
                     f"{acq_result.coarse_doppler_hz:+.0f} => {acq_result.acq_doppler_hz:+.0f}"
                 )
                 code_phase = (
-                    f"{acq_result.coarse_code_phase_seconds * 1e3:.5f} => "
-                    f"{acq_result.acq_code_phase_ms:.5f}"
+                    f"{_ns(acq_result.coarse_code_phase_seconds)} => "
+                    f"{_ns(acq_result.acq_code_phase_seconds)}"
                 )
             print(
                 f"  {signal_id:<5} {snr:>{snr_w}} {doppler:>{dopp_w}} {code_phase:>{cp_w}}"
