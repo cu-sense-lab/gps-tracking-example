@@ -293,6 +293,84 @@ class TrackingLoopState:
         return float(np.abs(np.mean(np.exp(1j * angles))))
 
 
+def estimate_cn0_vsm(prompt_power: np.ndarray, integration_time_s: float) -> float:
+    """
+    Carrier-to-noise density from prompt power, by the variance summing method.
+
+    VSM (Van Dierendonck) separates signal from noise using the second and fourth
+    moments of the prompt magnitude, which is all it needs -- no knowledge of the
+    data bits, the carrier phase error or the overlay sign, because none of those
+    survive `|P|**2`.  That is what makes it usable before the secondary code is
+    synchronised, and why its input needs no wipe-off.
+
+        mu2 = E[|P|^2]                    mu4 = E[|P|^4]
+        Pd  = sqrt(2*mu2^2 - mu4)         Pn  = mu2 - Pd
+        C/N0 = (Pd / Pn) / T
+
+    `integration_time_s` must be the integration time of the samples given, and the
+    samples must all share it: C/N0 is a *density*, so the whole result scales with
+    this number.  Feeding it epochs of mixed length silently reports the wrong
+    answer, which is why the channel collects one correlation interval at a time.
+
+    Returns NaN rather than raising where the estimator degenerates -- the
+    discriminant goes negative at low C/N0, and the noise term vanishes at very
+    high -- because a NaN leaves a gap in the record while an exception would take
+    down a whole tracking run over one bad window.
+    """
+    if prompt_power.size == 0:
+        return float("nan")
+    mu2 = float(np.mean(prompt_power))
+    mu4 = float(np.mean(prompt_power ** 2))
+    discriminant = 2.0 * mu2 ** 2 - mu4
+    if discriminant <= 0.0:
+        return float("nan")
+    signal_power = float(np.sqrt(discriminant))
+    noise_power = mu2 - signal_power
+    if noise_power <= 0.0:
+        return float("nan")
+    return float(10.0 * np.log10((signal_power / noise_power) / integration_time_s))
+
+
+@dataclass
+class CN0EstimatorParameters:
+    """
+    How the C/N0 estimate is windowed.
+
+    `period_ms` samples -- one correlation interval each -- go into every estimate,
+    and a new one is emitted every `hop_ms = period_ms * (1 - overlap_fraction)`.
+    Longer periods trade time resolution for a steadier number: measured on the
+    rooftop collect, the estimate's 1-sigma spread is about 0.6-0.9 dB at 100 ms,
+    0.4-0.9 dB at 200 ms and 0.1-0.2 dB at 1000 ms.
+
+    Note the period must be well under the tracked duration or there is nothing to
+    plot: at the 1000 ms default, one second of tracking yields exactly one point.
+    """
+
+    period_ms: int = 1000
+    overlap_fraction: float = 0.5
+    enabled: bool = True
+
+    def __post_init__(self) -> None:
+        # VSM's fourth moment is the fragile one, and below roughly a hundred
+        # samples it stops being trustworthy.  Refusing beats quietly returning a
+        # number nobody can tell is wrong.
+        if self.period_ms < 100:
+            raise ValueError(
+                f"period_ms must be at least 100 correlation intervals for the "
+                f"fourth-moment estimate to be meaningful, got {self.period_ms}"
+            )
+        if not 0.0 <= self.overlap_fraction < 1.0:
+            raise ValueError(
+                f"overlap_fraction must be in [0, 1), got {self.overlap_fraction}"
+            )
+        self.hop_ms = int(round(self.period_ms * (1.0 - self.overlap_fraction)))
+        if self.hop_ms < 1:
+            raise ValueError(
+                f"period_ms {self.period_ms} at overlap {self.overlap_fraction} gives a "
+                f"hop of {self.hop_ms} intervals; it must be at least 1"
+            )
+
+
 # One correlation interval, in milliseconds.
 #
 # !!! DO NOT CHANGE THIS. !!!
@@ -379,7 +457,7 @@ class SignalTrackingOutputs:
     makes it impossible to silently broadcast one component across all columns.
     """
 
-    def __init__(self, capacity: int, num_components: int = 1):
+    def __init__(self, capacity: int, num_components: int = 1, cn0_capacity: int = 0):
         self.capacity = capacity
         self.num_components = num_components
         self.uptime_epoch_ms = np.zeros(capacity, dtype=float)
@@ -399,6 +477,14 @@ class SignalTrackingOutputs:
         self.pll_mode = np.zeros(capacity, dtype=bool)
         self.output_index = 0
 
+        # C/N0 lands on its own cadence -- one estimate per hop of correlation
+        # intervals, not one per epoch -- so it gets its own arrays and its own
+        # index rather than being forced onto the epoch axis.
+        self.cn0_capacity = cn0_capacity
+        self.cn0_dbhz = np.zeros((cn0_capacity, num_components), dtype=float)
+        self.cn0_uptime_ms = np.zeros(cn0_capacity, dtype=float)
+        self.cn0_index = 0
+
     @property
     def valid(self) -> slice:
         """
@@ -408,6 +494,11 @@ class SignalTrackingOutputs:
         (0, 0) if plotted unsliced.
         """
         return slice(0, self.output_index)
+
+    @property
+    def cn0_valid(self) -> slice:
+        """Slice covering only the C/N0 estimates actually written."""
+        return slice(0, self.cn0_index)
 
 
 @dataclass
@@ -559,6 +650,7 @@ class TrackingChannel:
         synced_policy: LoopDiscriminatorPolicy | None = None,
         synced_coherent_duration_ms: int = CORRELATION_INTERVAL_MS,
         initial_overlay_counter: int | None = None,
+        cn0_params: CN0EstimatorParameters | None = None,
     ) -> None:
         self.loop_params = loop_params
         self.signal_params = signal_params
@@ -574,8 +666,30 @@ class TrackingChannel:
 
         self.signal_state = initial_signal_state
         self.loop_state = TrackingLoopState(mode=TrackingLoopMode.FLL)
+        # --- C/N0 estimator ---------------------------------------------------
+        # Sized from the epoch budget: output_capacity epochs of the *initial*
+        # coherent duration is the run length in ms, and a channel that later
+        # extends covers the same wall time in fewer epochs, so this stays an
+        # over-estimate rather than truncating the record.
+        self.cn0_params = cn0_params if cn0_params is not None else CN0EstimatorParameters()
+        run_duration_ms = output_capacity * loop_params.coherent_duration_ms
+        cn0_capacity = (
+            run_duration_ms // self.cn0_params.hop_ms + 2 if self.cn0_params.enabled else 0
+        )
+        # One correlation interval per slot; filled before the epoch machinery
+        # touches anything, so the samples are always CORRELATION_INTERVAL_MS long
+        # whatever the coherent duration happens to be.
+        self._cn0_power = np.zeros(
+            (self.cn0_params.period_ms, num_components), dtype=float
+        )
+        self._cn0_fill = 0          # how many slots hold real data yet
+        self._cn0_write = 0         # ring write position
+        self._cn0_since_estimate = 0
+
         self.outputs = SignalTrackingOutputs(
-            capacity=output_capacity, num_components=num_components
+            capacity=output_capacity,
+            num_components=num_components,
+            cn0_capacity=cn0_capacity,
         )
 
         if correlator_config is None:
@@ -934,6 +1048,47 @@ class TrackingChannel:
         # still picks it up.  It is a no-op once applied.
         self._maybe_extend_coherent_duration()
 
+    def _record_interval_for_cn0(self) -> None:
+        """
+        Feed one correlation interval's prompt power to the C/N0 estimator.
+
+        Called at the very top of `_complete_interval`, which is deliberate on two
+        counts.  It runs before `fold()`, so the sample is one raw interval and is
+        unaffected by `coherent_duration_ms` -- the estimate's integration time has
+        to be the interval, not the epoch.  And it runs before the epoch-anchoring
+        return, because an interval dropped while waiting for a symbol boundary is
+        a perfectly good correlation; it is discarded for epoch-tiling reasons, and
+        excluding it would punch a hole in the C/N0 record at the start of every
+        channel.
+        """
+        params = self.cn0_params
+        if not params.enabled or self.outputs.cn0_capacity == 0:
+            return
+
+        # Prompt is delay tap 1; every component, since magnitude costs nothing to
+        # keep and comparing I against Q is the point.
+        prompt = self.correlator.corr_grid[1, 0, :]
+        self._cn0_power[self._cn0_write] = np.abs(prompt) ** 2
+        self._cn0_write = (self._cn0_write + 1) % params.period_ms
+        self._cn0_fill = min(self._cn0_fill + 1, params.period_ms)
+        self._cn0_since_estimate += 1
+
+        if self._cn0_fill < params.period_ms or self._cn0_since_estimate < params.hop_ms:
+            return
+        self._cn0_since_estimate = 0
+
+        idx = self.outputs.cn0_index
+        if idx >= self.outputs.cn0_capacity:
+            return
+        integration_time_s = CORRELATION_INTERVAL_MS * 1e-3
+        for component in range(self.outputs.num_components):
+            self.outputs.cn0_dbhz[idx, component] = estimate_cn0_vsm(
+                self._cn0_power[:, component], integration_time_s
+            )
+        # Stamped at the end of the window the estimate covers.
+        self.outputs.cn0_uptime_ms[idx] = self.signal_state.uptime_epoch_ms
+        self.outputs.cn0_index += 1
+
     def _complete_interval(self) -> None:
         """
         Fold one finished correlation interval into the epoch, and run the loop
@@ -945,6 +1100,8 @@ class TrackingChannel:
         intervals here.  A signal with no overlay folds with unit signs and an
         epoch of one interval, which is arithmetically the old behaviour.
         """
+        self._record_interval_for_cn0()
+
         if self.overlay_sync is None:
             signs = self._unit_signs
         else:

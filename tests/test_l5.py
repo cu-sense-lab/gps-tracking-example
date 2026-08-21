@@ -880,6 +880,75 @@ def test_changing_epoch_length_lands_on_a_symbol_boundary():
     assert openings[changed][0] % symbol_ms == 0
 
 
+def _track_for_cn0(coherent_duration_ms, buffers=6, buffer_ms=50, period_ms=100):
+    """Track a synthetic L5 signal with the C/N0 estimator running."""
+    from utils import sample_streaming, tracking_channel
+
+    channel = _seeded_channel(CORRECT_SEEDED_COUNTER, code_phase_ms=0.31)
+    channel.cn0_params = tracking_channel.CN0EstimatorParameters(
+        period_ms=period_ms, overlap_fraction=0.5
+    )
+    channel.coherent_duration_ms = coherent_duration_ms
+    channel._synced_coherent_duration_ms = coherent_duration_ms  # keep the epoch fixed
+    channel.loop_params = tracking_channel.TrackingLoopParameters(
+        DLL_bandwidth_hz=2.0, PLL_bandwidth_hz=20.0, FLL_bandwidth_hz=50.0,
+        coherent_duration_ms=coherent_duration_ms, EPL_chip_spacing=0.5,
+    )
+    channel._epoch_grid_anchored = False
+    channel._cn0_power = np.zeros((period_ms, channel.outputs.num_components))
+    channel._cn0_fill = channel._cn0_write = channel._cn0_since_estimate = 0
+    channel.outputs.cn0_capacity = 64
+    channel.outputs.cn0_dbhz = np.zeros((64, channel.outputs.num_components))
+    channel.outputs.cn0_uptime_ms = np.zeros(64)
+    channel.outputs.cn0_index = 0
+    _drive(channel, code_phase_ms=0.31, buffers=buffers, buffer_ms=buffer_ms)
+    return channel
+
+
+def test_cn0_input_is_one_interval_regardless_of_coherent_duration():
+    """
+    The requirement the whole feature exists for.  C/N0 is a density, so its
+    samples must be one correlation interval long whatever the epoch is; if the
+    estimator were fed epochs, the count would fall with the epoch length and the
+    reported dB-Hz would be wrong by that factor.
+    """
+    short = _track_for_cn0(1)
+    long = _track_for_cn0(5)
+
+    assert long.outputs.output_index < short.outputs.output_index, (
+        "5 ms epochs should produce fewer epochs than 1 ms ones -- otherwise this "
+        "test is not exercising what it claims"
+    )
+    assert short.outputs.cn0_index == long.outputs.cn0_index, (
+        f"C/N0 estimate count must follow duration, not epochs: "
+        f"{short.outputs.cn0_index} at 1 ms vs {long.outputs.cn0_index} at 5 ms"
+    )
+    assert short.outputs.cn0_index > 0
+
+
+def test_cn0_estimates_arrive_on_the_configured_hop():
+    channel = _track_for_cn0(1, period_ms=100)
+    stamps = channel.outputs.cn0_uptime_ms[channel.outputs.cn0_valid]
+    assert len(stamps) >= 3
+    # 50% overlap of a 100-interval window -> one estimate per 50 ms.
+    assert np.allclose(np.diff(stamps), 50.0, atol=1.0)
+
+
+def test_cn0_counts_intervals_dropped_by_epoch_anchoring():
+    """
+    A grid waiting for a symbol boundary discards intervals for tiling reasons, not
+    because they are bad correlations.  Excluding them would delay the first
+    estimate and put a hole at the start of every channel.
+    """
+    channel = _track_for_cn0(5, period_ms=100)
+    stamps = channel.outputs.cn0_uptime_ms[channel.outputs.cn0_valid]
+    assert len(stamps) > 0
+    # Seeded at 0.31 ms the first interval is at 1 ms and the 5 ms grid waits for
+    # code phase 10; those 9 intervals still feed the estimator, so the first
+    # estimate lands one window after tracking starts, not one window after 10 ms.
+    assert stamps[0] < 115.0, f"first estimate at {stamps[0]} ms is too late"
+
+
 def test_seeded_overlay_starts_synced_without_extending():
     """
     Wipe-off and coherent extension are separate concerns, and only the first is

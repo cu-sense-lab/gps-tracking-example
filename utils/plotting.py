@@ -847,14 +847,25 @@ def plot_code_delay_and_doppler(
     return ax
 
 
+# Minimum height of the C/N0 axis, in dB.  A locked channel's C/N0 varies by about
+# a dB, and letting matplotlib autoscale to that makes estimator noise look like a
+# fading signal.  Ten dB is wide enough that flat reads as flat and a real fade
+# still shows.
+MIN_CN0_AXIS_SPAN_DB = 10.0
+
+
 def plot_prompt_circ_length(
     fig: Figure | SubFigure,
     adapter: "TrackingChannelAdapter",
     sig_id: str,
     title: Optional[str] = None,
+    component: Optional[int] = None,
 ) -> Axes:
     """
-    Prompt circular length per epoch, coloured by which carrier loop was running.
+    Prompt circular length and VSM C/N0 -- two quantities on one pair of axes,
+    despite what the name says: coherence on the left, C/N0 in dB-Hz on the right.
+
+    Circular length per epoch, coloured by which carrier loop was running.
 
     Circular length is the coherence of the recent prompt history: the magnitude of
     the mean unit phasor, wrapped for Costas where the policy says so.  It is ~1
@@ -884,6 +895,14 @@ def plot_prompt_circ_length(
     so the FLL runs for exactly `history_size` epochs and then hands over.  A
     channel that never leaves FLL never locked at all, and one sagging back towards
     the threshold later in a run is about to lose lock.
+
+    **C/N0** comes from `estimate_cn0_vsm` over correlation intervals, on a far
+    slower cadence than the epochs -- one point per hop of the estimator's window,
+    so a run shorter than a couple of periods shows almost nothing.  It is drawn
+    for one component, the carrier loop's by default; pass `component` to compare
+    I against Q.  Unlike the coherence trace it should be flat for a locked
+    channel: it measures how much signal is arriving, not how well the loop holds
+    phase, so it does *not* dip at the FLL/PLL handover.
     """
     outputs = adapter.outputs
     valid = outputs.valid
@@ -909,9 +928,38 @@ def plot_prompt_circ_length(
                     rotation=90, va="center", fontsize=8)
 
     ax.set_ylim(0, 1.05)
-    ax.set_ylabel("Prompt circular length")
+    ax.set_ylabel("Prompt circular length", color="tab:blue")
+    ax.tick_params(axis="y", labelcolor="tab:blue")
     ax.set_xlabel("Uptime [s]")
     ax.set_title(title if title is not None else f"Carrier loop coherence: {sig_id}")
     ax.grid(True)
-    ax.legend(markerscale=4, loc="lower right", fontsize=8)
+    handles = ax.get_legend_handles_labels()[0]
+
+    # C/N0 on its own axis, and its own much slower cadence.
+    if component is None:
+        component = adapter.channel.policy.carrier_component
+    cn0_slice = outputs.cn0_valid
+    if cn0_slice.stop > 0:
+        name = adapter.signal.component_names[component]
+        ax_cn0 = ax.twinx()
+        line, = ax_cn0.plot(
+            outputs.cn0_uptime_ms[cn0_slice] * 1e-3,
+            outputs.cn0_dbhz[cn0_slice, component],
+            marker="o", markersize=4, lw=1.5, color="tab:green",
+            label=f"C/N0 ({name})",
+        )
+        ax_cn0.set_ylabel("C/N0 [dB-Hz]", color="tab:green")
+        ax_cn0.tick_params(axis="y", labelcolor="tab:green")
+
+        # Hold a minimum span, or autoscale magnifies a steady channel's ~1 dB of
+        # estimator noise to fill the axis and it reads as a dramatic swing.
+        values = outputs.cn0_dbhz[cn0_slice, component]
+        finite = values[np.isfinite(values)]
+        if finite.size:
+            centre = 0.5 * (finite.min() + finite.max())
+            half_span = max(0.5 * (finite.max() - finite.min()) * 1.2, MIN_CN0_AXIS_SPAN_DB / 2)
+            ax_cn0.set_ylim(centre - half_span, centre + half_span)
+        handles.append(line)
+
+    ax.legend(handles=handles, markerscale=4, loc="lower right", fontsize=8)
     return ax

@@ -629,6 +629,7 @@ def create_tracking_channels(
     start_mode_pll: bool = False,
     ambiguity_resolutions: dict[str, ambiguity_resolution.AmbiguityResolution]
     | None = None,
+    cn0_params: tracking_channel.CN0EstimatorParameters | None = None,
 ) -> dict[str, TrackingChannelAdapter]:
     tracking_policy = TRACKING_POLICIES[signal_type.signal_type_id]
     channels: dict[str, TrackingChannelAdapter] = {}
@@ -713,6 +714,7 @@ def create_tracking_channels(
             discriminator_policy=discriminator_policy,
             synced_policy=tracking_policy.synced_discriminator_policy,
             synced_coherent_duration_ms=tracking_policy.synced_coherent_duration_ms,
+            cn0_params=cn0_params,
             initial_overlay_counter=initial_overlay_counter,
         )
 
