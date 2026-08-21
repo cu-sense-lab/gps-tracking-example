@@ -353,13 +353,22 @@ def plot_acquisition_dwell_layout(
     Left panel -- the dwell in time.  `num_blocks` coherent blocks of
     `coherent_duration_sample_ms` are taken back to back from the stream, and each
     is zero-padded out to `coherent_duration_replica_ms` before its FFT (the
-    correlation is circular, so the FFT length is the replica length).  If
-    `symbol_period_ms` is given, data symbol boundaries are drawn: a sign flip
-    *between* blocks is harmless because the blocks are combined by square law,
-    but one *inside* a block cancels part of that block's own integration.
-    `symbol_phase_ms` offsets that boundary grid: acquisition does not know the
-    symbol alignment, so the realistic picture is an arbitrary offset, and keeping
-    blocks short is what bounds the damage whatever the offset turns out to be.
+    correlation is circular, so the FFT length is the replica length).
+
+    Each block sits at the offset it actually occupied within the code period --
+    block `j` at `j * T_coherent` modulo `T_replica`, wrapping if it straddles the
+    end -- not at the start of its window.  That is what `pack_coherent_blocks`
+    does, and it is what makes the square-law sum accumulate: block `j` was
+    received after the code had already advanced that far, so padding every block
+    at position 0 would leave each peak at a different lag and smear the sum
+    across the code phase axis instead of stacking it.
+
+    If `symbol_period_ms` is given, data symbol boundaries are drawn across the
+    window.  A sign flip *between* blocks is harmless because the blocks are
+    combined by square law; one *inside* a block cancels part of that block's own
+    integration.  `symbol_phase_ms` offsets that grid: acquisition does not know
+    the symbol alignment, so the realistic picture is an arbitrary offset, and
+    keeping blocks short is what bounds the damage whatever it turns out to be.
 
     Right panel -- the same two lengths in frequency.  Grid ticks are the Doppler
     bins the FFT actually produces, spaced `1 / T_replica`.  The curve is the
@@ -377,26 +386,26 @@ def plot_acquisition_dwell_layout(
 
     for m in range(num_blocks):
         y = num_blocks - 1 - m
-        ax_time.broken_barh([(0.0, t_coh)], (y - 0.32, 0.64),
+        # Where this block's data actually sits in the window, wrapping if it
+        # straddles the end of the code period.
+        start = (m * t_coh) % t_rep
+        spans = [(start, min(t_coh, t_rep - start))]
+        if start + t_coh > t_rep:
+            spans.append((0.0, start + t_coh - t_rep))
+
+        ax_time.broken_barh([(0.0, t_rep)], (y - 0.32, 0.64),
+                            facecolors="lightgrey", edgecolor="k",
+                            linewidth=0.5, hatch="//")
+        ax_time.broken_barh(spans, (y - 0.32, 0.64),
                             facecolors="tab:blue", edgecolor="k", linewidth=0.5)
-        if t_rep > t_coh:
-            ax_time.broken_barh([(t_coh, t_rep - t_coh)], (y - 0.32, 0.64),
-                                facecolors="lightgrey", edgecolor="k",
-                                linewidth=0.5, hatch="//")
-        ax_time.text(t_coh / 2, y, f"block {m}", ha="center", va="center",
-                     fontsize=8, color="white")
-        if symbol_period_ms:
-            # Symbol boundaries as this block sees them: the block starts at
-            # m * t_coh in the stream, so the grid is offset into the window.
-            k = 0
-            while True:
-                edge = symbol_phase_ms + k * symbol_period_ms - m * t_coh
-                if edge >= t_coh:
-                    break
-                if edge > 0:
-                    ax_time.plot([edge, edge], [y - 0.32, y + 0.32],
-                                 color="tab:red", lw=2)
-                k += 1
+        ax_time.text(spans[0][0] + spans[0][1] / 2, y, f"{m}", ha="center",
+                     va="center", fontsize=8, color="white")
+
+    if symbol_period_ms:
+        # Boundaries are absolute in the window: it is one code period, and the
+        # blocks have been placed back onto their true positions within it.
+        edges = np.arange(symbol_phase_ms % symbol_period_ms, t_rep, symbol_period_ms)
+        ax_time.vlines(edges, -0.5, num_blocks - 0.5, color="tab:red", lw=2, zorder=3)
 
     ax_time.set_yticks(range(num_blocks))
     ax_time.set_yticklabels([f"{num_blocks - 1 - i}" for i in range(num_blocks)])
@@ -568,70 +577,6 @@ def plot_epl_magnitude_and_code_error(
     return axes
 
 
-def plot_tracking_prompt_and_doppler(
-    fig: Figure | SubFigure,
-    adapter: "TrackingChannelAdapter",
-    sig_id: str,
-    title: Optional[str] = None,
-) -> Sequence[Axes]:
-    """
-    The standard "is this channel actually locked?" plot, for one satellite.
-
-    Top panel: the prompt correlator's in-phase (I) and quadrature (Q) values over
-    time, for whichever component the carrier loop is running on (CA for L1 C/A,
-    CM for L2C, the Q pilot for L5). Bottom panel: the Doppler frequency the loop
-    has settled on.
-
-    What locked looks like: all the power sits on I while Q stays clustered around
-    zero -- that is the phase-locked loop doing its job, rotating the signal onto
-    the real axis. Doppler is a smooth, slowly drifting line of a few kHz, changing
-    by only a few Hz per second as the satellite moves.
-
-    How many bands I forms depends on which component the carrier loop is using:
-
-      - A **data-bearing** component (L1 C/A's CA, L2C's CM) shows I in two
-        horizontal bands, one positive and one negative.  The jumps between them
-        are navigation data bits flipping the sign of the signal.
-      - A **dataless pilot** (L5's Q, L2C's CL once resolved) shows I as a single
-        band with no flips at all.  Nothing modulates a pilot, which is exactly
-        why the carrier loop prefers one where it exists.
-
-    What losing lock looks like: I and Q both scatter symmetrically around zero
-    with no visible bands, and Doppler wanders erratically over hundreds or
-    thousands of Hz. A channel that never locked at all looks like this from the
-    start -- usually a false acquisition.
-
-    The carrier component is read from the channel's live policy rather than the
-    signal type's default, because overlay sync can move the carrier loop onto a
-    different component partway through the run (L5 does exactly this).
-    """
-    outputs = adapter.outputs
-    component_names = adapter.signal.component_names
-    carrier_index = adapter.channel.policy.carrier_component
-    carrier_prompt = adapter.get_prompt_component(component=carrier_index)
-
-    # `outputs` pre-allocates output_capacity epochs and fills only the first
-    # `output_index`; `outputs.valid` slices off the unwritten zero tail, which
-    # would otherwise draw a spurious line back to (0, 0).
-    plot_time = outputs.uptime_epoch_ms[outputs.valid] * 1e-3
-    doppler_freq_hz = outputs.doppler_freq_hz[outputs.valid]
-
-    axes = fig.subplots(2, 1, sharex=True)
-    axes[0].scatter(plot_time, carrier_prompt.real, s=2, color="tab:red", label="In-phase")
-    axes[0].scatter(plot_time, carrier_prompt.imag, s=2, color="tab:blue", label="Quadrature")
-    axes[0].set_ylabel(f"Prompt ({component_names[carrier_index]})")
-    axes[0].set_title(title if title is not None else f"Tracking: {sig_id}")
-    axes[0].legend(markerscale=10)
-    axes[0].grid(True)
-
-    axes[1].plot(plot_time, doppler_freq_hz, lw=1.5, color="tab:green")
-    axes[1].set_ylabel("Doppler [Hz]")
-    axes[1].set_xlabel("Uptime [s]")
-    axes[1].grid(True)
-    fig.align_labels()
-    return axes
-
-
 def plot_component_prompt_magnitudes(
     fig: Figure | SubFigure,
     adapter: "TrackingChannelAdapter",
@@ -665,4 +610,164 @@ def plot_component_prompt_magnitudes(
     ax.set_xlabel("Uptime [s]")
     ax.grid(True)
     ax.legend(markerscale=10)
+    return ax
+
+
+def plot_prompt_components(
+    fig: Figure | SubFigure,
+    adapter: "TrackingChannelAdapter",
+    sig_id: str,
+    title: Optional[str] = None,
+) -> Sequence[Axes]:
+    """
+    Prompt correlator output per code component, one row each, in-phase and
+    quadrature together.
+
+    A locked channel puts essentially all of each component's power on *one* axis
+    and leaves the other at zero.  Which axis depends on the component's carrier
+    phase relative to the one the loop is tracking:
+
+      - the component the carrier loop runs on lands on I, because that is what the
+        PLL is driving it to do;
+      - a component transmitted in phase quadrature with it lands on Q.  GPS L5 is
+        exactly this case -- I and Q ride quadrature carriers, and with the loop on
+        the Q pilot the L5I component's power appears in the *imaginary* part;
+      - components sharing a carrier phase (L2C's CM and CL) both land on I.
+
+    How many bands that axis forms says what the component carries: a data
+    component (L1 C/A's CA, L2C's CM, L5's I) splits into a positive and a negative
+    band as navigation symbols flip its sign, while a dataless pilot (L5's Q, L2C's
+    CL once resolved) stays in a single band.
+
+    Loss of lock looks like I and Q both scattered symmetrically about zero.  Since
+    every component shares one epoch, a component whose magnitude collapses on a
+    subset of epochs while its siblings are healthy is straddling its own symbol
+    boundary -- see `utils.tracking_channel`'s epoch anchoring.
+    """
+    outputs = adapter.outputs
+    names = adapter.signal.component_names
+    plot_time = outputs.uptime_epoch_ms[outputs.valid] * 1e-3
+
+    axes = np.atleast_1d(fig.subplots(len(names), 1, sharex=True))
+    for index, name in enumerate(names):
+        prompt = adapter.get_prompt_component(component=index)
+        ax: Axes = axes[index]
+        ax.scatter(plot_time, prompt.real, s=2, color="tab:red", label="In-phase (I)")
+        ax.scatter(plot_time, prompt.imag, s=2, color="tab:blue", label="Quadrature (Q)")
+        ax.axhline(0.0, color="k", lw=0.5)
+        ax.set_ylabel(f"{name}\nPrompt")
+        ax.grid(True)
+    axes[0].set_title(title if title is not None else f"Prompt correlators: {sig_id}")
+    axes[0].legend(markerscale=8, loc="upper right", fontsize=8)
+    axes[-1].set_xlabel("Uptime [s]")
+    fig.align_labels()
+    return axes
+
+
+def plot_code_delay_and_doppler(
+    fig: Figure | SubFigure,
+    adapter: "TrackingChannelAdapter",
+    sig_id: str,
+    title: Optional[str] = None,
+) -> Axes:
+    """
+    Code delay and carrier Doppler on shared axes, as the line-of-sight dynamics.
+
+    Code delay is plotted as the *residual*: the tracked code phase minus the
+    nominal one-millisecond-per-millisecond advance, referenced to the first
+    epoch.  The raw code phase is dominated by that nominal advance and shows
+    nothing; the residual is the part that reflects the satellite actually moving,
+    and is reported in chips (the right-hand axis carries Doppler in Hz).
+
+    The two are related by construction, not independently measured: this tracker
+    slaves the code rate to the carrier, `code_rate = (1 + doppler / f_carrier)`,
+    so the delay residual is the integral of Doppler over the carrier frequency.
+    What the plot is good for is seeing that dynamic directly -- a steady Doppler
+    of a few kHz produces a delay ramp of a fraction of a chip per second -- and
+    seeing both break together when a channel loses lock.
+    """
+    outputs = adapter.outputs
+    valid = outputs.valid
+    plot_time = outputs.uptime_epoch_ms[valid] * 1e-3
+    doppler_freq_hz = outputs.doppler_freq_hz[valid]
+
+    # Code phase accumulates without wrapping, so subtracting elapsed time leaves
+    # only the departure from the nominal rate.
+    residual_ms = outputs.code_phase_ms[valid] - outputs.uptime_epoch_ms[valid]
+    if len(residual_ms):
+        residual_ms = residual_ms - residual_ms[0]
+    residual_chips = residual_ms * 1e-3 * adapter.signal.tracking_code_rate_chips_per_sec
+
+    ax = fig.add_subplot(1, 1, 1)
+    ax.plot(plot_time, residual_chips, color="tab:purple", lw=2, label="Code delay")
+    ax.set_ylabel("Code delay residual [chips]", color="tab:purple")
+    ax.tick_params(axis="y", labelcolor="tab:purple")
+    ax.set_xlabel("Uptime [s]")
+    ax.grid(True)
+
+    ax_doppler = ax.twinx()
+    ax_doppler.plot(plot_time, doppler_freq_hz, color="tab:green", lw=2, label="Doppler")
+    ax_doppler.set_ylabel("Doppler [Hz]", color="tab:green")
+    ax_doppler.tick_params(axis="y", labelcolor="tab:green")
+
+    ax.set_title(title if title is not None else f"Code delay and Doppler: {sig_id}")
+    handles = [
+        plt.Line2D([0], [0], color="tab:purple", lw=2, label="Code delay residual"),
+        plt.Line2D([0], [0], color="tab:green", lw=2, label="Doppler"),
+    ]
+    ax.legend(handles=handles, loc="best", fontsize=8)
+    return ax
+
+
+def plot_prompt_circ_length(
+    fig: Figure | SubFigure,
+    adapter: "TrackingChannelAdapter",
+    sig_id: str,
+    title: Optional[str] = None,
+) -> Axes:
+    """
+    Prompt circular length per epoch, coloured by which carrier loop was running.
+
+    Circular length is the coherence of the recent prompt history: the magnitude of
+    the mean unit phasor, wrapped for Costas where the policy says so.  It is ~1
+    when the prompt phase is steady and falls towards 0 as it scatters, which makes
+    it the statistic the channel uses to decide the FLL has pulled the frequency
+    error in far enough for the PLL to take over.
+
+    Epochs filtered by the FLL and by the PLL are drawn in different colours, with
+    the switching threshold and the handover instant both marked -- on a strong
+    signal the FLL stretch is only a few epochs wide.  Expect a short FLL stretch while the loop
+    pulls in, a crossing of the threshold, then PLL for the rest of the run.
+    Dropping back towards the threshold under PLL is the signature of a channel
+    about to lose lock; a channel that never leaves FLL never locked at all.
+    """
+    outputs = adapter.outputs
+    valid = outputs.valid
+    plot_time = outputs.uptime_epoch_ms[valid] * 1e-3
+    circ_length = outputs.prompt_corr_circ_length[valid]
+    pll = outputs.pll_mode[valid]
+
+    ax = fig.add_subplot(1, 1, 1)
+    ax.scatter(plot_time[~pll], circ_length[~pll], s=4, color="tab:orange", label="FLL")
+    ax.scatter(plot_time[pll], circ_length[pll], s=4, color="tab:blue", label="PLL")
+
+    threshold = adapter.channel.loop_params.prompt_corr_circ_length_threshold
+    ax.axhline(threshold, color="k", ls="--", lw=1.5,
+               label=f"FLL -> PLL threshold ({threshold:g})")
+
+    # On a strong signal the FLL stretch can be only a handful of epochs wide and
+    # all but invisible as scattered points, so mark the handover explicitly.
+    if pll.any() and not pll.all():
+        handover_s = float(plot_time[np.argmax(pll)])
+        ax.axvline(handover_s, color="k", ls=":", lw=1.5)
+        ax.annotate(f"FLL -> PLL at {handover_s:.3f} s",
+                    xy=(handover_s, 0.5), xytext=(6, 0), textcoords="offset points",
+                    rotation=90, va="center", fontsize=8)
+
+    ax.set_ylim(0, 1.05)
+    ax.set_ylabel("Prompt circular length")
+    ax.set_xlabel("Uptime [s]")
+    ax.set_title(title if title is not None else f"Carrier loop coherence: {sig_id}")
+    ax.grid(True)
+    ax.legend(markerscale=4, loc="lower right", fontsize=8)
     return ax

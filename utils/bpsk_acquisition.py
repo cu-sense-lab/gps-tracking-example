@@ -585,10 +585,10 @@ def run_acquisition(
         if print_progress:
             # Doppler and code phase are only meaningful where a peak was actually
             # detected; a dash is honest about the rest being the noise maximum.
-            doppler = f"{acq_result.acq_doppler_hz:+.1f}" if signal_detected else "-"
-            code_phase = f"{acq_result.acq_code_phase_ms:.4f}" if signal_detected else "-"
+            doppler = f"{acq_result.acq_doppler_hz:+.0f}" if signal_detected else "-"
+            code_phase = f"{acq_result.acq_code_phase_ms:.3f}" if signal_detected else "-"
             print(
-                f"  {signal_id:<5} {acq_result.peak_snr_db:9.2f} {doppler:>13} "
+                f"  {signal_id:<5} {acq_result.peak_snr_db:9.1f} {doppler:>13} "
                 f"{code_phase:>22}"
             )
 

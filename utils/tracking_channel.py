@@ -393,6 +393,10 @@ class SignalTrackingOutputs:
         self.code_phase_ms = np.zeros(capacity, dtype=float)
         self.delta_omega = np.zeros(capacity, dtype=float)
         self.prompt_corr_circ_length = np.zeros(capacity, dtype=float)
+        # Which carrier loop actually filtered this epoch.  Recorded because the
+        # FLL->PLL handover is invisible in the correlator outputs alone, and
+        # reading a lock transient correctly means knowing which loop was running.
+        self.pll_mode = np.zeros(capacity, dtype=bool)
         self.output_index = 0
 
     @property
@@ -849,6 +853,10 @@ class TrackingChannel:
         )
 
         filt_code_phase_error_chips = self.loop_params.DLL_filter_coeff * delta_eta
+        # Captured before the branch below, which may switch the mode: the epoch
+        # that triggers the handover is still filtered by the FLL, so that is the
+        # mode this epoch should be logged under.
+        epoch_used_pll = self.loop_state.mode is TrackingLoopMode.PLL
         if self.loop_state.mode == TrackingLoopMode.FLL:
             if (
                 self.loop_state.history_filled
@@ -899,6 +907,7 @@ class TrackingChannel:
             self.outputs.code_phase_ms[idx] = code_phase_ms
             self.outputs.delta_omega[idx] = delta_omega
             self.outputs.prompt_corr_circ_length[idx] = circ_length
+            self.outputs.pll_mode[idx] = epoch_used_pll
             self.outputs.output_index += 1
 
         # ---- prior for the next epoch: the posterior, propagated to its start. ----
