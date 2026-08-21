@@ -611,6 +611,25 @@ class TrackingChannel:
         )
         self.coherent_duration_ms = loop_params.coherent_duration_ms
         self._epoch_interval_count = 0
+
+        # --- epoch grid anchoring --------------------------------------------
+        # Epochs open on a data symbol boundary, so an epoch never straddles one
+        # and epoch zero coincides with symbol zero -- which is what later makes
+        # the symbols demodulable without a separate alignment search.
+        #
+        # The period is the shortest symbol among *all* components, not the one
+        # driving the loops: on L5 the carrier loop runs on the dataless Q pilot,
+        # which has no symbol of its own, while I's 10 ms CNAV symbol is what the
+        # shared epoch has to respect.  A signal that is pilot-only everywhere has
+        # no boundary to find, and falls back to anchoring on the epoch length.
+        symbol_periods = [
+            c.symbol_period_ms
+            for c in signal_params.code_set.components
+            if c.symbol_period_ms is not None
+        ]
+        self._epoch_anchor_period_ms: int | None = min(symbol_periods) if symbol_periods else None
+        # Cleared whenever the epoch length changes, so the new grid re-anchors.
+        self._epoch_grid_anchored = False
         self._unit_signs = np.ones(num_components, dtype=np.int8)
         self._synced_policy = synced_policy
         self._synced_coherent_duration_ms = synced_coherent_duration_ms
@@ -718,33 +737,26 @@ class TrackingChannel:
         if self.loop_state.mode is not TrackingLoopMode.PLL:
             return
 
-        # Start the longer epochs on a code phase that the epoch length divides.
+        # Switch exactly on a symbol boundary, so the longer grid is anchored the
+        # moment it starts.
         #
-        # A single interval is safe wherever it starts, because every period that
-        # matters -- code, data symbol, overlay chip -- is a whole number of
-        # milliseconds and intervals are integer-ms aligned.  An epoch of N
-        # intervals is not: begun at an arbitrary code phase it can span a data
-        # symbol boundary and cancel itself.  Anchoring epoch starts to multiples
-        # of N milliseconds of code phase makes the tiling deterministic and
-        # independent of wherever acquisition happened to land, so an epoch
-        # straddles a boundary only if N genuinely fails to divide that period --
-        # a configuration choice, visible up front, rather than an accident of
-        # code phase.
-        #
-        # For L5 it also lands every epoch on NH20 index 0.
-        #
-        # Costs at most N-1 intervals of delay, once.
-        epoch_ms = self._synced_coherent_duration_ms
+        # Waiting here rather than switching now and dropping intervals until the
+        # boundary is what keeps the transition lossless: the shorter epochs keep
+        # producing output right up to the boundary.  Only a grid with no shorter
+        # length to fall back on -- one configured multi-interval from the start --
+        # has to discard intervals instead (see `_complete_interval`).
+        anchor_ms = self._epoch_anchor_period_ms or self._synced_coherent_duration_ms
         next_interval_code_phase_ms = (
             self.corr_interval.start_code_phase_ms + self.corr_interval.duration_ms
         )
-        if next_interval_code_phase_ms % epoch_ms != 0:
+        if next_interval_code_phase_ms % anchor_ms != 0:
             return
 
         self.coherent_duration_ms = self._synced_coherent_duration_ms
         self.loop_params = self._synced_loop_params
         self.correlator.reset_epoch()
         self._epoch_interval_count = 0
+        self._epoch_grid_anchored = True
 
     def run_loop_filter(self) -> None:
         # Update signal state to reflect parameters at current correlation epoch.
@@ -941,28 +953,52 @@ class TrackingChannel:
             signs = self.overlay_sync.signs(self._overlays)
             self.overlay_sync.advance()
 
-        # Anchor the epoch grid to code phase, not to wherever tracking started.
+        # Open the epoch grid on a data symbol boundary.
         #
-        # `validate_coherent_duration` rejects an epoch length that does not
-        # divide every component's sign period, but divisibility only keeps epochs
-        # inside those boundaries if the grid is *anchored* -- which is what that
-        # function's docstring already assumes.  The seeded code phase is wherever
-        # acquisition landed, so an epoch grid begun there is offset by an
-        # arbitrary number of milliseconds.  On L5 a 5 ms epoch started at code
-        # phase 3 straddles the 10 ms CNAV symbol on every other epoch: I collapses
-        # whenever consecutive symbols differ, while the dataless Q looks perfect.
-        # It also strands `_maybe_extend_coherent_duration`, whose gate is only
-        # reachable from an aligned grid.
+        # `validate_coherent_duration` rejects an epoch length that does not divide
+        # every component's symbol period, but divisibility only keeps epochs
+        # inside those boundaries if the grid is *anchored*.  The seeded code phase
+        # is wherever acquisition landed, so a grid begun there is offset by an
+        # arbitrary number of milliseconds: on L5 a 5 ms epoch started at code
+        # phase 3 crosses the 10 ms CNAV symbol on every other epoch, and I
+        # collapses whenever consecutive symbols differ while the dataless Q looks
+        # perfect.
         #
-        # So open the epoch on the first interval whose code phase the epoch length
-        # divides, and drop the intervals before it.  Costs at most N-1 intervals,
-        # once.  The caller resets the interval grid immediately after this returns,
-        # and the epoch accumulator is already empty whenever the count is zero.
-        if (
-            self._epoch_interval_count == 0
-            and self.corr_interval.start_code_phase_ms % self.coherent_duration_ms
-        ):
-            return
+        # Anchoring on the symbol period rather than merely on the epoch length is
+        # the stronger choice, and it is deliberate: both avoid straddling, but
+        # only this one makes epoch zero coincide with symbol zero, so the symbols
+        # can later be read off the epoch index without a separate search.
+        #
+        # Anchoring happens once per grid -- at construction and again after every
+        # change of epoch length -- not at every epoch.  Once the first epoch is on
+        # a boundary, the epoch length divides the symbol period and the tiling
+        # stays on it.  Intervals before the boundary are dropped: at most
+        # `symbol_period - 1` of them, once.  The caller resets the interval grid
+        # immediately after this returns, and the epoch accumulator is already
+        # empty whenever the interval count is zero.
+        #
+        # A caveat worth stating: this locates the boundary in *code phase*, so it
+        # is a true symbol boundary only for a signal whose acquisition recovers
+        # symbol phase -- L5 via the NH20 counter, L2C via CM's 20 ms period.  GPS
+        # L1 C/A carries no symbol phase in its 1 ms code, so its grid is anchored
+        # deterministically but arbitrarily, and real bit synchronisation remains a
+        # separate step this repository does not implement.
+        # A single-interval epoch is exempt: it cannot straddle anything, because
+        # every period that matters is a whole number of milliseconds and intervals
+        # are integer-ms aligned.  Waiting for a boundary would only throw away
+        # intervals, and symbol alignment is still recoverable afterwards since
+        # every symbol boundary is also an epoch boundary.  So the wait here only
+        # ever applies to a channel configured multi-interval from construction:
+        # the post-lock extension anchors by waiting at the shorter length instead
+        # (see `_maybe_extend_coherent_duration`), which discards nothing.
+        if not self._epoch_grid_anchored:
+            if self.coherent_duration_ms <= CORRELATION_INTERVAL_MS:
+                self._epoch_grid_anchored = True
+            else:
+                anchor_ms = self._epoch_anchor_period_ms or self.coherent_duration_ms
+                if self.corr_interval.start_code_phase_ms % anchor_ms:
+                    return
+                self._epoch_grid_anchored = True
 
         self.correlator.fold(signs)
         self._epoch_interval_count += 1

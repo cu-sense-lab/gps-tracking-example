@@ -398,6 +398,10 @@ def run_acquisition(
     prob_false_alarm_per_cell = -np.expm1(
         np.log1p(-prob_false_alarm_total) / num_detection_cells
     )
+    # The threshold depends only on the per-cell rate and the number of blocks, so
+    # it is one number for the whole sweep rather than a per-signal quantity.
+    detection_threshold = float(scipy.stats.chi2(df=2 * M).isf(prob_false_alarm_per_cell))
+    threshold_db = 10.0 * np.log10(detection_threshold / (2 * M))
     # Compute conjugated FFT of blocks, once per sub-bin Doppler hypothesis.
     # Blocks are combined non-coherently below, so applying the same phase ramp
     # from the start of each block (rather than from the start of the capture) is
@@ -416,10 +420,24 @@ def run_acquisition(
         conj_sample_ffts.append(np.conj(np.fft.fft(shifted_samples, axis=1)))
         sub_bin_offsets_hz.append(offset_hz)
 
-    for signal_id, code_params in code_parameters.items():
+    if print_progress:
+        # The code period is what code phase is ambiguous over; state it in the
+        # header when every signal shares one, rather than on every row.
+        code_periods_ms = {
+            1e3 * p.length_chips / p.rate_chips_per_sec for p in code_parameters.values()
+        }
+        ambiguity = (
+            f", mod {code_periods_ms.pop():g}" if len(code_periods_ms) == 1 else ""
+        )
+        print(
+            f"Detection threshold: {threshold_db:.2f} dB above noise "
+            f"(p_fa {prob_false_alarm_total:g} over {num_detection_cells:,} cells/PRN)"
+        )
+        print()
+        print(f"  {'PRN':<5} {'SNR [dB]':>9} {'Doppler [Hz]':>13} {'Code phase [ms' + ambiguity + ']':>22}")
+        print(f"  {'-' * 5} {'-' * 9} {'-' * 13} {'-' * 22}")
 
-        if print_progress:
-            print(f"  {signal_id}: ", end="")
+    for signal_id, code_params in code_parameters.items():
 
         # The correlation is circular, so the replica's wraparound is only the
         # code's own periodic extension if the replica spans a whole number of code
@@ -515,8 +533,6 @@ def run_acquisition(
             raise ValueError(f"Unknown noise_var_method: {noise_var_method}")
 
         normalized_peak_value = peak_val / noise_var
-        chi2 = scipy.stats.chi2(df=2 * M)
-        detection_threshold = chi2.isf(prob_false_alarm_per_cell)
         signal_detected = normalized_peak_value > detection_threshold
 
         # The reported Doppler axis belongs to the winning pass, so it carries the
@@ -567,17 +583,13 @@ def run_acquisition(
         acquisition_results[signal_id] = acq_result
 
         if print_progress:
-            line = (
-                f"{acq_result.peak_snr_db:6.2f} dB "
-                f"(threshold {acq_result.detection_threshold_db:5.2f} dB)"
+            # Doppler and code phase are only meaningful where a peak was actually
+            # detected; a dash is honest about the rest being the noise maximum.
+            doppler = f"{acq_result.acq_doppler_hz:+.1f}" if signal_detected else "-"
+            code_phase = f"{acq_result.acq_code_phase_ms:.4f}" if signal_detected else "-"
+            print(
+                f"  {signal_id:<5} {acq_result.peak_snr_db:9.2f} {doppler:>13} "
+                f"{code_phase:>22}"
             )
-            if signal_detected:
-                line += (
-                    f"  ACQUIRED"
-                    f"  Doppler {acq_result.acq_doppler_hz:+9.1f} Hz"
-                    f"  code phase {acq_result.acq_code_phase_ms:8.4f} ms"
-                    f" (mod {acq_result.code_phase_ambiguity_ms:g} ms)"
-                )
-            print(line)
 
     return acquisition_results

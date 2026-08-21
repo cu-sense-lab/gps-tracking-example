@@ -687,6 +687,101 @@ def _drive(channel, doppler_hz=1500.0, code_phase_ms=0.31, buffers=14, buffer_ms
 # ceil(0.31) = 1 ms.
 CORRECT_SEEDED_COUNTER = 1
 
+# Seeded at 2.34 ms the first interval is ceil(2.34) = 3 ms, so NH20 index 3.
+CORRECT_SEEDED_COUNTER_234 = 3
+
+
+def _record_epoch_openings(channel):
+    """Log the code phase at which each epoch's first interval opens."""
+    openings = []
+    original = channel._complete_interval
+
+    def wrapped():
+        opening = channel._epoch_interval_count == 0
+        before = channel._epoch_grid_anchored
+        code_phase_ms = channel.corr_interval.start_code_phase_ms
+        original()
+        # An interval dropped while waiting for the anchor leaves the count at 0
+        # and the flag still clear; a real opening either anchors or continues an
+        # already-anchored grid.
+        if opening and channel._epoch_interval_count == 1:
+            openings.append((code_phase_ms, before))
+
+    channel._complete_interval = wrapped
+    return openings
+
+
+def test_epochs_open_on_a_symbol_boundary_not_on_the_seeded_code_phase():
+    """
+    Acquisition seeds an arbitrary code phase, so an epoch grid begun there is
+    offset by an arbitrary number of milliseconds and straddles L5 I's 10 ms CNAV
+    symbol.  Anchoring on the symbol period -- rather than merely on the epoch
+    length, which would also avoid straddling -- additionally puts epoch zero on
+    symbol zero, so symbols can later be read off the epoch index.
+
+    Seeded at 2.34 ms with 5 ms epochs: intervals run 3, 4, ... and the first
+    epoch opens at 10 ms, not at 3 ms and not at 5 ms.
+    """
+    from utils import tracking_channel
+
+    channel = _seeded_channel(CORRECT_SEEDED_COUNTER_234, code_phase_ms=2.34)
+    channel.coherent_duration_ms = 5
+    channel.loop_params = tracking_channel.TrackingLoopParameters(
+        DLL_bandwidth_hz=2.0, PLL_bandwidth_hz=20.0, FLL_bandwidth_hz=50.0,
+        coherent_duration_ms=5, EPL_chip_spacing=0.5,
+    )
+    channel._epoch_grid_anchored = False
+    openings = _record_epoch_openings(channel)
+
+    _drive(channel, code_phase_ms=2.34, buffers=4)
+
+    assert openings, "no epoch ever opened"
+    symbol_ms = channel._epoch_anchor_period_ms
+    assert symbol_ms == 10, "L5's shortest symbol is I's 10 ms CNAV symbol"
+
+    first_code_phase, was_anchored = openings[0]
+    assert not was_anchored, "the first opening should be the one that anchors the grid"
+    assert first_code_phase % symbol_ms == 0, (
+        f"first epoch opened at code phase {first_code_phase} ms, "
+        f"which is not a multiple of the {symbol_ms} ms symbol period"
+    )
+    assert first_code_phase == 10, (
+        f"expected the first epoch at 10 ms (seed 2.34 -> intervals from 3), "
+        f"got {first_code_phase}"
+    )
+    # Every later epoch stays on the lattice.  The channel may extend from 5 ms to
+    # 10 ms part-way through, and both grids are anchored at multiples of 10, so
+    # every opening is a multiple of the shorter epoch length either way.
+    assert all(code_phase % 5 == 0 for code_phase, _ in openings), (
+        f"an epoch opened off the 5 ms lattice: {openings}"
+    )
+    assert all(not was_anchored_before for _, was_anchored_before in openings[:1])
+
+
+def test_changing_epoch_length_lands_on_a_symbol_boundary():
+    """
+    The post-lock extension must not simply continue from wherever the shorter
+    epochs happened to end, or the longer grid inherits the offset anchoring exists
+    to remove.  It waits at the shorter length instead of switching and discarding
+    intervals, so the transition costs no output.
+    """
+    channel = _seeded_channel(CORRECT_SEEDED_COUNTER_234, code_phase_ms=2.34)
+    openings = _record_epoch_openings(channel)
+
+    _drive(channel, code_phase_ms=2.34, buffers=14)
+
+    assert channel.coherent_duration_ms > 1, "expected the channel to extend"
+    symbol_ms = channel._epoch_anchor_period_ms
+    # Find the first opening after the length changed: spacing jumps to the new
+    # epoch length, and that opening must sit on a symbol boundary.
+    spacings = [b - a for (a, _), (b, _) in zip(openings, openings[1:])]
+    changed = next(
+        (i for i, gap in enumerate(spacings) if gap == channel.coherent_duration_ms),
+        None,
+    )
+    assert changed is not None, "never saw the extended epoch cadence"
+    assert openings[changed][0] % symbol_ms == 0
+
 
 def test_seeded_overlay_starts_synced_without_extending():
     """
