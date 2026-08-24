@@ -521,9 +521,14 @@ class CN0EstimatorParameters:
 # It is not a tuning knob, and nothing in the repository is correct at any other
 # value.  Three separate things depend on it being 1:
 #
-#   1. It is the granularity at which a sign can be applied.  An overlay chip
-#      lasts one primary code period -- 1 ms for L1 C/A, L2C and L5 alike -- so a
-#      longer interval would span an overlay flip and cancel itself.
+#   1. It is the granularity at which a wipe-off sign can be applied, so it must
+#      DIVIDE the overlay chip -- one primary code period -- or an interval would
+#      span a sign flip and cancel itself.  It need not equal it: L5's period is
+#      1 ms and L1C's is 10 ms, and the channel folds ten intervals per overlay
+#      chip on L1C (see `_intervals_per_primary_period`).  Assuming equality was a
+#      real defect, and one that hid for a long time because L5 was the only
+#      signal with an overlay and the two coincide there.  L2C's period is 20 ms
+#      and always was -- it simply has no overlay for the mismatch to show up in.
 #   2. Interval boundaries land on integer milliseconds of code phase, and every
 #      period that matters (code, data symbol, overlay chip) is a whole number of
 #      milliseconds.  That is what guarantees no interval straddles a boundary,
