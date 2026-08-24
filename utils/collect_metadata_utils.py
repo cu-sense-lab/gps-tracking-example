@@ -220,6 +220,19 @@ class ResolvedCollect:
     sample_params: SampleParameters
     inter_freq_hz: Optional[float]
 
+    def __repr__(self) -> str:
+        return (
+            f"ResolvedCollect(\n"
+            f"  experiment_name={self.experiment_name!r},\n"
+            f"  collect_id={self.collect_id!r},\n"
+            f"  band_id={self.band_id!r},\n"
+            f"  collect_filepath={self.collect_filepath!r},\n"
+            f"  samp_rate={self.samp_rate!r},\n"
+            f"  sample_params={self.sample_params!r},\n"
+            f"  inter_freq_hz={self.inter_freq_hz!r},\n"
+            f")"
+        )
+
 
 def resolve_collect(
     collects_dir: Path,

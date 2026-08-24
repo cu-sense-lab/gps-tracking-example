@@ -18,16 +18,16 @@ def setup_default_plotting():
     plt.rcParams.update({
         'figure.dpi': 150,
         'figure.figsize': (10, 6),
-        'axes.titlesize': 16,
-        'axes.labelsize': 14,
-        'xtick.labelsize': 12,
-        'ytick.labelsize': 12,
-        'legend.fontsize': 12,
-        'grid.color': 'gray',
-        'grid.linestyle': '--',
-        'grid.linewidth': 0.5,
-        'lines.linewidth': 2,
-        'lines.markersize': 6
+        # 'axes.titlesize': 16,
+        # 'axes.labelsize': 14,
+        # 'xtick.labelsize': 12,
+        # 'ytick.labelsize': 12,
+        # 'legend.fontsize': 12,
+        # 'grid.color': 'gray',
+        # 'grid.linestyle': '--',
+        # 'grid.linewidth': 0.5,
+        # 'lines.linewidth': 2,
+        # 'lines.markersize': 6
     })
 
 
