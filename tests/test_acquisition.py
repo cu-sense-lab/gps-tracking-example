@@ -41,7 +41,7 @@ CODE_PHASE_MS = 0.61
 
 def _config(**overrides) -> bpsk_acq.AcquisitionConfiguration:
     params = dict(
-        replica_duration_ms=20,
+        coherent_duration_replica_ms=20,
         num_blocks=1,
         sample_rate=FS,
         min_search_doppler_hz=-2000,
@@ -113,7 +113,7 @@ def test_packing_rejects_a_short_sample_block():
 
 def test_coherent_defaults_to_the_replica_length():
     config = _config()
-    assert config.coherent_duration_ms == 20.0
+    assert config.coherent_duration_sample_ms == 20.0
     assert config.coherent_length_samples == config.replica_length_samples
     assert config.doppler_response_width_hz == pytest.approx(config.fft_resolution)
 
@@ -124,7 +124,7 @@ def test_short_coherent_gives_a_grid_finer_than_the_response():
     length.  Separating them is what leaves the Doppler grid 4x oversampled, so
     the residual error stays grid-limited rather than mainlobe-limited.
     """
-    config = _config(coherent_duration_ms=5.0, num_blocks=4)
+    config = _config(coherent_duration_sample_ms=5.0, num_blocks=4)
     assert config.fft_resolution == pytest.approx(50.0)
     assert config.doppler_response_width_hz == pytest.approx(200.0)
     # Same dwell as one 20 ms block, so the two are directly comparable.
@@ -133,12 +133,12 @@ def test_short_coherent_gives_a_grid_finer_than_the_response():
 
 def test_coherent_longer_than_the_replica_is_rejected():
     with pytest.raises(ValueError, match="coherent <= replica"):
-        _config(coherent_duration_ms=25.0)
+        _config(coherent_duration_sample_ms=25.0)
 
 
 def test_coherent_shorter_than_a_sample_is_rejected():
     with pytest.raises(ValueError, match="shorter than one sample"):
-        _config(coherent_duration_ms=1e-6)
+        _config(coherent_duration_sample_ms=1e-6)
 
 
 # --------------------------------------------------------------------------
@@ -146,7 +146,7 @@ def test_coherent_shorter_than_a_sample_is_rejected():
 # --------------------------------------------------------------------------
 
 def _acquire(start_sec, noise_sigma, *, coherent=None, num_blocks=1, seed=7):
-    config = _config(coherent_duration_ms=coherent, num_blocks=num_blocks)
+    config = _config(coherent_duration_sample_ms=coherent, num_blocks=num_blocks)
     samples = synthetic.generate_l2c_samples(
         prn=PRN,
         start_sec=start_sec,

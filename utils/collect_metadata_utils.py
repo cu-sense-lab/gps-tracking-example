@@ -9,14 +9,15 @@ from .sample_streaming import SampleParameters
 @dataclass
 class BandConfiguration:
     center_freq: float
-    inter_freq: Optional[float] = None
+    # 0.0 means the recording is already centred on this band (see notebook 00).
+    inter_freq: float = 0.0
 
     @staticmethod
     def from_dict(band_dict: Dict[str, Any]) -> "BandConfiguration":
         if "center_freq" not in band_dict:
             raise ValueError("Band configuration dictionary must contain 'center_freq' key.")
         center_freq = band_dict["center_freq"]
-        inter_freq = band_dict.get("inter_freq")
+        inter_freq = band_dict.get("inter_freq", 0.0)
         return BandConfiguration(center_freq=center_freq, inter_freq=inter_freq)
 
 @dataclass
@@ -182,12 +183,12 @@ def print_experiment_available_collects_and_bands(metadata: ExperimentMetadata, 
         band_ids = metadata.channel_configurations[channel_config_id].band_ids
         print(print_prefix + f"  {collect_id}: " + " ".join(band_ids))
 
-def load_experiment_metadata_from_file(metadata_filepath: str, print_summary: bool = False, print_prefix: str = "", verbose_parsing: bool = False) -> ExperimentMetadata:
+def load_experiment_metadata_from_file(metadata_filepath: str | Path, print_summary: bool = False, print_prefix: str = "", verbose_parsing: bool = False) -> ExperimentMetadata:
     """
     Load the experiment metadata from a YAML file.
 
     Args:
-        metadata_filepath (str): The file path to the metadata YAML file.
+        metadata_filepath (str | Path): The file path to the metadata YAML file.
     Returns:
         ExperimentMetadata: The parsed experiment metadata.
     """
@@ -218,7 +219,7 @@ class ResolvedCollect:
     collect_filepath: Path
     samp_rate: float
     sample_params: SampleParameters
-    inter_freq_hz: Optional[float]
+    inter_freq_hz: float
 
 
 def resolve_collect(

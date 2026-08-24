@@ -176,7 +176,7 @@ class GpsL1CA(Signal):
         code = (1 - 2 * gps_l1ca.get_GPS_L1CA_code_sequence(prn)).astype(np.int8)
         return [
             CodeComponent(
-                name="CA", sequence=code, branch=Branch.Q,
+                name="L1C/A", sequence=code, branch=Branch.Q,
                 symbol_period_ms=_symbol_period_ms(gps_l1ca),
             )
         ]
@@ -203,14 +203,14 @@ class GpsL2C(Signal):
         cm, cl = _interleave([code_cm, code_cl])
         return [
             CodeComponent(
-                name="CM", sequence=cm, branch=Branch.Q,
+                name="L2CM", sequence=cm, branch=Branch.Q,
                 symbol_period_ms=_symbol_period_ms(gps_l2c),
             ),
             # CL is the dataless pilot: no symbol period, so nothing caps its
             # coherent integration but Doppler.  Same branch as CM -- both sit in
             # quadrature to P(Y) -- which is what makes the carrier handover at
             # ambiguity resolution phase-continuous.
-            CodeComponent(name="CL", sequence=cl, branch=Branch.Q),
+            CodeComponent(name="L2CL", sequence=cl, branch=Branch.Q),
         ]
 
 
@@ -241,13 +241,13 @@ class GpsL5(Signal):
         overlay_q = (1 - 2 * gps_l5.NEUMAN_HOFFMAN_SEQ_L5Q).astype(np.int8)
         return [
             CodeComponent(
-                name="I", sequence=code_i, branch=Branch.I, overlay=overlay_i,
+                name="L5I", sequence=code_i, branch=Branch.I, overlay=overlay_i,
                 symbol_period_ms=_symbol_period_ms(gps_l5),
             ),
             # Q is the dataless pilot: no symbol period.  Opposite branch to I,
             # so moving the carrier loop between them would cost a quarter-cycle
             # re-pull -- which is why it starts on Q and stays there.
-            CodeComponent(name="Q", sequence=code_q, branch=Branch.Q, overlay=overlay_q),
+            CodeComponent(name="L5Q", sequence=code_q, branch=Branch.Q, overlay=overlay_q),
         ]
 
 
@@ -286,12 +286,12 @@ class AcquisitionPolicy:
 
 
 ACQUISITION_POLICIES: dict[str, AcquisitionPolicy] = {
-    "GPS_L1CA": AcquisitionPolicy(component_name="CA"),
+    "GPS_L1CA": AcquisitionPolicy(component_name="L1C/A"),
     # Acquisition locates CM's 20 ms period, which leaves CL -- 75 times longer
     # -- unlocated.  Until the search below runs, the channel generates CL from
     # whatever phase CM supplied, i.e. as though CL were at its code origin,
     # which is right 1 time in 75.
-    "GPS_L2C": AcquisitionPolicy(component_name="CM", ambiguous_component="CL"),
+    "GPS_L2C": AcquisitionPolicy(component_name="L2CM", ambiguous_component="L2CL"),
     # Acquire on Q x NH20 -- the pilot, with its overlay folded into the
     # replica.  I x NH10 is half the length and was the obvious choice, but it
     # has a degeneracy: L5I's CNAV symbol period EQUALS NH10's, so the data
@@ -309,7 +309,7 @@ ACQUISITION_POLICIES: dict[str, AcquisitionPolicy] = {
     #   * ~1.5 dB, because no data flip breaks coherence inside a block
     #     (measured on real L5: G14 +16.9 -> +18.7, G01 +12.8 -> +14.5,
     #     G08 +1.9 -> +3.4 dB of margin over threshold).
-    "GPS_L5": AcquisitionPolicy(component_name="Q", include_overlay=True),
+    "GPS_L5": AcquisitionPolicy(component_name="L5Q", include_overlay=True),
 }
 
 
@@ -319,9 +319,9 @@ class TrackingPolicy:
     Which components drive the tracking loops, and how tiered-code sync and
     ambiguity resolution change that.
 
-    `synced_discriminator_policy`/`synced_coherent_integration_ms` apply once a
+    `synced_discriminator_policy`/`synced_coherent_duration_ms` apply once a
     tiered (overlay) code is synchronised and can be wiped off:
-    `synced_coherent_integration_ms` is how long one coherent accumulation then
+    `synced_coherent_duration_ms` is how long one coherent accumulation then
     lasts. Defaults leave behaviour unchanged for signals without an overlay.
 
     `resolved_discriminator_policy` applies instead of `discriminator_policy`
@@ -334,7 +334,7 @@ class TrackingPolicy:
 
     discriminator_policy: tracking_channel.LoopDiscriminatorPolicy
     synced_discriminator_policy: tracking_channel.LoopDiscriminatorPolicy | None = None
-    synced_coherent_integration_ms: int = tracking_channel.CORRELATION_INTERVAL_MS
+    synced_coherent_duration_ms: int = tracking_channel.CORRELATION_INTERVAL_MS
     resolved_discriminator_policy: tracking_channel.LoopDiscriminatorPolicy | None = None
 
 
@@ -403,7 +403,7 @@ TRACKING_POLICIES: dict[str, TrackingPolicy] = {
         #
         # The loop update rate drops to 10 ms with it, so the loop filter is
         # retuned at the same moment (see TrackingChannel).
-        synced_coherent_integration_ms=10,
+        synced_coherent_duration_ms=10,
     ),
 }
 
@@ -538,7 +538,7 @@ class TrackingChannelAdapter:
         self.channel.loop_state.mode = tracking_channel.TrackingLoopMode.PLL
 
     def component_index(self, name: str) -> int:
-        """Index of a named component, e.g. "CM"/"CL" for L2C."""
+        """Index of a named component, e.g. "L2CM"/"L2CL" for L2C."""
         return self.signal.code_set.index_of(name)
 
     def get_prompt_component(self, component: int = 0) -> np.ndarray:
@@ -568,6 +568,7 @@ def build_acquisition_code_params(
             rate_chips_per_sec=signal_type.tracking_code_rate_chips_per_sec,
             length_chips=len(sequence),
             sequence=sequence,
+            carrier_freq_hz=signal_type.carrier_freq_hz,
         )
     return params
 
@@ -629,6 +630,7 @@ def create_tracking_channels(
     start_mode_pll: bool = False,
     ambiguity_resolutions: dict[str, ambiguity_resolution.AmbiguityResolution]
     | None = None,
+    cn0_params: tracking_channel.CN0EstimatorParameters | None = None,
 ) -> dict[str, TrackingChannelAdapter]:
     tracking_policy = TRACKING_POLICIES[signal_type.signal_type_id]
     channels: dict[str, TrackingChannelAdapter] = {}
@@ -660,8 +662,8 @@ def create_tracking_channels(
             warnings.warn(
                 f"{signal_id}: {plan.description} unresolved "
                 f"(confidence {resolution.confidence:.2f} < threshold); tracking starts at "
-                f"{loop_params.coherent_integration_ms} ms and "
-                f"{tracking_policy.synced_coherent_integration_ms} ms coherent integration is NOT "
+                f"{loop_params.coherent_duration_ms} ms and "
+                f"{tracking_policy.synced_coherent_duration_ms} ms coherent integration is NOT "
                 f"active. The channel falls back to searching for the overlay phase after "
                 f"PLL lock, and will extend only if that succeeds.",
                 RuntimeWarning,
@@ -712,7 +714,8 @@ def create_tracking_channels(
             output_capacity=output_capacity,
             discriminator_policy=discriminator_policy,
             synced_policy=tracking_policy.synced_discriminator_policy,
-            synced_coherent_integration_ms=tracking_policy.synced_coherent_integration_ms,
+            synced_coherent_duration_ms=tracking_policy.synced_coherent_duration_ms,
+            cn0_params=cn0_params,
             initial_overlay_counter=initial_overlay_counter,
         )
 

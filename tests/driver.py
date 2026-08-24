@@ -27,7 +27,7 @@ LOOP_KWARGS = dict(
     DLL_bandwidth_hz=2.0,
     PLL_bandwidth_hz=20.0,
     FLL_bandwidth_hz=50.0,
-    coherent_integration_ms=BLOCK_DURATION_MS,
+    coherent_duration_ms=BLOCK_DURATION_MS,
     EPL_chip_spacing=0.5,
     prompt_corr_circ_length_threshold=0.9,
 )
@@ -100,7 +100,7 @@ def _build_channel(scenario: TrackingScenario):
         # cover a different configuration than the notebook runs: overlay
         # wipe-off without the extended integration and policy switch it enables.
         synced_policy=policy.synced_discriminator_policy,
-        synced_coherent_integration_ms=policy.synced_coherent_integration_ms,
+        synced_coherent_duration_ms=policy.synced_coherent_duration_ms,
     )
 
 

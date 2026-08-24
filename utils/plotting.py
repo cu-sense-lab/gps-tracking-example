@@ -1,4 +1,4 @@
-from typing import Iterable, Optional, Sequence
+from typing import TYPE_CHECKING, Iterable, Optional, Sequence
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -9,6 +9,9 @@ from matplotlib.figure import Figure, SubFigure
 
 from . import bpsk_acquisition, tracking_channel
 from .collect_metadata_utils import ExperimentMetadata
+
+if TYPE_CHECKING:  # avoids importing signal_interfaces at runtime
+    from .signal_interfaces import TrackingChannelAdapter
 
 
 def setup_default_plotting():
@@ -120,19 +123,107 @@ def plot_welch_psd(
     freqs = np.fft.fftshift(freqs)
     psd = np.fft.fftshift(psd)
     if orig_samples is not None:
-        freqs, psd_orig = scipy.signal.welch(
+        _, psd_orig = scipy.signal.welch(
             orig_samples, fs=samp_rate, nperseg=nperseg, noverlap=noverlap,
             window="hann", return_onesided=False, scaling="density",
         )
         psd_orig = np.fft.fftshift(psd_orig)
-        ax.plot(freqs / 1e6, 10 * np.log10(psd_orig), color="gray")
+        ax.plot(freqs / 1e6, 10 * np.log10(psd_orig), color="gray", label="Original Samples")
 
-    ax.plot(freqs / 1e6, 10 * np.log10(psd), color="black")
+    ax.plot(freqs / 1e6, 10 * np.log10(psd), color="black", label="Baseband Samples")
     
     ax.set_title("Welch PSD Estimate of Raw Samples")
     ax.set_xlabel("Frequency (MHz)")
     ax.set_ylabel("Power/Frequency (dB/Hz)")
     ax.grid()
+    ax.legend()
+    return ax
+
+
+def plot_sample_histogram_and_constellation(
+    fig: Figure | SubFigure,
+    samples: np.ndarray,
+    bit_depth: int = 8,
+) -> Sequence[Axes]:
+    """
+    Two views of one buffer of raw samples: a histogram of the I and Q values,
+    and the I-vs-Q scatter ("constellation").
+
+    What a healthy collect looks like: both histograms are bell-shaped (Gaussian)
+    and centred near zero, and the scatter is a round, featureless blob. GNSS
+    signals arrive far below the noise floor, so what you are looking at is
+    essentially receiver noise -- the satellites are invisible until correlation
+    pulls them out.
+
+    What problems look like:
+      - Histogram pressed flat against the ends of the range -> the front-end gain
+        is too high and samples are clipping.
+      - Histogram squeezed into just a few values near zero -> gain too low, and
+        quantisation is throwing away the signal.
+      - Q identically zero -> the data is real-valued, not complex; check
+        `is_complex` in the collect's metadata.yml.
+      - An off-centre blob, or a ring/arc rather than a disc -> a DC bias or an
+        uncorrected carrier offset.
+
+    `bit_depth` sets the histogram range to the full span the sample format can
+    represent, so an under-driven collect is obvious by how little of the axis it
+    fills.
+    """
+    axes = fig.subplots(1, 2, width_ratios=[1.5, 1])
+    ax_hist: Axes = axes[0]
+    ax_scatter: Axes = axes[1]
+
+    hist_bins = np.arange(-(2 ** (bit_depth - 1)), 2 ** (bit_depth - 1))
+    ax_hist.hist(samples.real, bins=hist_bins, histtype="stepfilled", color="r", alpha=0.6, align="left", label="Real (I)")
+    ax_hist.hist(samples.imag, bins=hist_bins, histtype="stepfilled", color="b", alpha=0.6, align="mid", label="Imaginary (Q)")
+    ax_hist.set_xlabel("Sample Value")
+    ax_hist.set_ylabel("Count")
+    ax_hist.grid()
+    ax_hist.legend(loc="upper right")
+
+    # alpha is very low because a 40 ms buffer is ~1e6 points: the density, not
+    # any single dot, is the thing to read.
+    ax_scatter.scatter(samples.real, samples.imag, color="k", s=1, alpha=0.01, zorder=1)
+    ax_scatter.set_axisbelow(True)
+    ax_scatter.grid()
+    ax_scatter.set_xlabel("Real (I)")
+    ax_scatter.set_ylabel("Imaginary (Q)")
+    return axes
+
+
+def plot_stft_periodogram(
+    fig: Figure | SubFigure,
+    periodogram: np.ndarray,
+    samp_rate: float,
+    total_duration_s: float,
+) -> Axes:
+    """
+    Spectrogram: how the power spectrum of the collect changes over time.
+
+    `periodogram` is (num_windows, num_freq_bins), one PSD estimate per time
+    window, already fftshifted so frequency runs monotonically from -samp_rate/2
+    to +samp_rate/2. Colour is power in dB.
+
+    What to look for: a steady horizontal band across the whole capture means the
+    front end behaved consistently. Vertical stripes are momentary interference or
+    dropped samples; a band that brightens or fades over time means the gain (or
+    the antenna's view of the sky) changed mid-collect. Narrow horizontal lines
+    that persist are continuous-wave interference -- a jammer or a nearby
+    oscillator -- which is exactly the kind of thing that stops acquisition from
+    working later.
+    """
+    ax = fig.add_subplot(1, 1, 1)
+    im = ax.imshow(
+        10 * np.log10(periodogram.T),
+        aspect="auto",
+        origin="lower",
+        extent=[0, total_duration_s, -samp_rate / 2e6, samp_rate / 2e6],
+        interpolation="nearest",
+    )
+    ax.set_xlabel("Time [s]")
+    ax.set_ylabel("Frequency [MHz]")
+    ax.set_title("STFT Periodogram")
+    fig.colorbar(im, ax=ax, label="Power/Frequency [dB/Hz]")
     return ax
 
 
@@ -164,7 +255,13 @@ def plot_acquisition_doppler_slices(
     fig: Figure | SubFigure,
     acq_results: dict[str, bpsk_acquisition.AcquisitionResult],
 ) -> Axes:
-    """Correlation-vs-Doppler slice through each signal's peak code-phase bin."""
+    """
+    Correlation-vs-Doppler slice through each signal's peak code-phase bin.
+
+    Needs the full Doppler grid, so the results must come from an acquisition run
+    with `save_corr_doppler_window_bins=None`; with the default window this
+    degenerates to the three retained rows.
+    """
     ax = fig.add_subplot(1, 1, 1)
     cmap = plt.get_cmap("tab20b")
     for i, (signal_id, acq_result) in enumerate(acq_results.items()):
@@ -188,18 +285,43 @@ def plot_acquisition_delay_doppler_map(
     fig: Figure | SubFigure,
     acq_result: bpsk_acquisition.AcquisitionResult,
     code_phase_window_samples: int = 150,
+    use_fine: bool = False,
 ) -> Axes:
     """Delay-Doppler correlation heatmap for one signal's acquisition result, zoomed to the peak."""
     ax = fig.add_subplot(1, 1, 1)
-    acq_config = acq_result.config
-    correlation = acq_result.correlation_result.correlation_matrix
+    source = acq_result.correlation_result
+    if use_fine:
+        if acq_result.fine_correlation_result is None:
+            raise ValueError(
+                f"{acq_result.signal_id}: no fine search result -- it runs only on a "
+                "detection, and only when acq_config.fine_search is set"
+            )
+        source = acq_result.fine_correlation_result
+    correlation = source.correlation_matrix
     num_doppler_bins, num_code_phases = correlation.shape
-    extent = [0, num_code_phases, acq_config.min_search_doppler_hz, acq_config.max_search_doppler_hz]
 
-    peak_code_phase_bin = acq_result.peak_code_phase_bin
+    # The Doppler extent comes from the rows actually retained, not from the config's
+    # full search range: `save_corr_doppler_window_bins` keeps only a few rows around
+    # the peak, and labelling them +/-5 kHz would be a lie.  The delay axis is kept
+    # whole, so `peak_code_phase_bin` indexes it directly and the zoom below works.
+    doppler_hz = source.doppler_bins_hz
+    half_row = 0.5 * source.doppler_resolution_hz
+    extent = [0, num_code_phases, doppler_hz[0] - half_row, doppler_hz[-1] + half_row]
+
+    # NaN rows (a window overhanging the grid) should read as absent, not as zero.
+    cmap = plt.get_cmap("plasma").copy()
+    cmap.set_bad(color="0.85")
+
+    if use_fine:
+        # The fine grid IS the zoom, and its columns are fractional samples about
+        # the peak, so the coarse sample-index window does not apply.
+        code_phase_window_samples = num_code_phases
+    peak_code_phase_bin = (
+        num_code_phases // 2 if use_fine else acq_result.peak_code_phase_bin
+    )
     im = ax.imshow(
         correlation, extent=extent, aspect="auto", interpolation="nearest",
-        cmap="plasma", origin="lower", vmin=0,
+        cmap=cmap, origin="lower", vmin=0,
     )
     ax.set_xlim(peak_code_phase_bin - code_phase_window_samples, peak_code_phase_bin + code_phase_window_samples)
     ax.set_xlabel("Code Phase [samples]")
@@ -220,19 +342,27 @@ def plot_acquisition_correlation_histogram(
     chi-squared distribution (df = 2 * num_blocks) that non-coherent
     square-law summation should follow under noise alone, and the detection
     threshold used to declare acquisition.
+
+    Needs the *whole* search grid, so the result must come from an acquisition run
+    with `save_corr_doppler_window_bins=None`.  A retained Doppler window is
+    centred on the peak and is not a fair sample of the noise distribution.
     """
     ax = fig.add_subplot(1, 1, 1)
     corr_matrix = acq_result.correlation_result.correlation_matrix
 
-    y_noise_mean = np.mean(corr_matrix)
+    # nanmean/NaN-drop: a result kept with `save_corr_doppler_window_bins` NaN-fills
+    # any Doppler row that fell outside the searched grid, and plain np.mean of an
+    # array containing NaN is NaN.
+    y_noise_mean = np.nanmean(corr_matrix)
     sigma_n = np.sqrt(y_noise_mean / (2 * num_blocks))
     normalized_corr_matrix = corr_matrix / sigma_n**2
 
     hist_bins = np.linspace(0, hist_max_val, 100)
-    hist = np.histogram(normalized_corr_matrix.flatten(), bins=hist_bins)[0]
+    finite_values = normalized_corr_matrix[np.isfinite(normalized_corr_matrix)]
+    hist = np.histogram(finite_values, bins=hist_bins)[0]
 
     ax.bar(hist_bins[:-1], hist, width=hist_bins[1] - hist_bins[0], color="blue", alpha=0.7)
-    x_vals = np.linspace(0, np.max(normalized_corr_matrix), 1000)
+    x_vals = np.linspace(0, np.nanmax(normalized_corr_matrix), 1000)
     chi2_pdf = scipy.stats.chi2.pdf(x_vals, df=2 * num_blocks)
     ax.plot(
         x_vals, chi2_pdf * np.max(hist) / np.max(chi2_pdf), color="red", linewidth=2,
@@ -247,6 +377,255 @@ def plot_acquisition_correlation_histogram(
     ax.set_ylabel("Count")
     ax.grid()
     ax.set_xlim(0, hist_max_val)
+    return ax
+
+
+def plot_acquisition_dwell_layout(
+    fig: Figure | SubFigure,
+    acq_config: bpsk_acquisition.AcquisitionConfiguration,
+    symbol_period_ms: Optional[float] = None,
+    symbol_phase_ms: float = 0.0,
+) -> Sequence[Axes]:
+    """
+    Why acquisition has two lengths, drawn from the configuration itself.
+
+    Left panel -- the dwell in time.  `num_blocks` coherent blocks of
+    `coherent_duration_sample_ms` are taken back to back from the stream, and each
+    is zero-padded out to `coherent_duration_replica_ms` before its FFT (the
+    correlation is circular, so the FFT length is the replica length).
+
+    Each block sits at the offset it actually occupied within the code period --
+    block `j` at `j * T_coherent` modulo `T_replica`, wrapping if it straddles the
+    end -- not at the start of its window.  That is what `pack_coherent_blocks`
+    does, and it is what makes the square-law sum accumulate: block `j` was
+    received after the code had already advanced that far, so padding every block
+    at position 0 would leave each peak at a different lag and smear the sum
+    across the code phase axis instead of stacking it.
+
+    If `symbol_period_ms` is given, data symbol boundaries are drawn across the
+    window.  A sign flip *between* blocks is harmless because the blocks are
+    combined by square law; one *inside* a block cancels part of that block's own
+    integration.  `symbol_phase_ms` offsets that grid: acquisition does not know
+    the symbol alignment, so the realistic picture is an arbitrary offset, and
+    keeping blocks short is what bounds the damage whatever it turns out to be.
+
+    Right panel -- the same two lengths in frequency.  Grid ticks are the Doppler
+    bins the FFT actually produces, spaced `1 / T_replica`.  The curve is the
+    coherent response, whose mainlobe is `1 / T_coherent` wide.  A short coherent
+    length therefore widens the response without widening the grid, which is what
+    lets a short integration still be located to a fine Doppler.
+    """
+    axes = fig.subplots(1, 2, width_ratios=[1.4, 1])
+    ax_time: Axes = axes[0]
+    ax_freq: Axes = axes[1]
+
+    t_coh = float(acq_config.coherent_duration_sample_ms)
+    t_rep = float(acq_config.coherent_duration_replica_ms)
+    num_blocks = acq_config.num_blocks
+
+    for m in range(num_blocks):
+        y = num_blocks - 1 - m
+        # Where this block's data actually sits in the window, wrapping if it
+        # straddles the end of the code period.
+        start = (m * t_coh) % t_rep
+        spans = [(start, min(t_coh, t_rep - start))]
+        if start + t_coh > t_rep:
+            spans.append((0.0, start + t_coh - t_rep))
+
+        ax_time.broken_barh([(0.0, t_rep)], (y - 0.32, 0.64),
+                            facecolors="lightgrey", edgecolor="k",
+                            linewidth=0.5, hatch="//")
+        ax_time.broken_barh(spans, (y - 0.32, 0.64),
+                            facecolors="tab:blue", edgecolor="k", linewidth=0.5)
+        ax_time.text(spans[0][0] + spans[0][1] / 2, y, f"{m}", ha="center",
+                     va="center", fontsize=8, color="white")
+
+    if symbol_period_ms:
+        # Boundaries are absolute in the window: it is one code period, and the
+        # blocks have been placed back onto their true positions within it.
+        edges = np.arange(symbol_phase_ms % symbol_period_ms, t_rep, symbol_period_ms)
+        ax_time.vlines(edges, -0.5, num_blocks - 0.5, color="tab:red", lw=2, zorder=3)
+
+    ax_time.set_yticks(range(num_blocks))
+    ax_time.set_yticklabels([f"{num_blocks - 1 - i}" for i in range(num_blocks)])
+    ax_time.set_ylabel("Block")
+    ax_time.set_xlabel("Time within the FFT window [ms]")
+    ax_time.set_xlim(0, t_rep)
+    ax_time.set_title(f"Dwell: {num_blocks} x {t_coh:g} ms coherent, {t_rep:g} ms replica")
+    handles = [
+        plt.Rectangle((0, 0), 1, 1, facecolor="tab:blue", edgecolor="k", label="data integrated"),
+        plt.Rectangle((0, 0), 1, 1, facecolor="lightgrey", edgecolor="k", hatch="//", label="zero padding"),
+    ]
+    if symbol_period_ms:
+        handles.append(plt.Line2D([0], [0], color="tab:red", lw=2,
+                                  label=f"symbol boundary ({symbol_period_ms:g} ms)"))
+    ax_time.legend(handles=handles, fontsize=7, loc="upper right")
+
+    # --- frequency ---
+    grid_hz = acq_config.fft_resolution
+    response_hz = acq_config.doppler_response_width_hz
+    span = 3 * response_hz
+    f = np.linspace(-span, span, 1001)
+    ax_freq.plot(f, np.abs(np.sinc(f / response_hz)), color="k", lw=2,
+                 label=f"response, {response_hz:.0f} Hz wide")
+    ticks = np.arange(-span, span + grid_hz, grid_hz)
+    ax_freq.vlines(ticks, 0, 0.12, color="tab:orange", lw=1.5,
+                   label=f"Doppler bins, {grid_hz:.0f} Hz apart")
+    ax_freq.set_xlabel("Doppler offset from the true value [Hz]")
+    ax_freq.set_ylabel("Normalised correlation")
+    ax_freq.set_title("Grid spacing vs response width")
+    ax_freq.set_xlim(-span, span)
+    ax_freq.set_ylim(0, 1.1)
+    ax_freq.grid()
+    ax_freq.legend(fontsize=7, loc="upper right")
+    return axes
+
+
+def plot_acquisition_code_phase_slices(
+    fig: Figure | SubFigure,
+    acq_results: dict[str, bpsk_acquisition.AcquisitionResult],
+    signal_ids: Optional[Sequence[str]] = None,
+    window_chips: float = 3.0,
+) -> Axes:
+    """
+    Correlation power against code delay, one curve per signal, each taken at its
+    own peak Doppler bin.
+
+    This is the view for reading **multipath**, which lives in the delay dimension:
+    a reflection is always delayed relative to the direct path, so it shows up as
+    asymmetry about zero -- a shoulder on the late side, a broadened or flattened
+    peak -- rather than as a change in peak height.
+
+    Delay is plotted relative to each signal's own peak, so the curves are
+    comparable; absolute code phase is in the acquisition table.  Power is in dB
+    above the expected noise level, the same scale as `AcquisitionResult.
+    peak_snr_db` and that table, so every noise floor sits at 0 dB and every peak
+    reads its own SNR.  The detection threshold is drawn as one horizontal line --
+    it depends only on the per-cell false-alarm rate and `num_blocks`, so it is a
+    property of the sweep rather than of any signal.
+
+    A healthy dwell is a sharp peak at delay zero, far above the line, falling to a
+    flat floor within about a chip either side.  A false acquisition is a low,
+    shapeless bump that barely clears it.
+
+    Resolution is set by the sample rate, and it is coarse: at 22 Msps against a
+    10.23 Mcps code there are only 2.15 samples per chip -- one sample is 45.5 ns,
+    13.6 m, 0.465 chips, and the ideal +/-1 chip correlation triangle spans just
+    4.3 samples.  Multipath appears as asymmetry across a handful of points, not as
+    a smoothly resolved shoulder.  Anything finer needs a higher sample rate or an
+    interpolated peak.
+
+    **Do not read asymmetry as multipath without checking the sign.**  With 2.15
+    samples per chip the true peak almost never lands on a sample, so the two
+    neighbours are unequal purely from where the sampling grid happened to fall.
+    On the rooftop collect the late-minus-early difference is -6.4, +5.8 and
+    -0.8 dB for G01, G14 and G30 -- random in sign, which is the signature of
+    sub-sample placement.  Multipath is a *delayed* reflection, so it skews late
+    consistently, across satellites and over time.  A single dwell cannot separate
+    the two; a run of dwells can.
+
+    Signals are taken from `acq_results` by default only where `signal_detected` is
+    set; elsewhere the "peak" is a noise maximum whose neighbourhood means nothing.
+    """
+    if signal_ids is None:
+        signal_ids = sorted(sid for sid, r in acq_results.items() if r.signal_detected)
+
+    ax = fig.add_subplot(1, 1, 1)
+    if not signal_ids:
+        ax.set_title("No signals acquired")
+        return ax
+
+    def _slice(result, corr, peak_row, reference_seconds):
+        """One Doppler row of `corr`, in dB above noise, against delay in chips."""
+        power = corr.correlation_matrix[peak_row]
+        with np.errstate(divide="ignore", invalid="ignore"):
+            power_db = 10.0 * np.log10(
+                power / result.noise_var / (2 * result.config.num_blocks)
+            )
+        delay_chips = (
+            corr.code_phase_bins_seconds - reference_seconds
+        ) * result.acquisition_code_rate_chips_per_sec
+        keep = np.abs(delay_chips) <= window_chips
+        order = np.argsort(delay_chips[keep])
+        return delay_chips[keep][order], power_db[keep][order]
+
+    any_fine = False
+    for index, signal_id in enumerate(signal_ids):
+        result = acq_results[signal_id]
+        colour = f"C{index}"
+        fine = result.fine_correlation_result
+
+        # Both curves are referenced to the FINE peak, so the coarse curve's own
+        # displacement from zero is visible -- that offset is exactly what the
+        # refinement corrected, and hiding it by giving each curve its own origin
+        # would throw away the most informative thing in the figure.
+        #
+        # The *unwrapped* fine peak is the reference: the fine delay axis is a local
+        # axis that may run past the code period, and `acq_code_phase_seconds` is
+        # wrapped, so mixing the two would offset the coarse curve by a whole period
+        # near the boundary.
+        if fine is not None:
+            reference_seconds = float(
+                fine.code_phase_bins_seconds[result.fine_peak_code_phase_bin]
+            )
+        else:
+            reference_seconds = result.coarse_code_phase_seconds
+
+        # The retained coarse window is centred on the coarse peak and NaN-filled
+        # where it overhangs the grid, so the peak is its middle row by
+        # construction.  Verified rather than assumed: a silent off-by-one would
+        # plot a neighbouring Doppler bin and understate the whole curve.
+        coarse_row = result.correlation_result.correlation_matrix.shape[0] // 2
+        if not np.isclose(
+            result.correlation_result.doppler_bins_hz[coarse_row], result.coarse_doppler_hz
+        ):
+            raise ValueError(
+                f"{signal_id}: coarse row {coarse_row} is "
+                f"{result.correlation_result.doppler_bins_hz[coarse_row]:.1f} Hz but the coarse "
+                f"peak is at {result.coarse_doppler_hz:.1f} Hz; the retained Doppler window is "
+                "not centred on the peak"
+            )
+
+        x, y = _slice(result, result.correlation_result, coarse_row, reference_seconds)
+        # Faded, same colour and marker: the eye should read the pair as one signal
+        # measured two ways, not as two signals.
+        ax.plot(x, y, ".-", color=colour, alpha=0.35, markersize=6, lw=1.2)
+
+        if fine is not None:
+            any_fine = True
+            if not np.isclose(
+                fine.doppler_bins_hz[result.fine_peak_doppler_bin], result.acq_doppler_hz
+            ):
+                raise ValueError(
+                    f"{signal_id}: fine row {result.fine_peak_doppler_bin} is "
+                    f"{fine.doppler_bins_hz[result.fine_peak_doppler_bin]:.1f} Hz but the refined "
+                    f"peak is at {result.acq_doppler_hz:.1f} Hz"
+                )
+            x, y = _slice(result, fine, result.fine_peak_doppler_bin, reference_seconds)
+            ax.plot(x, y, ".-", color=colour, alpha=1.0, markersize=6, lw=1.6)
+
+        snr = result.peak_snr_db
+        fine_snr = result.fine_peak_snr_db
+        label = f"{signal_id}  {snr:.1f} dB"
+        if fine_snr is not None:
+            label = f"{signal_id}  {snr:.1f} => {fine_snr:.1f} dB"
+        ax.plot([], [], ".-", color=colour, markersize=6, label=label)
+
+    threshold_db = acq_results[signal_ids[0]].detection_threshold_db
+    ax.axhline(threshold_db, color="k", ls="--", lw=1.5,
+               label=f"detection threshold ({threshold_db:.2f} dB)")
+    if any_fine:
+        ax.plot([], [], ".-", color="0.4", alpha=0.35, markersize=6, label="faded: coarse")
+        ax.plot([], [], ".-", color="0.4", alpha=1.0, markersize=6, label="solid: fine")
+
+    # Noise cells scatter several dB below the 0 dB mean, so clamp the floor rather
+    # than letting one deep null squash every curve.
+    ax.set_ylim(bottom=max(-12.0, ax.get_ylim()[0]))
+    ax.set_xlabel("Code delay relative to the refined peak [chips]")
+    ax.set_ylabel("Correlation power [dB above noise]")
+    ax.set_title("Acquisition correlation vs code delay")
+    ax.grid(True)
+    ax.legend(fontsize=8, ncol=2)
     return ax
 
 
@@ -383,3 +762,263 @@ def plot_epl_magnitude_and_code_error(
         ax.grid()
     fig.align_labels()
     return axes
+
+
+def plot_component_prompt_magnitudes(
+    fig: Figure | SubFigure,
+    adapter: "TrackingChannelAdapter",
+    sig_id: str,
+    title: Optional[str] = None,
+) -> Axes:
+    """
+    Prompt correlation magnitude of every code component of a multi-component
+    signal, on one set of axes. Meaningless for a single-component signal such as
+    L1 C/A, so callers should skip it when `len(component_names) == 1`.
+
+    What to expect:
+      - L5: I and Q carry equal power, so the two traces should sit on top of each
+        other. A large gap means one component is not being tracked properly.
+      - L2C: CM and CL each transmit on only half the chip slots, so both sit near
+        half the magnitude a single full-rate code would reach -- and they should
+        be roughly equal to each other.
+
+    Magnitude is used rather than I/Q because it is insensitive to carrier phase:
+    it answers "how much signal power is this component recovering", not "is the
+    phase right".
+    """
+    ax = fig.add_subplot(1, 1, 1)
+    outputs = adapter.outputs
+    plot_time = outputs.uptime_epoch_ms[outputs.valid] * 1e-3
+    for index, name in enumerate(adapter.signal.component_names):
+        prompt = adapter.get_prompt_component(component=index)
+        ax.scatter(plot_time, np.abs(prompt), s=2, label=f"{name}", color=f"C{index}")
+    ax.set_title(title if title is not None else f"Components: {sig_id}")
+    ax.set_ylabel("Prompt Magnitude")
+    ax.set_xlabel("Uptime [s]")
+    ax.grid(True)
+    ax.legend(markerscale=10)
+    return ax
+
+
+def plot_prompt_components(
+    fig: Figure | SubFigure,
+    adapter: "TrackingChannelAdapter",
+    sig_id: str,
+    title: Optional[str] = None,
+) -> Sequence[Axes]:
+    """
+    Prompt correlator output per code component, one row each, in-phase and
+    quadrature together.
+
+    A locked channel puts essentially all of each component's power on *one* axis
+    and leaves the other at zero.  Which axis depends on the component's carrier
+    phase relative to the one the loop is tracking:
+
+      - the component the carrier loop runs on lands on I, because that is what the
+        PLL is driving it to do;
+      - a component transmitted in phase quadrature with it lands on Q.  GPS L5 is
+        exactly this case -- I and Q ride quadrature carriers, and with the loop on
+        the Q pilot the L5I component's power appears in the *imaginary* part;
+      - components sharing a carrier phase (L2C's CM and CL) both land on I.
+
+    How many bands that axis forms says what the component carries: a data
+    component (L1 C/A's CA, L2C's CM, L5's I) splits into a positive and a negative
+    band as navigation symbols flip its sign, while a dataless pilot (L5's Q, L2C's
+    CL once resolved) stays in a single band.
+
+    Loss of lock looks like I and Q both scattered symmetrically about zero.  Since
+    every component shares one epoch, a component whose magnitude collapses on a
+    subset of epochs while its siblings are healthy is straddling its own symbol
+    boundary -- see `utils.tracking_channel`'s epoch anchoring.
+    """
+    outputs = adapter.outputs
+    names = adapter.signal.component_names
+    plot_time = outputs.uptime_epoch_ms[outputs.valid] * 1e-3
+
+    axes = np.atleast_1d(fig.subplots(len(names), 1, sharex=True))
+    for index, name in enumerate(names):
+        prompt = adapter.get_prompt_component(component=index)
+        ax: Axes = axes[index]
+        ax.scatter(plot_time, prompt.real, s=2, color="tab:red", label="In-phase (I)")
+        ax.scatter(plot_time, prompt.imag, s=2, color="tab:blue", label="Quadrature (Q)")
+        ax.axhline(0.0, color="k", lw=0.5)
+        ax.set_ylabel(f"{name}\nPrompt")
+        ax.grid(True)
+    axes[0].set_title(title if title is not None else f"Prompt correlators: {sig_id}")
+    axes[0].legend(markerscale=8, loc="upper right", fontsize=8)
+    axes[-1].set_xlabel("Uptime [s]")
+    fig.align_labels()
+    return axes
+
+
+def plot_code_delay_and_doppler(
+    fig: Figure | SubFigure,
+    adapter: "TrackingChannelAdapter",
+    sig_id: str,
+    title: Optional[str] = None,
+) -> Axes:
+    """
+    Code delay and carrier Doppler on shared axes, as the line-of-sight dynamics.
+
+    Code delay is plotted as the *residual*: the tracked code phase minus the
+    nominal one-millisecond-per-millisecond advance, referenced to the first
+    epoch.  The raw code phase is dominated by that nominal advance and shows
+    nothing; the residual is the part that reflects the satellite actually moving,
+    and is reported in chips (the right-hand axis carries Doppler in Hz).
+
+    The two are related by construction, not independently measured: this tracker
+    slaves the code rate to the carrier, `code_rate = (1 + doppler / f_carrier)`,
+    so the delay residual is the integral of Doppler over the carrier frequency.
+    What the plot is good for is seeing that dynamic directly -- a steady Doppler
+    of a few kHz produces a delay ramp of a fraction of a chip per second -- and
+    seeing both break together when a channel loses lock.
+    """
+    outputs = adapter.outputs
+    valid = outputs.valid
+    plot_time = outputs.uptime_epoch_ms[valid] * 1e-3
+    doppler_freq_hz = outputs.doppler_freq_hz[valid]
+
+    # Code phase accumulates without wrapping, so subtracting elapsed time leaves
+    # only the departure from the nominal rate.
+    residual_ms = outputs.code_phase_ms[valid] - outputs.uptime_epoch_ms[valid]
+    if len(residual_ms):
+        residual_ms = residual_ms - residual_ms[0]
+    residual_chips = residual_ms * 1e-3 * adapter.signal.tracking_code_rate_chips_per_sec
+
+    ax = fig.add_subplot(1, 1, 1)
+    ax.plot(plot_time, residual_chips, color="tab:purple", lw=2, label="Code delay")
+    ax.set_ylabel("Code delay residual [chips]", color="tab:purple")
+    ax.tick_params(axis="y", labelcolor="tab:purple")
+    ax.set_xlabel("Uptime [s]")
+    ax.grid(True)
+
+    ax_doppler = ax.twinx()
+    ax_doppler.plot(plot_time, doppler_freq_hz, color="tab:green", lw=2, label="Doppler")
+    ax_doppler.set_ylabel("Doppler [Hz]", color="tab:green")
+    ax_doppler.tick_params(axis="y", labelcolor="tab:green")
+
+    ax.set_title(title if title is not None else f"Code delay and Doppler: {sig_id}")
+    handles = [
+        plt.Line2D([0], [0], color="tab:purple", lw=2, label="Code delay residual"),
+        plt.Line2D([0], [0], color="tab:green", lw=2, label="Doppler"),
+    ]
+    ax.legend(handles=handles, loc="best", fontsize=8)
+    return ax
+
+
+# Minimum height of the C/N0 axis, in dB.  A locked channel's C/N0 varies by about
+# a dB, and letting matplotlib autoscale to that makes estimator noise look like a
+# fading signal.  Ten dB is wide enough that flat reads as flat and a real fade
+# still shows.
+MIN_CN0_AXIS_SPAN_DB = 10.0
+
+
+def plot_prompt_circ_length(
+    fig: Figure | SubFigure,
+    adapter: "TrackingChannelAdapter",
+    sig_id: str,
+    title: Optional[str] = None,
+    component: Optional[int] = None,
+) -> Axes:
+    """
+    Prompt circular length and VSM C/N0 -- two quantities on one pair of axes,
+    despite what the name says: coherence on the left, C/N0 in dB-Hz on the right.
+
+    Circular length per epoch, coloured by which carrier loop was running.
+
+    Circular length is the coherence of the recent prompt history: the magnitude of
+    the mean unit phasor, wrapped for Costas where the policy says so.  It is ~1
+    when the prompt phase is steady and falls towards 0 as it scatters, which makes
+    it the statistic the channel uses to decide the FLL has pulled the frequency
+    error in far enough for the PLL to take over.
+
+    Epochs filtered by the FLL and by the PLL are drawn in different colours, with
+    the switching threshold and the handover instant both marked.
+
+    **A dip just after the handover is expected, and is not a loss of signal.**
+    The FLL controls frequency only, so it hands over holding whatever carrier
+    phase error it happens to have -- a third of a cycle is typical.  The PLL then
+    drives that to zero over the next ten or so epochs, and it is the *sweep* of
+    phase during that correction, not any drop in power, that spreads the history's
+    phasors and pulls this metric down.  Prompt magnitude is flat throughout;
+    `plot_prompt_components` is where a real power loss would show.
+
+    Two consequences.  The dip's depth scales with the phase error the FLL left.
+    And it **lags the handover by up to `history_size` epochs**, because this is a
+    sliding window: it bottoms once the window is maximally filled with sweep-era
+    phases and recovers as they scroll out.  Read the bottom of the dip as "the
+    correction finished about ten epochs ago", not as something happening then.
+
+    The threshold rarely gates anything for a healthy signal, whose coherence is
+    already above it at the first epoch; the binding condition is `history_filled`,
+    so the FLL runs for exactly `history_size` epochs and then hands over.  A
+    channel that never leaves FLL never locked at all, and one sagging back towards
+    the threshold later in a run is about to lose lock.
+
+    **C/N0** comes from `estimate_cn0_vsm` over correlation intervals, on a far
+    slower cadence than the epochs -- one point per hop of the estimator's window,
+    so a run shorter than a couple of periods shows almost nothing.  It is drawn
+    for one component, the carrier loop's by default; pass `component` to compare
+    I against Q.  Unlike the coherence trace it should be flat for a locked
+    channel: it measures how much signal is arriving, not how well the loop holds
+    phase, so it does *not* dip at the FLL/PLL handover.
+    """
+    outputs = adapter.outputs
+    valid = outputs.valid
+    plot_time = outputs.uptime_epoch_ms[valid] * 1e-3
+    circ_length = outputs.prompt_corr_circ_length[valid]
+    pll = outputs.pll_mode[valid]
+
+    ax = fig.add_subplot(1, 1, 1)
+    ax.scatter(plot_time[~pll], circ_length[~pll], s=4, color="tab:orange", label="FLL")
+    ax.scatter(plot_time[pll], circ_length[pll], s=4, color="tab:blue", label="PLL")
+
+    threshold = adapter.channel.loop_params.prompt_corr_circ_length_threshold
+    ax.axhline(threshold, color="k", ls="--", lw=1.5,
+               label=f"FLL -> PLL threshold ({threshold:g})")
+
+    # On a strong signal the FLL stretch can be only a handful of epochs wide and
+    # all but invisible as scattered points, so mark the handover explicitly.
+    if pll.any() and not pll.all():
+        handover_s = float(plot_time[np.argmax(pll)])
+        ax.axvline(handover_s, color="k", ls=":", lw=1.5)
+        ax.annotate(f"FLL -> PLL at {handover_s:.3f} s",
+                    xy=(handover_s, 0.5), xytext=(6, 0), textcoords="offset points",
+                    rotation=90, va="center", fontsize=8)
+
+    ax.set_ylim(0, 1.05)
+    ax.set_ylabel("Prompt circular length", color="tab:blue")
+    ax.tick_params(axis="y", labelcolor="tab:blue")
+    ax.set_xlabel("Uptime [s]")
+    ax.set_title(title if title is not None else f"Carrier loop coherence: {sig_id}")
+    ax.grid(True)
+    handles = ax.get_legend_handles_labels()[0]
+
+    # C/N0 on its own axis, and its own much slower cadence.
+    if component is None:
+        component = adapter.channel.policy.carrier_component
+    cn0_slice = outputs.cn0_valid
+    if cn0_slice.stop > 0:
+        name = adapter.signal.component_names[component]
+        ax_cn0 = ax.twinx()
+        line, = ax_cn0.plot(
+            outputs.cn0_uptime_ms[cn0_slice] * 1e-3,
+            outputs.cn0_dbhz[cn0_slice, component],
+            marker="o", markersize=4, lw=1.5, color="tab:green",
+            label=f"C/N0 ({name})",
+        )
+        ax_cn0.set_ylabel("C/N0 [dB-Hz]", color="tab:green")
+        ax_cn0.tick_params(axis="y", labelcolor="tab:green")
+
+        # Hold a minimum span, or autoscale magnifies a steady channel's ~1 dB of
+        # estimator noise to fill the axis and it reads as a dramatic swing.
+        values = outputs.cn0_dbhz[cn0_slice, component]
+        finite = values[np.isfinite(values)]
+        if finite.size:
+            centre = 0.5 * (finite.min() + finite.max())
+            half_span = max(0.5 * (finite.max() - finite.min()) * 1.2, MIN_CN0_AXIS_SPAN_DB / 2)
+            ax_cn0.set_ylim(centre - half_span, centre + half_span)
+        handles.append(line)
+
+    ax.legend(handles=handles, markerscale=4, loc="lower right", fontsize=8)
+    return ax

@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from pathlib import Path
 from typing import NotRequired, Optional, Generator, TypedDict
 import numpy as np
 from numpy.typing import NDArray
@@ -230,7 +231,7 @@ class FileSampleStream:
 
     def __init__(
             self,
-            filepath: str,
+            filepath: str | Path,
             sample_params: SampleParameters,
             buffer_size_samples: int,
         ) -> None:
