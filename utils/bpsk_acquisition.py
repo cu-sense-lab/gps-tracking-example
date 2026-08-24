@@ -5,7 +5,13 @@ import numpy as np
 from numpy.typing import NDArray
 
 from .bpsk_correlation import correlate__multicomponent
-from .code_components import Branch, CodeComponent, build_code_set
+from .code_components import (
+    Branch,
+    CodeComponent,
+    Subcarrier,
+    build_code_set,
+    subcarrier_signs,
+)
 import scipy.fft
 import scipy.stats
 
@@ -218,6 +224,12 @@ class AcqSignalCodeParameters:
     # Needed by the fine search to slave the code rate to Doppler.  At 2450 Hz on
     # L5 the code drifts 0.107 chips per 5 ms block, so this is not optional there.
     carrier_freq_hz: float = 0.0
+    # The component's subcarrier, if it has one.  The replica must carry it: a BOC
+    # subcarrier is odd-symmetric within each chip, so correlating a BOC signal
+    # against a plain BPSK replica gives roughly nothing at zero delay.  It is
+    # applied from the fractional chip position, exactly as the correlator kernel
+    # does -- `rate_chips_per_sec` stays the signal's true chip rate.
+    subcarrier: Optional[Subcarrier] = None
 
 
 @dataclass
@@ -469,26 +481,41 @@ def refine_acquisition_peak(
     return grid, int(peak_d), int(peak_t)
 
 
-def _acquisition_code_set(code_params: "AcqSignalCodeParameters"):
+def _acquisition_component(code_params: "AcqSignalCodeParameters") -> CodeComponent:
     """
-    A one-component `CodeSet` over the acquisition sequence, for the fine search.
+    The acquisition sequence as a single `CodeComponent`, subcarrier included.
 
     It must be the *acquisition* code, not the signal's tracking code set: on L5
     the acquisition code is the composite Q x NH20, and refining against plain Q
     would let the overlay's sign flips cancel across a coherent block.
-
-    `allow_partial_coverage` is required and correct here -- L2C acquires on CM
-    alone, which is zero on CL's chips, and `build_code_set`'s own docstring names
-    scoring one component in isolation as exactly this case.
     """
-    component = CodeComponent(
+    return CodeComponent(
         name="acquisition",
         sequence=np.ascontiguousarray(code_params.sequence, dtype=np.int8),
         # Branch is meaningful only as a *difference* between components of one
         # signal; this set has a single component, so the choice cannot matter.
         branch=Branch.I,
+        subcarrier=code_params.subcarrier,
     )
-    return build_code_set([component], allow_partial_coverage=True)
+
+
+def _acquisition_code_set(code_params: "AcqSignalCodeParameters"):
+    """
+    A one-component `CodeSet` over the acquisition sequence, for the fine search.
+
+    The fine search runs through `correlate__multicomponent`, so carrying the
+    subcarrier here is all it takes for the refinement to model it too -- the same
+    kernel tracking uses, on the same chip axis.
+
+    `allow_partial_coverage` is required and correct here -- L2C acquires on CM
+    alone, which is zero on CL's chips, and `build_code_set`'s own docstring names
+    scoring one component in isolation as exactly this case.
+    """
+    return build_code_set(
+        [_acquisition_component(code_params)],
+        allow_partial_coverage=True,
+        chip_rate_hz=code_params.rate_chips_per_sec,
+    )
 
 
 def pack_coherent_blocks(
@@ -713,6 +740,16 @@ def run_acquisition(
             )
             chip_indices = chips_arr.astype(int) % code_params.length_chips
             replica_values = code_params.sequence[chip_indices]
+            if code_params.subcarrier is not None:
+                # `replica_time_arr` starts at 0, so truncation is floor and the
+                # remainder is the position within the chip -- the same quantity
+                # the correlator kernel derives per sample.
+                replica_values = replica_values * subcarrier_signs(
+                    _acquisition_component(code_params),
+                    code_params.rate_chips_per_sec,
+                    chip_indices,
+                    chips_arr - np.floor(chips_arr),
+                )
             replica_samples[: acq_config.replica_length_samples] = replica_values.astype(float)
             replica_samples_fft = np.fft.fft(replica_samples)
             replica_entry = SignalReplicaCacheEntry(

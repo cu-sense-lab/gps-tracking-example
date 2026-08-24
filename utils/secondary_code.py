@@ -23,8 +23,19 @@ that delivers symbol synchronisation for free.
 
 The synchroniser is deliberately separated from the search strategy.  Brute force
 over every offset is fine for NH10/NH20, but L1C's 1800-symbol overlay makes it
-O(1800^2); that will want an FFT-based circular correlation, which can be dropped
-in without touching the state machine.
+O(1800^2), so `fft_search` does the same job as one circular correlation.  Both
+satisfy `OverlaySearch` and neither touches the state machine.
+
+HOW LONG TO WATCH
+-----------------
+The observation window is a separate question from the overlay's length, and for
+L1C the two are wildly different.  A full NH20 period is 20 ms, so watching four
+of them costs nothing.  A full L1C overlay period is 18 SECONDS, and waiting for
+one before even attempting a search would be absurd -- the search is a matched
+filter over 1800 hypotheses, and a couple of hundred symbols already separates
+the true offset from every other by a wide margin.  `prompts_to_observe` sets the
+window directly for that case; `periods_to_observe` remains the default for short
+overlays, where thinking in whole periods is the natural thing.
 """
 
 from __future__ import annotations
@@ -76,6 +87,47 @@ def brute_force_search(prompts: np.ndarray, overlay: np.ndarray) -> tuple[int, f
     return best, confidence
 
 
+def fft_search(prompts: np.ndarray, overlay: np.ndarray) -> tuple[int, float]:
+    """
+    `brute_force_search`'s answer, by one circular correlation instead of L of them.
+
+    Folding the prompts onto the overlay's length turns the shifted sums into a
+    circular cross-correlation, so all L offsets come out of a single FFT pair:
+    O(L log L) rather than O(L * len(prompts)).  For L5's 20-chip overlay that is
+    slower than brute force and pointless; for L1C's 1800 it is the difference
+    between a few hundred microseconds and a tenth of a second, run once per
+    unsuccessful attempt.
+
+    The fold is exact rather than an approximation.  Prompt `n` multiplies
+    `overlay[(n + h) % L]` under every hypothesis, so prompts `L` apart always
+    share a factor and can be summed before the correlation instead of after:
+
+        sum_n p[n] * o[(n+h) % L]  ==  sum_m (sum_{n = m mod L} p[n]) * o[(m+h) % L]
+
+    A window shorter than the overlay leaves most bins empty, which is the
+    zero-padding case; a longer one -- L5 watches four whole periods -- fills each
+    bin several times over.  Both are the same operation.
+
+    The conjugate is free here.  `brute_force_search` sums `prompts * shifted`
+    without one, and the standard correlation theorem carries a conjugate -- but
+    the overlay is real, so the two results are complex conjugates of each other
+    and identical in magnitude, which is all either function reports.
+    """
+    length = len(overlay)
+    folded = np.zeros(length, dtype=complex)
+    np.add.at(folded, np.arange(len(prompts)) % length, prompts)
+
+    scores = np.abs(
+        np.fft.ifft(np.conj(np.fft.fft(folded)) * np.fft.fft(overlay.astype(float)))
+    )
+
+    best = int(np.argmax(scores))
+    ranked = np.sort(scores)[::-1]
+    runner_up = ranked[1] if len(ranked) > 1 else 0.0
+    confidence = float(ranked[0] / runner_up) if runner_up > 0 else np.inf
+    return best, confidence
+
+
 @dataclass
 class OverlaySynchroniser:
     """
@@ -92,6 +144,10 @@ class OverlaySynchroniser:
     reference_overlay: np.ndarray
     period: int
     periods_to_observe: int = 4
+    # Window length in prompts, overriding `periods_to_observe`.  Set it for an
+    # overlay long enough that a whole period is not a sensible unit of patience
+    # -- see HOW LONG TO WATCH in the module docstring.
+    prompts_to_observe: int | None = None
     confidence_threshold: float = 2.0
     search: OverlaySearch = brute_force_search
 
@@ -106,6 +162,10 @@ class OverlaySynchroniser:
                 f"counter period {self.period} must be a multiple of the reference "
                 f"overlay length {len(self.reference_overlay)}"
             )
+        if self.prompts_to_observe is not None and self.prompts_to_observe < 1:
+            raise ValueError(
+                f"prompts_to_observe must be at least 1, got {self.prompts_to_observe}"
+            )
 
     @property
     def synced(self) -> bool:
@@ -113,6 +173,9 @@ class OverlaySynchroniser:
 
     @property
     def observation_length(self) -> int:
+        """Prompts collected before a search is attempted."""
+        if self.prompts_to_observe is not None:
+            return self.prompts_to_observe
         return self.periods_to_observe * len(self.reference_overlay)
 
     def signs(self, overlays: Sequence[np.ndarray | None]) -> np.ndarray:
@@ -159,10 +222,16 @@ class OverlaySynchroniser:
         self.confidence = confidence
 
         if confidence < self.confidence_threshold:
-            # Ambiguous.  Drop the oldest overlay period and try again on the next
-            # prompt rather than discarding everything, so a marginal signal still
+            # Ambiguous.  Drop the oldest slice and try again on the next prompt
+            # rather than discarding everything, so a marginal signal still
             # converges instead of restarting from empty each time.
-            del self._prompts[: len(self.reference_overlay)]
+            #
+            # One overlay period is the natural slice and the one L5 uses.  It is
+            # capped at half the window because for L1C the overlay is nine times
+            # the window, so dropping a period would discard everything -- exactly
+            # the behaviour this is here to avoid.
+            stride = min(len(self.reference_overlay), max(1, self.observation_length // 2))
+            del self._prompts[:stride]
             return False
 
         # `prompts[0]` was counter value `offset`, so the prompt just observed --

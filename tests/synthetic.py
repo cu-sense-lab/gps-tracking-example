@@ -19,6 +19,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
+import gnss_tools.signals.gps_l1c as gps_l1c
 import gnss_tools.signals.gps_l1ca as gps_l1ca
 import gnss_tools.signals.gps_l2c as gps_l2c
 import gnss_tools.signals.gps_l5 as gps_l5
@@ -59,6 +60,18 @@ def get_l5_overlays() -> tuple[np.ndarray, np.ndarray]:
     nh_i = (1 - 2 * gps_l5.NEUMAN_HOFFMAN_SEQ_L5I).astype(np.int8)
     nh_q = (1 - 2 * gps_l5.NEUMAN_HOFFMAN_SEQ_L5Q).astype(np.int8)
     return nh_i, nh_q
+
+
+def get_l1c_codes(prn: int) -> tuple[np.ndarray, np.ndarray]:
+    """+/-1 int8 (L1CD, L1CP) ranging codes, 10230 chips each."""
+    code_d = (1 - 2 * gps_l1c.get_GPS_L1CD_code_sequence(prn)).astype(np.int8)
+    code_p = (1 - 2 * gps_l1c.get_GPS_L1CP_code_sequence(prn)).astype(np.int8)
+    return code_d, code_p
+
+
+def get_l1c_overlay(prn: int) -> np.ndarray:
+    """+/-1 int8 L1CO overlay, 1800 bits, carried on L1CP."""
+    return (1 - 2 * gps_l1c.get_GPS_L1CO_overlay_sequence(prn)).astype(np.int8)
 
 
 def _nav_bits(code_period_index: np.ndarray, periods_per_symbol: int) -> np.ndarray:
@@ -195,3 +208,80 @@ def _add_noise(
     n = len(samples)
     noise = rng.normal(0.0, sigma, n) + 1j * rng.normal(0.0, sigma, n)
     return (samples + noise).astype(np.complex64)
+
+
+def generate_l1c_samples(
+    prn: int,
+    start_sec: float,
+    duration_sec: float,
+    samp_rate: float,
+    doppler_hz: float,
+    code_phase_ms: float,
+    noise_sigma: float = 0.0,
+    nav_bits: bool = True,
+    overlay: bool = True,
+    rng: np.random.Generator | None = None,
+) -> np.ndarray:
+    """
+    Baseband GPS L1C: L1CD and L1CP summed IN PHASE, both at 1.023 Mcps.
+
+    Two things make this unlike the other generators here.
+
+    First, the components are added rather than placed in quadrature.  IS-GPS-800J
+    3.2.1.6.1 puts both L1C carriers in the same phase (and in phase with P(Y)), so
+    they are separated by their codes and by a 25/75 power split -- amplitudes
+    sqrt(0.25) and sqrt(0.75) -- and by nothing else.  Writing L1CP on the
+    imaginary axis, as L5's pilot legitimately is, would make the pilot trivially
+    separable and quietly flatter every discriminator downstream.
+
+    Second, each chip carries a subcarrier.  It is built here from `sign(sin(...))`
+    directly rather than from `code_components.subcarrier_signs`, so the fixture
+    and the correlator are independent statements of the same convention: L1CD is
+    BOC(1,1) throughout, and L1CP is BOC(6,1) on the 4 chips of every 33 named by
+    IS-GPS-800J 3.3 and BOC(1,1) on the other 29.
+
+    Note the sample rate this demands.  BOC(6,1) puts twelve sub-chips in a chip,
+    so 12.276 Mcps of sub-chip rate needs ~25 Msps to stay above two samples per
+    sub-chip; below ~14 Msps the BOC(6,1) lobes are gone entirely.
+    """
+    code_d, code_p = get_l1c_codes(prn)
+    overlay_p = get_l1c_overlay(prn)
+
+    n = int(round(samp_rate * duration_sec))
+    t = start_sec + np.arange(n) / samp_rate
+
+    code_rate = gps_l1c.CODE_RATE * (1.0 + doppler_hz / gps_l1c.CARRIER_FREQ)
+    chips = code_phase_ms * 1e-3 * gps_l1c.CODE_RATE + t * code_rate
+    chip_index = np.floor(chips).astype(np.int64)
+    within_chip = chips - chip_index
+
+    period_index = chip_index // gps_l1c.CODE_LENGTH
+    chip_of_period = chip_index % gps_l1c.CODE_LENGTH
+
+    def subcarrier(sub_chips_per_chip):
+        """sign(sin(2*pi*f_s*t)) over the chip, stated as its half-cycle index."""
+        return np.where(
+            (within_chip * sub_chips_per_chip).astype(np.int64) % 2 == 1, -1.0, 1.0
+        )
+
+    # L1CD is BOC(1,1) everywhere; L1CP swaps in BOC(6,1) on the TMBOC chips.
+    data_subcarrier = subcarrier(2)
+    tmboc = np.isin(
+        chip_of_period % gps_l1c.TMBOC_PATTERN_LENGTH,
+        np.array(gps_l1c.TMBOC_PATTERN_INDICES),
+    )
+    pilot_subcarrier = np.where(tmboc, subcarrier(12), data_subcarrier)
+
+    # One CNAV-2 symbol is exactly one 10 ms code period, and one L1CO bit is too.
+    data = _nav_bits(period_index, 1) if nav_bits else 1.0
+    overlay_sign = overlay_p[period_index % len(overlay_p)] if overlay else 1.0
+
+    amplitude_d = np.sqrt(gps_l1c.L1CD_POWER_FRACTION)
+    amplitude_p = np.sqrt(gps_l1c.L1CP_POWER_FRACTION)
+    composite = (
+        amplitude_d * code_d[chip_of_period] * data_subcarrier * data
+        + amplitude_p * code_p[chip_of_period] * pilot_subcarrier * overlay_sign
+    )
+
+    samples = composite * np.exp(2j * np.pi * doppler_hz * t)
+    return _add_noise(samples.astype(np.complex64), noise_sigma, rng)

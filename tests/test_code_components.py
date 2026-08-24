@@ -190,10 +190,14 @@ def test_overlay_and_subcarrier_flags():
         [
             CodeComponent("I", _code(32, 1), branch=Branch.I, overlay=_code(10, 3)),
             CodeComponent("Q", _code(32, 2), branch=Branch.Q, subcarrier=boc),
-        ]
+        ],
+        chip_rate_hz=1.023e6,
     )
     assert code_set.has_overlay
     assert code_set.has_subcarrier
+    # BOC(1,1): one subcarrier period per chip, so two sub-chips.  The component
+    # without a subcarrier carries 0, which is how the kernel skips it.
+    assert code_set.subcarrier_sub_chips_per_chip.tolist() == [0, 2]
 
 
 def test_rejects_float_sequences():

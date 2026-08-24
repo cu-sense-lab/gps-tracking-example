@@ -36,6 +36,11 @@ class TrackingSignalState:
     code_rate_ms_per_sec: float
     carrier_phase_cycles: float
     carrier_rate_cyc_per_sec: float
+    # How far the subcarrier's delay sits from the code's, in chips.  Zero means
+    # tied, which is ordinary BOC tracking and every signal but a double-estimator
+    # channel.  It does not propagate: both delays advance at the same code rate,
+    # so their difference is constant between loop updates.
+    subcarrier_offset_chips: float = 0.0
 
     def propagate_phase(self, new_uptime_epoch_ms: float) -> tuple[float, float]:
         "Return code phase (ms) and carrier phase (cycles) at new uptime epoch, without modifying state."
@@ -52,6 +57,7 @@ class TrackingSignalState:
             code_rate_ms_per_sec=self.code_rate_ms_per_sec,
             carrier_phase_cycles=new_carrier_phase_cycles,
             carrier_rate_cyc_per_sec=self.carrier_rate_cyc_per_sec,
+            subcarrier_offset_chips=self.subcarrier_offset_chips,
         )
 
 
@@ -73,6 +79,35 @@ class TrackingSignalParameters:
     @property
     def chip_period_sec(self) -> float:
         return 1.0 / self.nominal_code_rate_chips_per_sec
+
+    @property
+    def subcarrier_ambiguity_chips(self) -> float:
+        """
+        Spacing of the repeats a NON-COHERENT subcarrier discriminator sees, in
+        chips; 0 when the signal has no subcarrier.
+
+        The signed subcarrier correlation repeats every `2/S` chips for a wave of
+        `S` sub-chips per chip.  An early-minus-late-POWER discriminator combines
+        magnitudes, so it cannot tell the +1 peak from the -1 peak half a period
+        later and its ambiguity is half that: `1/S`.  For BOC(1,1) and for L1C's
+        TMBOC -- whose base rate is also BOC(1,1) -- that is 0.5 chip, confirmed
+        against the measured |R|, which peaks at 0 and +/-0.5 with nulls at +/-0.24.
+
+        The TMBOC pattern rate does not enter: BOC(6,1) sharpens the peak but the
+        29 chips in 33 that are BOC(1,1) are what set where it repeats.
+        """
+        base = {
+            int(n) for n in self.code_set.subcarrier_sub_chips_per_chip if n != 0
+        }
+        if not base:
+            return 0.0
+        if len(base) > 1:
+            raise ValueError(
+                f"components disagree on subcarrier rate ({sorted(base)} sub-chips "
+                "per chip), so the signal has no single ambiguity interval; the "
+                "double estimator would need one loop per rate"
+            )
+        return 1.0 / base.pop()
 
     @property
     def chip_length_m(self) -> float:
@@ -104,27 +139,129 @@ class LoopDiscriminatorPolicy:
             raise ValueError("code_components must not be empty")
 
 
+# Roles a correlator tap can play.  Named rather than positional because a
+# double-estimator layout has five taps on two axes, and "index 1" stops meaning
+# anything the moment the layout is not the classic early/prompt/late triple.
+PROMPT = "prompt"
+EARLY = "early"
+LATE = "late"
+SUBCARRIER_EARLY = "subcarrier_early"
+SUBCARRIER_LATE = "subcarrier_late"
+
+
+@dataclass(frozen=True)
+class TapLayout:
+    """
+    Where the correlator taps sit, as (code delay, subcarrier delay) pairs.
+
+    A BOC signal is a code multiplied by a subcarrier, and the two delays need not
+    be the same number.  Tying them is what gives a BOC correlation its side peaks;
+    separating them is the double estimator (`double_estimator_tap_layout`).  Every
+    tap therefore carries both offsets, and an ordinary BPSK layout is simply the
+    case where the subcarrier offsets equal the code offsets.
+
+    Taps are addressed by ROLE, not by index.  `epl_delay_bins`'s docstring has
+    said since the beginning that the layout is a tuple rather than a count plus a
+    step because BOC would need more taps; this is that promise kept.
+    """
+
+    code_offsets_chips: tuple[float, ...]
+    subcarrier_offsets_chips: tuple[float, ...]
+    roles: tuple[tuple[str, int], ...]
+
+    def __post_init__(self) -> None:
+        if len(self.code_offsets_chips) != len(self.subcarrier_offsets_chips):
+            raise ValueError(
+                f"a tap has one code offset and one subcarrier offset, got "
+                f"{len(self.code_offsets_chips)} and {len(self.subcarrier_offsets_chips)}"
+            )
+        if not self.code_offsets_chips:
+            raise ValueError("a tap layout needs at least one tap")
+        seen = dict(self.roles)
+        if len(seen) != len(self.roles):
+            raise ValueError(f"duplicate tap role in {self.roles}")
+        for role, index in self.roles:
+            if not 0 <= index < self.num_taps:
+                raise ValueError(
+                    f"role {role!r} points at tap {index}, but the layout has "
+                    f"{self.num_taps}"
+                )
+        if PROMPT not in seen:
+            raise ValueError("every layout needs a prompt tap")
+
+    @property
+    def num_taps(self) -> int:
+        return len(self.code_offsets_chips)
+
+    @property
+    def tracks_subcarrier(self) -> bool:
+        """True when the layout carries taps displaced along the subcarrier axis."""
+        names = dict(self.roles)
+        return SUBCARRIER_EARLY in names and SUBCARRIER_LATE in names
+
+    def index(self, role: str) -> int:
+        for name, position in self.roles:
+            if name == role:
+                return position
+        raise KeyError(f"no {role!r} tap in this layout; have {[n for n, _ in self.roles]}")
+
+    @property
+    def code_offsets(self) -> np.ndarray:
+        return np.ascontiguousarray(self.code_offsets_chips, dtype=np.float64)
+
+    @property
+    def subcarrier_offsets(self) -> np.ndarray:
+        return np.ascontiguousarray(self.subcarrier_offsets_chips, dtype=np.float64)
+
+
+def epl_tap_layout(chip_spacing: float) -> TapLayout:
+    """Classic early/prompt/late, subcarrier tied to the code."""
+    offsets = epl_delay_bins(chip_spacing)
+    return TapLayout(
+        code_offsets_chips=offsets,
+        subcarrier_offsets_chips=offsets,
+        roles=((EARLY, 0), (PROMPT, 1), (LATE, 2)),
+    )
+
+
+def double_estimator_tap_layout(
+    code_spacing_chips: float, subcarrier_spacing_chips: float
+) -> TapLayout:
+    """
+    Five taps on two axes: early/late along the code, early/late along the
+    subcarrier, and one prompt shared by both.
+
+    The code taps see the plain BPSK triangle -- one peak, a chip wide -- and the
+    subcarrier taps see a wave six times steeper but repeating.  Neither pair is
+    displaced along the other's axis, which is what keeps the two discriminators
+    independent.
+    """
+    if code_spacing_chips <= 0.0 or subcarrier_spacing_chips <= 0.0:
+        raise ValueError("tap spacings must be positive")
+    return TapLayout(
+        code_offsets_chips=(0.0, code_spacing_chips, -code_spacing_chips, 0.0, 0.0),
+        subcarrier_offsets_chips=(
+            0.0, 0.0, 0.0, subcarrier_spacing_chips, -subcarrier_spacing_chips,
+        ),
+        roles=(
+            (PROMPT, 0), (EARLY, 1), (LATE, 2),
+            (SUBCARRIER_EARLY, 3), (SUBCARRIER_LATE, 4),
+        ),
+    )
+
+
 @dataclass
 class DelayDopplerCorrelatorConfig:
-    """
-    Correlator bin layout.
+    """Correlator tap layout, plus an optional bank of Doppler hypotheses."""
 
-    Delay bins are an explicit tuple of chip offsets rather than a count plus a
-    step: BOC signals need asymmetric or wider layouts (very-early/very-late) to
-    resolve side-peak ambiguity.
-    """
-
-    bin_offsets_chips: np.ndarray
+    tap_layout: TapLayout
     num_dopplers: int = 1
     doppler_offset_hz: float = 0.0
     doppler_step_hz: float = 0.0
 
-    def __post_init__(self) -> None:
-        self.bin_offsets_chips = np.ascontiguousarray(self.bin_offsets_chips, dtype=np.float64)
-
     @property
     def num_delays(self) -> int:
-        return len(self.bin_offsets_chips)
+        return self.tap_layout.num_taps
 
 
 class AlignedCorrelator:
@@ -138,6 +275,10 @@ class AlignedCorrelator:
 
     def __init__(self, config: DelayDopplerCorrelatorConfig, num_components: int):
         self.config = config
+        # Materialised once: the kernel wants contiguous float64 and these are read
+        # on every buffer.
+        self._code_offsets = config.tap_layout.code_offsets
+        self._subcarrier_offsets = config.tap_layout.subcarrier_offsets
         shape = (config.num_delays, config.num_dopplers, num_components)
         # `corr_grid` holds one correlation interval -- for a signal with a tiered
         # code, one primary code period.  `epoch_grid` is where those intervals are
@@ -231,8 +372,10 @@ class AlignedCorrelator:
                 signal_params.code_set,
                 code_rate_chips_per_sec,
                 code_phase_chips,
-                self.config.bin_offsets_chips,
+                self._code_offsets,
                 self.corr_grid[:, i_dopp, :],
+                signal_state.subcarrier_offset_chips,
+                self._subcarrier_offsets,
             )
         self.corr_count += num_accum_samples
 
@@ -414,6 +557,13 @@ class TrackingLoopParameters:
     coherent_duration_ms: int = CORRELATION_INTERVAL_MS
     EPL_chip_spacing: float = 0.5
     prompt_corr_circ_length_threshold: float = 0.9
+    # Double estimator.  Both must be positive to enable it: the channel then lays
+    # out five taps instead of three and runs a second delay loop on the subcarrier
+    # axis.  The code loop can afford to be narrow, because all it has to do is
+    # stay inside half an ambiguity interval -- +/-0.25 chip on L1C -- while the
+    # subcarrier loop carries the precision.
+    subcarrier_bandwidth_hz: float = 0.0
+    subcarrier_chip_spacing: float = 0.0
 
     @property
     def intervals_per_epoch(self) -> int:
@@ -447,6 +597,21 @@ class TrackingLoopParameters:
         # Gain = 4 * Bn * T, where Bn is the FLL bandwidth in Hz and T is the update period in seconds
         self.FLL_filter_coeff = 4.0 * self.FLL_bandwidth_hz * update_period_seconds
 
+        # 1st-order subcarrier DLL, same form as the code one.
+        if (self.subcarrier_bandwidth_hz > 0.0) != (self.subcarrier_chip_spacing > 0.0):
+            raise ValueError(
+                "subcarrier_bandwidth_hz and subcarrier_chip_spacing enable the "
+                "double estimator together; got "
+                f"{self.subcarrier_bandwidth_hz} Hz and {self.subcarrier_chip_spacing} chips"
+            )
+        self.subcarrier_filter_coeff = (
+            4.0 * update_period_seconds * self.subcarrier_bandwidth_hz
+        )
+
+    @property
+    def tracks_subcarrier(self) -> bool:
+        return self.subcarrier_bandwidth_hz > 0.0 and self.subcarrier_chip_spacing > 0.0
+
 
 class SignalTrackingOutputs:
     """
@@ -457,15 +622,28 @@ class SignalTrackingOutputs:
     makes it impossible to silently broadcast one component across all columns.
     """
 
-    def __init__(self, capacity: int, num_components: int = 1, cn0_capacity: int = 0):
+    def __init__(
+        self,
+        capacity: int,
+        num_components: int = 1,
+        cn0_capacity: int = 0,
+        tap_layout: "TapLayout | None" = None,
+    ):
         self.capacity = capacity
         self.num_components = num_components
+        self.tap_layout = tap_layout if tap_layout is not None else epl_tap_layout(0.5)
         self.uptime_epoch_ms = np.zeros(capacity, dtype=float)
         self.carr_phase_errors_cycles = np.zeros(capacity, dtype=float)
         self.code_phase_errors_chips = np.zeros(capacity, dtype=float)
-        self.early_corr = np.zeros((capacity, num_components), dtype=complex)
-        self.prompt_corr = np.zeros((capacity, num_components), dtype=complex)
-        self.late_corr = np.zeros((capacity, num_components), dtype=complex)
+        # One array for every tap, addressed by role.  `early_corr`/`prompt_corr`/
+        # `late_corr` remain as views onto it, so a layout that happens to be the
+        # classic triple is indistinguishable from the old three arrays.
+        self.corr = np.zeros(
+            (capacity, self.tap_layout.num_taps, num_components), dtype=complex
+        )
+        # Displacement of the subcarrier's delay from the code's, per epoch; flat
+        # zero unless a double-estimator layout is tracking it.
+        self.subcarrier_offset_chips = np.zeros(capacity, dtype=float)
         self.carr_phase_cycles = np.zeros(capacity, dtype=float)
         self.doppler_freq_hz = np.zeros(capacity, dtype=float)
         self.code_phase_ms = np.zeros(capacity, dtype=float)
@@ -484,6 +662,22 @@ class SignalTrackingOutputs:
         self.cn0_dbhz = np.zeros((cn0_capacity, num_components), dtype=float)
         self.cn0_uptime_ms = np.zeros(cn0_capacity, dtype=float)
         self.cn0_index = 0
+
+    def tap(self, role: str) -> np.ndarray:
+        """All epochs of one named tap, shape (capacity, num_components)."""
+        return self.corr[:, self.tap_layout.index(role), :]
+
+    @property
+    def early_corr(self) -> np.ndarray:
+        return self.tap(EARLY)
+
+    @property
+    def prompt_corr(self) -> np.ndarray:
+        return self.tap(PROMPT)
+
+    @property
+    def late_corr(self) -> np.ndarray:
+        return self.tap(LATE)
 
     @property
     def valid(self) -> slice:
@@ -628,6 +822,8 @@ def _retune_for_update_period(
         coherent_duration_ms=int(update_period_ms),
         EPL_chip_spacing=loop_params.EPL_chip_spacing,
         prompt_corr_circ_length_threshold=loop_params.prompt_corr_circ_length_threshold,
+        subcarrier_bandwidth_hz=min(loop_params.subcarrier_bandwidth_hz, bandwidth_cap_hz),
+        subcarrier_chip_spacing=loop_params.subcarrier_chip_spacing,
     )
 
 
@@ -651,6 +847,8 @@ class TrackingChannel:
         synced_coherent_duration_ms: int = CORRELATION_INTERVAL_MS,
         initial_overlay_counter: int | None = None,
         cn0_params: CN0EstimatorParameters | None = None,
+        overlay_search: secondary_code.OverlaySearch | None = None,
+        overlay_prompts_to_observe: int | None = None,
     ) -> None:
         self.loop_params = loop_params
         self.signal_params = signal_params
@@ -686,16 +884,29 @@ class TrackingChannel:
         self._cn0_write = 0         # ring write position
         self._cn0_since_estimate = 0
 
+        # Built after the correlator config below, so the outputs know the layout.
+        self.outputs: SignalTrackingOutputs
+
+        if correlator_config is None:
+            if loop_params.tracks_subcarrier:
+                if not signal_params.code_set.has_subcarrier:
+                    raise ValueError(
+                        "the double estimator needs a subcarrier to track, but "
+                        f"{signal_params.code_set.names} has none"
+                    )
+                layout = double_estimator_tap_layout(
+                    loop_params.EPL_chip_spacing, loop_params.subcarrier_chip_spacing
+                )
+            else:
+                layout = epl_tap_layout(loop_params.EPL_chip_spacing)
+            correlator_config = DelayDopplerCorrelatorConfig(tap_layout=layout)
+        self._prompt_tap = correlator_config.tap_layout.index(PROMPT)
         self.outputs = SignalTrackingOutputs(
             capacity=output_capacity,
             num_components=num_components,
             cn0_capacity=cn0_capacity,
+            tap_layout=correlator_config.tap_layout,
         )
-
-        if correlator_config is None:
-            correlator_config = DelayDopplerCorrelatorConfig(
-                bin_offsets_chips=np.array(epl_delay_bins(loop_params.EPL_chip_spacing)),
-            )
         self.correlator = AlignedCorrelator(correlator_config, num_components=num_components)
         self.correlator_status = CorrelatorStatus.CLEARED
 
@@ -724,9 +935,27 @@ class TrackingChannel:
         # with unit signs, which is arithmetically identical to having no overlay
         # at all -- so signals without one are completely unaffected.
         self._overlays = tuple(c.overlay for c in signal_params.code_set.components)
+        overlay_sync_kwargs: dict = {}
+        if overlay_search is not None:
+            overlay_sync_kwargs["search"] = overlay_search
+        if overlay_prompts_to_observe is not None:
+            overlay_sync_kwargs["prompts_to_observe"] = overlay_prompts_to_observe
         self.overlay_sync = secondary_code.build_synchroniser(
-            self._overlays, reference_index=self.policy.carrier_component
+            self._overlays,
+            reference_index=self.policy.carrier_component,
+            **overlay_sync_kwargs,
         )
+        # An overlay chip lasts one PRIMARY CODE PERIOD, which is not the same
+        # thing as one correlation interval.  They coincide on L5 -- the only
+        # signal with an overlay until L1C -- and nowhere else: L1C's primary
+        # period is 10 ms, so its overlay advances once per ten intervals.
+        self._intervals_per_primary_period = (
+            signal_params.primary_period_ms // CORRELATION_INTERVAL_MS
+        )
+        # The search wants one prompt per overlay chip, so intervals are summed
+        # across the primary period before being handed over.  At one interval per
+        # period this is a copy and the sum is exact.
+        self._overlay_prompt = 0j
         self.coherent_duration_ms = loop_params.coherent_duration_ms
         self._epoch_interval_count = 0
 
@@ -848,7 +1077,15 @@ class TrackingChannel:
         update period, so a 20 ms epoch driving gains built for 1 ms is a 20x
         mistuning.  The two must not be separated.
         """
-        if self.coherent_duration_ms == self._synced_coherent_duration_ms:
+        # Only ever extend.  `synced_coherent_duration_ms` defaults to one
+        # interval, so a channel *started* multi-interval would otherwise be
+        # contracted here the moment its overlay synced -- and contracted onto
+        # `_synced_loop_params`, which is the un-retuned filter built for the
+        # longer epoch, so the gains would be wrong by the ratio as well.  No
+        # signal in the catalog configures it that way, because the ones that
+        # start long have no overlay; the guard is what keeps that an accident
+        # rather than a requirement.
+        if self._synced_coherent_duration_ms <= self.coherent_duration_ms:
             return
         if self.overlay_sync is None or not self.overlay_sync.synced:
             return
@@ -926,7 +1163,11 @@ class TrackingChannel:
         # Keep the full component vectors for output, and drive the loops with the
         # components the policy selects.  The epoch grid is the folded, overlay
         # wiped-off accumulation -- one interval long until the overlay syncs.
-        early_all, prompt_all, late_all = self.correlator.epoch_grid[:, 0]
+        epoch = self.correlator.epoch_grid[:, 0]
+        layout = self.correlator.config.tap_layout
+        early_all = epoch[layout.index(EARLY)]
+        prompt_all = epoch[layout.index(PROMPT)]
+        late_all = epoch[layout.index(LATE)]
         prompt = prompt_all[self.policy.carrier_component]
 
         # Compute loop discriminators
@@ -960,6 +1201,29 @@ class TrackingChannel:
         else:
             delta_eta = (2 - EPL_chip_spacing) * (early_mag - late_mag) / denom
 
+        # ---- subcarrier delay: the double estimator's second loop -------------
+        #
+        # The code taps above ride a plain BPSK triangle -- one peak, a chip wide,
+        # unambiguous, and shallow.  These ride the subcarrier, which near zero is
+        # about six times steeper on L1C and so carries the precision, but repeats.
+        #
+        # `subcarrier_ambiguity_chips` is the period of what this discriminator
+        # actually sees.  The signed subcarrier correlation repeats every chip, but
+        # the discriminator is non-coherent -- it combines MAGNITUDES, so it cannot
+        # tell the +1 peak at 0 from the -1 peak at half a chip and its period is
+        # half that.  Measured on L1CP: |R| peaks at 0 and +/-0.5, nulls at +/-0.24.
+        # The code loop therefore has to hold +/-0.25 chip, not +/-0.5.
+        delta_subcarrier_chips = 0.0
+        if layout.tracks_subcarrier:
+            sub_early_mag = self._combine_code_magnitude(epoch[layout.index(SUBCARRIER_EARLY)])
+            sub_late_mag = self._combine_code_magnitude(epoch[layout.index(SUBCARRIER_LATE)])
+            sub_denom = sub_early_mag + sub_late_mag + 2.0 * prompt_mag
+            if sub_denom >= 1e-12:
+                spacing = self.loop_params.subcarrier_chip_spacing
+                delta_subcarrier_chips = (
+                    (2 - spacing) * (sub_early_mag - sub_late_mag) / sub_denom
+                )
+
         # Apply loop filters to discriminators
         self.loop_state.update_history(prompt)
         circ_length = self.loop_state.compute_prompt_corr_history_circ_length(
@@ -988,6 +1252,31 @@ class TrackingChannel:
             filt_doppler_freq_error_hz = 0.0
             filt_code_phase_error_chips = 0.0
 
+        # Fold the subcarrier correction in and wrap it back into one ambiguity
+        # interval.  Wrapping IS the ambiguity resolution: the offset is kept in
+        # [-T/2, T/2), so the delay actually reported is the code loop's estimate
+        # plus a residual the subcarrier loop measured far more precisely than the
+        # code loop could.  The same move as resolving a carrier-phase integer
+        # against a code pseudorange, one cycle of the subcarrier instead of one of
+        # the carrier.
+        # The offset is a DIFFERENCE, tau_subcarrier - tau_code, so a correction to
+        # the code phase moves it too unless it is subtracted back out here.  Miss
+        # that and the code loop drags the subcarrier along with it: the taps then
+        # walk a diagonal of the 2-D surface instead of its two axes, and the code
+        # discriminator acquires a stable zero away from the truth (measured: it
+        # settles 0.23 chip off).  Independence is the whole premise.
+        subcarrier_offset_chips = self.signal_state.subcarrier_offset_chips
+        if layout.tracks_subcarrier:
+            subcarrier_offset_chips += (
+                self.loop_params.subcarrier_filter_coeff * delta_subcarrier_chips
+                - filt_code_phase_error_chips
+            )
+            ambiguity = self.signal_params.subcarrier_ambiguity_chips
+            if ambiguity > 0.0:
+                subcarrier_offset_chips -= ambiguity * round(
+                    subcarrier_offset_chips / ambiguity
+                )
+
         # State update and propagation
         # Rate (Doppler) is updated first, then code/carrier phase is updated and propagated based on updated rate.
         doppler_freq_hz = self.signal_state.carrier_rate_cyc_per_sec + filt_doppler_freq_error_hz
@@ -1000,6 +1289,7 @@ class TrackingChannel:
         carrier_phase_cycles = (
             self.signal_state.carrier_phase_cycles + filt_carr_phase_error_cycles
         )
+        self.signal_state.subcarrier_offset_chips = subcarrier_offset_chips
         code_phase_ms = (
             self.signal_state.code_phase_ms
             + filt_code_phase_error_chips
@@ -1013,9 +1303,8 @@ class TrackingChannel:
             self.outputs.uptime_epoch_ms[idx] = uptime_epoch_ms
             self.outputs.carr_phase_errors_cycles[idx] = delta_theta
             self.outputs.code_phase_errors_chips[idx] = delta_eta
-            self.outputs.early_corr[idx] = early_all
-            self.outputs.prompt_corr[idx] = prompt_all
-            self.outputs.late_corr[idx] = late_all
+            self.outputs.corr[idx] = epoch
+            self.outputs.subcarrier_offset_chips[idx] = subcarrier_offset_chips
             self.outputs.carr_phase_cycles[idx] = carrier_phase_cycles
             self.outputs.doppler_freq_hz[idx] = doppler_freq_hz
             self.outputs.code_phase_ms[idx] = code_phase_ms
@@ -1037,6 +1326,7 @@ class TrackingChannel:
             code_rate_ms_per_sec=code_rate_ms_per_sec,
             carrier_phase_cycles=carrier_phase_cycles,
             carrier_rate_cyc_per_sec=doppler_freq_hz,
+            subcarrier_offset_chips=subcarrier_offset_chips,
         )
         _, next_epoch_uptime_ms = self.corr_interval.compute_start_and_stop_uptime_ms(
             posterior
@@ -1065,9 +1355,10 @@ class TrackingChannel:
         if not params.enabled or self.outputs.cn0_capacity == 0:
             return
 
-        # Prompt is delay tap 1; every component, since magnitude costs nothing to
-        # keep and comparing I against Q is the point.
-        prompt = self.correlator.corr_grid[1, 0, :]
+        # Every component, since magnitude costs nothing to keep and comparing one
+        # against another is the point.  By role: the prompt is not tap 1 in a
+        # double-estimator layout.
+        prompt = self.correlator.corr_grid[self._prompt_tap, 0, :]
         self._cn0_power[self._cn0_write] = np.abs(prompt) ** 2
         self._cn0_write = (self._cn0_write + 1) % params.period_ms
         self._cn0_fill = min(self._cn0_fill + 1, params.period_ms)
@@ -1105,19 +1396,42 @@ class TrackingChannel:
         if self.overlay_sync is None:
             signs = self._unit_signs
         else:
+            # Where this interval sits inside the primary code period, read off the
+            # code phase rather than counted.  Intervals are whole milliseconds of
+            # code phase and the code repeats every `primary_period_ms`, so this is
+            # exact -- and unlike a running count it cannot drift when an interval
+            # is dropped (a gap in the stream, or the epoch-anchoring wait below).
+            position = (
+                self.corr_interval.start_code_phase_ms // CORRELATION_INTERVAL_MS
+            ) % self._intervals_per_primary_period
+            last_interval_of_period = position == self._intervals_per_primary_period - 1
+
             # Feed the synchroniser the raw prompt, before wipe-off: it is looking
             # for the overlay's own sign pattern, which wipe-off would remove.
             # Gated on PLL lock, because an un-locked carrier leaves the prompts
             # rotating and the correlation meaningless.
+            #
+            # One prompt per OVERLAY CHIP is what the search is defined on, so the
+            # intervals of a primary period are summed first.  Feeding it fragments
+            # instead would make the recovered offset an interval index rather than
+            # an overlay index, and cost 10*log10(intervals) dB per sample besides.
             if not self.overlay_sync.synced and self.loop_state.mode is TrackingLoopMode.PLL:
-                prompt = self.correlator.corr_grid[1, 0, self.policy.carrier_component]
-                if self.overlay_sync.observe(complex(prompt)):
-                    self._on_overlay_synced()
+                if position == 0:
+                    self._overlay_prompt = 0j
+                self._overlay_prompt += complex(
+                    self.correlator.corr_grid[1, 0, self.policy.carrier_component]
+                )
+                if last_interval_of_period:
+                    if self.overlay_sync.observe(self._overlay_prompt):
+                        self._on_overlay_synced()
+
             # Signs are read *after* a possible sync so that the interval which
             # triggered it is itself wiped off correctly, rather than folded raw
-            # into the freshly reset epoch.
+            # into the freshly reset epoch.  Every interval of a primary period
+            # carries the same overlay chip, so only the last one advances.
             signs = self.overlay_sync.signs(self._overlays)
-            self.overlay_sync.advance()
+            if last_interval_of_period:
+                self.overlay_sync.advance()
 
         # Open the epoch grid on a data symbol boundary.
         #
