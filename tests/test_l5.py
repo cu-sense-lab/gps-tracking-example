@@ -59,10 +59,10 @@ def test_components_are_colocated_not_interleaved(l5_definition):
     what keeps it on Q from the first epoch.
     """
     code_set = l5_definition.code_set
-    assert code_set.names == ("I", "Q")
+    assert code_set.names == ("L5I", "L5Q")
     np.testing.assert_array_equal(code_set.component_code_lengths, [10230, 10230])
     assert np.all(code_set.codes_flat != 0), "L5 transmits both components at every chip"
-    assert not code_set.share_branch("I", "Q")
+    assert not code_set.share_branch("L5I", "L5Q")
 
 
 def test_primary_period_is_one_millisecond(l5_definition):
@@ -90,7 +90,7 @@ def test_carrier_loop_runs_on_the_pilot(l5_definition):
     the pilot is not yet effectively dataless.
     """
     policy = TRACKING_POLICIES[GpsL5.signal_type_id].discriminator_policy
-    assert policy.carrier_component == l5_definition.code_set.index_of("Q")
+    assert policy.carrier_component == l5_definition.code_set.index_of("L5Q")
     assert policy.code_components == (0, 1), "delay discriminator should combine I and Q"
     assert policy.costas is True
 
@@ -184,7 +184,10 @@ def test_early_late_are_symmetric_when_aligned(l5_definition):
 # Acquisition
 # --------------------------------------------------------------------------
 
-def _acquisition_config() -> bpsk_acquisition.AcquisitionConfiguration:
+def _acquisition_config(
+    fine_search: bpsk_acquisition.FineSearchParameters | None = None,
+    doppler_hz: tuple[float, float] = (-5000, 5000),
+) -> bpsk_acquisition.AcquisitionConfiguration:
     """
     The composite-Q dwell: replica = primary x NH20 = 20 ms, coherent = 5 ms x 4.
 
@@ -199,22 +202,23 @@ def _acquisition_config() -> bpsk_acquisition.AcquisitionConfiguration:
     epoch is shared across components.
     """
     return bpsk_acquisition.AcquisitionConfiguration(
-        replica_duration_ms=20,
-        coherent_duration_ms=5.0,
+        coherent_duration_replica_ms=20,
+        coherent_duration_sample_ms=5.0,
         num_blocks=4,
         sample_rate=SAMP_RATE,
-        min_search_doppler_hz=-5000,
-        max_search_doppler_hz=5000,
+        min_search_doppler_hz=doppler_hz[0],
+        max_search_doppler_hz=doppler_hz[1],
+        fine_search=fine_search,
     )
 
 
 
 def _acquire(
-    true_doppler_hz, code_phase_ms, half_bin, prn=PRN, noise_sigma=2.0, seed=0,
-    start_sec=0.0, nav_bits=True,
+    true_doppler_hz, code_phase_ms, fine_search=None, prn=PRN, noise_sigma=2.0, seed=0,
+    start_sec=0.0, nav_bits=True, doppler_hz=(-5000, 5000), window_bins=1,
 ):
     definitions = build_signals(GpsL5, prns=[prn])
-    config = _acquisition_config()
+    config = _acquisition_config(fine_search, doppler_hz)
     samples = synthetic.generate_l5_samples(
         prn=prn, start_sec=start_sec, duration_sec=config.acq_total_duration_ms * 1e-3,
         samp_rate=SAMP_RATE, doppler_hz=true_doppler_hz, code_phase_ms=code_phase_ms,
@@ -227,14 +231,14 @@ def _acquire(
         code_parameters=build_acquisition_code_params(GpsL5, definitions),
         prob_false_alarm_total=1e-6,
         noise_var_method="abscorrvar",
-        half_bin_doppler_search=half_bin,
+        save_corr_doppler_window_bins=window_bins,
     )
     return results[f"G{prn:02d}"], config
 
 
 def test_acquisition_detects_and_locates_the_signal():
     code_phase_ms = 0.31
-    result, _ = _acquire(1234.0, code_phase_ms, half_bin=True)
+    result, _ = _acquire(1234.0, code_phase_ms, fine_search=bpsk_acquisition.FineSearchParameters())
     assert result.signal_detected
     # Code phase resolves to one sample.
     assert result.acq_code_phase_seconds * 1e3 == pytest.approx(
@@ -298,7 +302,7 @@ def test_composite_replica_separates_grid_from_response():
     replica to 25 Hz -- comfortably inside a 1 ms FLL's +/-250 Hz unambiguous range, which is
     what the half-bin search previously existed to rescue.
     """
-    _, config = _acquire(0.0, 0.0, half_bin=False)
+    _, config = _acquire(0.0, 0.0, fine_search=None)
     assert config.fft_resolution == pytest.approx(50.0)
     assert config.doppler_response_width_hz == pytest.approx(200.0)
 
@@ -319,7 +323,7 @@ def test_composite_code_phase_carries_the_overlay_counter():
     # index (8.31 ms for a true 7.31 ms).  Q carries no data, so the counter is exact.
     for start_ms, expected_index in ((0.0, 0), (3.0, 3), (7.0, 7), (13.0, 13)):
         result, _ = _acquire(
-            1234.0, code_phase_ms, half_bin=False, start_sec=start_ms * 1e-3
+            1234.0, code_phase_ms, fine_search=None, start_sec=start_ms * 1e-3
         )
         assert result.signal_detected
         phase_ms = result.acq_code_phase_seconds * 1e3
@@ -331,38 +335,272 @@ def test_composite_code_phase_carries_the_overlay_counter():
         assert phase_ms % 1.0 == pytest.approx(code_phase_ms, abs=2e-3)
 
 
-@pytest.mark.parametrize("true_doppler_hz", [0.0, 250.0, 400.0, 500.0, 700.0, -400.0, -500.0])
-def test_half_bin_search_halves_worst_case_doppler_error(true_doppler_hz):
+FINE = bpsk_acquisition.FineSearchParameters
+
+
+def test_fine_grid_contains_the_coarse_bins():
     """
-    Also fixes the sign: mixing the samples down by half a bin makes the signal
-    appear lower, so the recovered Doppler is the bin centre *plus* the offset.
-    Getting this backwards would double the error instead of halving it.
+    The fine grid is a uniform sub-division that lands *on* the coarse bins, not a
+    shifted grid beside them.  Everything else here compares fine against coarse at
+    a shared bin, so this property is what makes those comparisons meaningful.
     """
-    coarse, config = _acquire(true_doppler_hz, 0.31, half_bin=False)
-    fine, _ = _acquire(true_doppler_hz, 0.31, half_bin=True)
-    assert coarse.signal_detected and fine.signal_detected
+    result, config = _acquire(0.0, 0.31, fine_search=FINE())
+    fine = result.fine_correlation_result
+    assert fine is not None
 
-    # Half a grid step is the worst case without the search; the half-bin pass can
-    # only improve on it.
-    assert abs(fine.acq_doppler_hz - true_doppler_hz) <= 0.5 * config.fft_resolution + 1e-6
-    assert abs(fine.acq_doppler_hz - true_doppler_hz) <= abs(
-        coarse.acq_doppler_hz - true_doppler_hz
-    ) + 1e-6
+    delays = fine.code_phase_bins_seconds
+    dopplers = fine.doppler_bins_hz
+    assert len(delays) == FINE().num_delay_taps == 13
+    assert len(dopplers) == FINE().num_doppler_hypotheses == 5
 
-
-def test_half_bin_offset_is_reported_and_applied():
-    # 525 Hz sits on a half-bin of the 50 Hz grid, so the shifted pass must win.
-    fine, config = _acquire(525.0, 0.31, half_bin=True)
-    assert fine.doppler_offset_hz == pytest.approx(0.5 * config.fft_resolution)
-    bin_centre = config.doppler_search_bins[fine.peak_doppler_bin] * config.fft_resolution
-    assert fine.acq_doppler_hz == pytest.approx(bin_centre + fine.doppler_offset_hz)
+    # Step is one bin over the factor, and the centre coincides with the coarse peak.
+    assert (delays[1] - delays[0]) == pytest.approx(1 / (SAMP_RATE * 2))
+    assert (dopplers[1] - dopplers[0]) == pytest.approx(config.fft_resolution / 2)
+    assert delays[len(delays) // 2] == pytest.approx(result.coarse_code_phase_seconds)
+    assert dopplers[len(dopplers) // 2] == pytest.approx(result.coarse_doppler_hz)
 
 
-def test_half_bin_search_is_off_by_default():
-    """Existing L1CA/L2C callers must be unaffected."""
-    coarse, config = _acquire(400.0, 0.31, half_bin=False)
-    assert coarse.doppler_offset_hz == 0.0
-    assert coarse.acq_doppler_hz % config.fft_resolution == pytest.approx(0.0)
+def test_fine_and_coarse_agree_bin_for_bin_when_there_is_no_drift():
+    """
+    The fine grid is evaluated in the time domain, the coarse one by FFT.  At zero
+    Doppler there is no code drift for the fine search to correct, so the two must
+    produce the *same number* at a shared bin.  Nothing else catches a normalisation
+    error between the two paths.
+    """
+    result, _ = _acquire(
+        0.0, 0.31, noise_sigma=0.0,
+        fine_search=FINE(delay_factor=1, doppler_factor=1,
+                         delay_halfwidth_bins=1, doppler_halfwidth_bins=1),
+    )
+    centre = float(result.fine_correlation_result.correlation_matrix[1, 1])
+    coarse_peak = result.normalized_peak_value * result.noise_var
+    assert centre == pytest.approx(coarse_peak, rel=1e-3)
+
+
+def test_fine_search_corrects_code_drift_the_coarse_search_cannot():
+    """
+    The coarse replica runs at the nominal chip rate, so it does not model the code
+    drifting within the dwell -- 0.107 chips per 5 ms block at 2450 Hz on L5, which
+    leaves the four blocks' peaks displaced from each other.  The fine search slaves
+    the code rate to Doppler and recovers it.
+
+    Compared **peak to peak**, not bin to bin: at the coarse peak's own bin the fine
+    value is lower, because the coarse value there is inflated by exactly the
+    smearing being corrected.
+    """
+    true_code_phase_ms = 0.31
+    coarse_only, _ = _acquire(2450.0, true_code_phase_ms, noise_sigma=0.0)
+    refined, _ = _acquire(
+        2450.0, true_code_phase_ms, noise_sigma=0.0,
+        fine_search=FINE(delay_factor=4, doppler_factor=1,
+                         delay_halfwidth_bins=4, doppler_halfwidth_bins=1),
+    )
+    true_seconds = true_code_phase_ms * 1e-3
+    coarse_error = abs(coarse_only.coarse_code_phase_seconds - true_seconds) * SAMP_RATE
+    fine_error = abs(refined.acq_code_phase_seconds - true_seconds) * SAMP_RATE
+
+    assert coarse_error > 0.5, "expected the coarse search to be displaced by drift"
+    assert fine_error < 0.3, f"fine search should recover it, got {fine_error:.3f} samples"
+
+    fine_peak = float(refined.fine_correlation_result.correlation_matrix.max())
+    coarse_peak = refined.normalized_peak_value * refined.noise_var
+    assert fine_peak > coarse_peak
+
+
+@pytest.mark.parametrize("offset_samples", [0.0, 0.25, 0.5, -0.25, -0.5])
+def test_fine_search_bounds_the_delay_error_by_half_a_fine_step(offset_samples):
+    """The refined estimate must land within half a fine step of the truth."""
+    code_phase_ms = (7750 + offset_samples) / SAMP_RATE * 1e3
+    result, _ = _acquire(
+        0.0, code_phase_ms, noise_sigma=0.0,
+        fine_search=FINE(delay_factor=4, doppler_factor=1,
+                         delay_halfwidth_bins=3, doppler_halfwidth_bins=1),
+    )
+    error_samples = abs(result.acq_code_phase_seconds - code_phase_ms * 1e-3) * SAMP_RATE
+    assert error_samples <= 0.5 / 4 + 1e-6
+
+
+def test_fine_search_near_the_code_period_boundary_wraps_only_the_scalar():
+    """
+    A peak a sample short of the code period leaves the window hanging over the end.
+    The correlation is still right (the kernel wraps code phase internally) and the
+    stored axis stays monotonic -- deliberately unwrapped, or it could not be
+    plotted -- while the reported scalar comes back inside one period.
+    """
+    config = _acquisition_config()
+    period_seconds = config.coherent_duration_replica_ms * 1e-3
+    # One sample short of the end of the 20 ms composite code.
+    code_phase_ms = (period_seconds - 1.0 / SAMP_RATE) * 1e3
+
+    result, _ = _acquire(
+        0.0, code_phase_ms, noise_sigma=0.0,
+        fine_search=FINE(delay_halfwidth_bins=3, doppler_halfwidth_bins=1),
+    )
+    assert result.signal_detected
+
+    axis = result.fine_correlation_result.code_phase_bins_seconds
+    assert np.all(np.diff(axis) > 0), "the stored delay axis must stay monotonic"
+    assert axis[-1] > period_seconds, "this case is only interesting if the window overhangs"
+
+    wrapped = result.acq_code_phase_seconds
+    assert 0.0 <= wrapped < period_seconds, f"scalar must be wrapped, got {wrapped}"
+
+
+def test_fine_search_only_runs_on_a_detection():
+    """Refining a noise maximum would dress noise up as a measurement."""
+    definitions = build_signals(GpsL5, prns=[PRN])
+    config = _acquisition_config(FINE())
+    rng = np.random.default_rng(3)
+    noise = (
+        rng.normal(0, 5, config.total_num_samples)
+        + 1j * rng.normal(0, 5, config.total_num_samples)
+    ).astype(np.complex64)
+    results = bpsk_acquisition.run_acquisition(
+        sample_block=noise,
+        sample_block_uptime_epoch_ms=0.0,
+        acq_config=config,
+        code_parameters=build_acquisition_code_params(GpsL5, definitions),
+        prob_false_alarm_total=1e-9,
+        noise_var_method="abscorrvar",
+    )
+    result = results[f"G{PRN:02d}"]
+    assert not result.signal_detected
+    assert result.fine_correlation_result is None
+    assert result.acq_doppler_hz == result.coarse_doppler_hz
+
+
+def test_fine_search_leaves_the_detection_statistics_alone():
+    """
+    Detection is decided on the coarse grid, whose false-alarm statistics were
+    derived for it.  Enabling a post-detection refinement must not move the
+    threshold, the cell count, or the value being thresholded.
+    """
+    plain, _ = _acquire(1234.0, 0.31)
+    refined, _ = _acquire(1234.0, 0.31, fine_search=FINE())
+    assert refined.signal_detected == plain.signal_detected
+    assert refined.num_detection_cells == plain.num_detection_cells
+    assert refined.detection_threshold == pytest.approx(plain.detection_threshold)
+    assert refined.normalized_peak_value == pytest.approx(plain.normalized_peak_value)
+
+
+def test_fine_search_is_off_by_default_and_leaves_estimates_coarse():
+    result, _ = _acquire(1234.0, 0.31)
+    assert result.fine_correlation_result is None
+    assert result.acq_doppler_hz == result.coarse_doppler_hz
+    assert result.acq_code_phase_seconds == result.coarse_code_phase_seconds
+
+
+def test_fine_search_reports_its_error_ranges():
+    plain = _acquisition_config()
+    fine = _acquisition_config(FINE(delay_factor=4, doppler_factor=4))
+
+    assert plain.doppler_error_hz == pytest.approx(0.5 * plain.fft_resolution)
+    assert fine.doppler_error_hz == pytest.approx(0.5 * fine.fft_resolution / 4)
+    assert plain.code_phase_error_seconds == pytest.approx(0.5 / SAMP_RATE)
+    assert fine.code_phase_error_seconds == pytest.approx(0.5 / SAMP_RATE / 4)
+
+    assert "fine search" not in plain.search_resolution_summary()
+    assert "delay x4" in fine.search_resolution_summary()
+
+
+def test_fine_search_rejects_a_window_too_narrow_to_bracket_the_peak():
+    """A halfwidth of 0 searches only the coarse peak, which can be half a bin off."""
+    with pytest.raises(ValueError, match="halfwidths must be >= 1"):
+        FINE(delay_halfwidth_bins=0)
+
+
+def test_retained_correlation_keeps_full_delay_and_a_doppler_window():
+    """
+    Multipath lives in the delay dimension, so that axis is kept whole and the
+    Doppler axis is cut down to the peak and its neighbours.  Retaining the whole
+    grid is ~700 MB per PRN, which a 32-PRN sweep cannot afford.
+    """
+    windowed, config = _acquire(1234.0, 0.31, window_bins=1)
+    full, _ = _acquire(1234.0, 0.31, window_bins=None)
+
+    assert windowed.correlation_result.correlation_matrix.shape == (
+        3, config.replica_length_samples
+    )
+    assert full.correlation_result.correlation_matrix.shape == (
+        config.num_doppler_bins, config.replica_length_samples
+    )
+    assert windowed.acq_doppler_hz == full.acq_doppler_hz
+    assert windowed.acq_code_phase_seconds == full.acq_code_phase_seconds
+
+
+def test_retained_doppler_axis_stays_absolute_and_centred_on_the_peak():
+    """
+    The stored matrix is a window, but its axis must still read true Doppler --
+    the same discipline `start_code_phase_seconds` follows.  Reporting it relative
+    to the window would silently move every plotted peak to 0 Hz.
+    """
+    result, config = _acquire(1234.0, 0.31, window_bins=1)
+    doppler_hz = result.correlation_result.doppler_bins_hz
+
+    assert len(doppler_hz) == 3
+    assert doppler_hz[1] == pytest.approx(result.acq_doppler_hz)
+    assert doppler_hz[0] == pytest.approx(result.acq_doppler_hz - config.fft_resolution)
+    assert doppler_hz[2] == pytest.approx(result.acq_doppler_hz + config.fft_resolution)
+
+
+@pytest.mark.parametrize("edge", ["low", "high"])
+def test_doppler_window_overhanging_the_grid_is_nan_filled_not_clipped(edge):
+    """
+    A peak at the edge of the search range leaves the window with nowhere to take a
+    row from.  NaN-filling rather than clipping keeps the shape fixed and the peak
+    in the centre, which is what lets consumers index the centre row instead of
+    hunting for the peak.
+    """
+    true_doppler_hz = 1000.0
+    # Put the searched range so the peak lands in the first (or last) bin.
+    span = 400.0
+    doppler_hz = (
+        (true_doppler_hz, true_doppler_hz + span) if edge == "low"
+        else (true_doppler_hz - span, true_doppler_hz + 1.0)
+    )
+    result, config = _acquire(true_doppler_hz, 0.31, doppler_hz=doppler_hz, window_bins=1)
+    assert result.signal_detected
+
+    matrix = result.correlation_result.correlation_matrix
+    assert matrix.shape[0] == 3, "shape must not depend on where the peak landed"
+
+    peak_index = result.peak_doppler_bin
+    overhangs_low = peak_index == 0
+    overhangs_high = peak_index == config.num_doppler_bins - 1
+    assert overhangs_low or overhangs_high, "test did not place the peak at an edge"
+
+    if overhangs_low:
+        assert np.all(np.isnan(matrix[0])), "row below the grid must be NaN"
+    if overhangs_high:
+        assert np.all(np.isnan(matrix[2])), "row above the grid must be NaN"
+    assert np.all(np.isfinite(matrix[1])), "the peak row must still hold data"
+
+    # The axis stays correct across the NaN rows, so it is still evenly spaced and
+    # still centred on the peak.
+    doppler_bins_hz = result.correlation_result.doppler_bins_hz
+    assert doppler_bins_hz[1] == pytest.approx(result.acq_doppler_hz)
+    assert np.allclose(np.diff(doppler_bins_hz), config.fft_resolution)
+
+
+def test_correlation_histogram_survives_nan_rows():
+    """
+    NaN-filling is the cost of the fixed shape, and `np.mean` of anything holding a
+    NaN is NaN -- so the one plot that reduces over the whole matrix has to use the
+    nan-aware forms or it silently produces nothing.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from utils import plotting
+
+    result, _ = _acquire(1000.0, 0.31, doppler_hz=(1000.0, 1400.0), window_bins=1)
+    assert np.isnan(result.correlation_result.correlation_matrix).any()
+
+    fig = plt.figure()
+    ax = plotting.plot_acquisition_correlation_histogram(fig, result, num_blocks=4)
+    heights = [p.get_height() for p in ax.containers[0]]
+    plt.close(fig)
+    assert np.isfinite(heights).all() and sum(heights) > 0
 
 
 # --------------------------------------------------------------------------
@@ -378,13 +616,13 @@ def test_acquisition_seeds_tracking_to_convergence():
     from utils.signal_interfaces import create_tracking_channels
 
     true_doppler_hz, code_phase_ms, prn = 1234.0, 0.31, PRN
-    acq_result, _ = _acquire(true_doppler_hz, code_phase_ms, half_bin=True, prn=prn)
+    acq_result, _ = _acquire(true_doppler_hz, code_phase_ms, fine_search=bpsk_acquisition.FineSearchParameters(), prn=prn)
     assert acq_result.signal_detected
 
     definitions = build_signals(GpsL5, prns=[prn])
     loop_params = tracking_channel.TrackingLoopParameters(
         DLL_bandwidth_hz=2.0, PLL_bandwidth_hz=20.0, FLL_bandwidth_hz=50.0,
-        coherent_integration_ms=1, EPL_chip_spacing=0.5,
+        coherent_duration_ms=1, EPL_chip_spacing=0.5,
     )
     channels = create_tracking_channels(
         GpsL5,
@@ -454,13 +692,12 @@ def _track_until_synced(noise_sigma=3.0, buffers=14, buffer_ms=50, seed=4):
         sample_block_uptime_epoch_ms=0.0, acq_config=config,
         code_parameters=build_acquisition_code_params(GpsL5, definitions),
         prob_false_alarm_total=1e-6, noise_var_method="abscorrvar",
-        half_bin_doppler_search=True,
-    )[f"G{PRN:02d}"]
+            )[f"G{PRN:02d}"]
     assert acq.signal_detected
 
     loop_params = tracking_channel.TrackingLoopParameters(
         DLL_bandwidth_hz=2.0, PLL_bandwidth_hz=20.0, FLL_bandwidth_hz=50.0,
-        coherent_integration_ms=1, EPL_chip_spacing=0.5,
+        coherent_duration_ms=1, EPL_chip_spacing=0.5,
     )
     adapter = create_tracking_channels(
         GpsL5,
@@ -476,7 +713,7 @@ def _track_until_synced(noise_sigma=3.0, buffers=14, buffer_ms=50, seed=4):
     adapter.channel.overlay_sync.status = secondary_code.OverlaySyncStatus.UNSYNCED
     adapter.channel.overlay_sync.counter = 0
     adapter.channel._set_policy(TRACKING_POLICIES[GpsL5.signal_type_id].discriminator_policy)
-    adapter.channel.coherent_integration_ms = loop_params.coherent_integration_ms
+    adapter.channel.coherent_duration_ms = loop_params.coherent_duration_ms
     adapter.channel.loop_params = loop_params
 
     synced_at_epoch = None
@@ -502,13 +739,13 @@ def test_overlay_syncs_and_switches_to_pilot_tracking():
     assert channel.overlay_sync.confidence > 2.0
 
     # Everything that must move together at the transition.
-    assert channel.coherent_integration_ms == 10, "coherent accumulation did not extend"
+    assert channel.coherent_duration_ms == 10, "coherent accumulation did not extend"
     assert channel.policy.costas is False, "pilot should drop Costas wrapping"
     assert channel.policy.code_components == (0, 1), (
         "delay discriminator should combine I and Q -- a 10 ms epoch is exactly one "
         "CNAV symbol, so I no longer cancels and is worth ~3 dB non-coherently"
     )
-    assert channel.loop_params.coherent_integration_ms == 10, "loop filter not retuned"
+    assert channel.loop_params.coherent_duration_ms == 10, "loop filter not retuned"
 
 
 def test_wipe_off_gives_n_fold_coherent_gain():
@@ -558,7 +795,7 @@ def test_extending_integration_narrows_the_loops():
     """
     adapter, _, _ = _track_until_synced()
     params = adapter.channel.loop_params
-    update_period_sec = params.coherent_integration_ms * 1e-3
+    update_period_sec = params.coherent_duration_ms * 1e-3
     for bandwidth_hz in (
         params.PLL_bandwidth_hz, params.DLL_bandwidth_hz, params.FLL_bandwidth_hz
     ):
@@ -598,7 +835,7 @@ def _seeded_channel(initial_overlay_counter, doppler_hz=1500.0, code_phase_ms=0.
     return tracking_channel.TrackingChannel(
         loop_params=tracking_channel.TrackingLoopParameters(
             DLL_bandwidth_hz=2.0, PLL_bandwidth_hz=20.0, FLL_bandwidth_hz=50.0,
-            coherent_integration_ms=1, EPL_chip_spacing=0.5,
+            coherent_duration_ms=1, EPL_chip_spacing=0.5,
         ),
         signal_params=tracking_channel.TrackingSignalParameters(
             code_set=signal.code_set,
@@ -613,7 +850,7 @@ def _seeded_channel(initial_overlay_counter, doppler_hz=1500.0, code_phase_ms=0.
         output_capacity=4000,
         discriminator_policy=policy.discriminator_policy,
         synced_policy=policy.synced_discriminator_policy,
-        synced_coherent_integration_ms=policy.synced_coherent_integration_ms,
+        synced_coherent_duration_ms=policy.synced_coherent_duration_ms,
         initial_overlay_counter=initial_overlay_counter,
     )
 
@@ -625,14 +862,14 @@ def _drive(channel, doppler_hz=1500.0, code_phase_ms=0.31, buffers=14, buffer_ms
     rng = np.random.default_rng(seed)
     extended_at_mode = None
     for i in range(buffers):
-        before = channel.coherent_integration_ms
+        before = channel.coherent_duration_ms
         channel.process_sample_buffer(sample_streaming.SampleBuffer(
             samples=synthetic.generate_l5_samples(
                 prn=PRN, start_sec=i * buffer_ms * 1e-3, duration_sec=buffer_ms * 1e-3,
                 samp_rate=SAMP_RATE, doppler_hz=doppler_hz,
                 code_phase_ms=code_phase_ms, noise_sigma=noise_sigma, rng=rng),
             start_uptime_ms=i * buffer_ms, samp_rate=SAMP_RATE))
-        if before == 1 and channel.coherent_integration_ms > 1 and extended_at_mode is None:
+        if before == 1 and channel.coherent_duration_ms > 1 and extended_at_mode is None:
             extended_at_mode = channel.loop_state.mode
     return extended_at_mode
 
@@ -641,6 +878,170 @@ def _drive(channel, doppler_hz=1500.0, code_phase_ms=0.31, buffers=14, buffer_ms
 # the NH20 index at code phase c ms is c % 20.  The first interval starts at
 # ceil(0.31) = 1 ms.
 CORRECT_SEEDED_COUNTER = 1
+
+# Seeded at 2.34 ms the first interval is ceil(2.34) = 3 ms, so NH20 index 3.
+CORRECT_SEEDED_COUNTER_234 = 3
+
+
+def _record_epoch_openings(channel):
+    """Log the code phase at which each epoch's first interval opens."""
+    openings = []
+    original = channel._complete_interval
+
+    def wrapped():
+        opening = channel._epoch_interval_count == 0
+        before = channel._epoch_grid_anchored
+        code_phase_ms = channel.corr_interval.start_code_phase_ms
+        original()
+        # An interval dropped while waiting for the anchor leaves the count at 0
+        # and the flag still clear; a real opening either anchors or continues an
+        # already-anchored grid.
+        if opening and channel._epoch_interval_count == 1:
+            openings.append((code_phase_ms, before))
+
+    channel._complete_interval = wrapped
+    return openings
+
+
+def test_epochs_open_on_a_symbol_boundary_not_on_the_seeded_code_phase():
+    """
+    Acquisition seeds an arbitrary code phase, so an epoch grid begun there is
+    offset by an arbitrary number of milliseconds and straddles L5 I's 10 ms CNAV
+    symbol.  Anchoring on the symbol period -- rather than merely on the epoch
+    length, which would also avoid straddling -- additionally puts epoch zero on
+    symbol zero, so symbols can later be read off the epoch index.
+
+    Seeded at 2.34 ms with 5 ms epochs: intervals run 3, 4, ... and the first
+    epoch opens at 10 ms, not at 3 ms and not at 5 ms.
+    """
+    from utils import tracking_channel
+
+    channel = _seeded_channel(CORRECT_SEEDED_COUNTER_234, code_phase_ms=2.34)
+    channel.coherent_duration_ms = 5
+    channel.loop_params = tracking_channel.TrackingLoopParameters(
+        DLL_bandwidth_hz=2.0, PLL_bandwidth_hz=20.0, FLL_bandwidth_hz=50.0,
+        coherent_duration_ms=5, EPL_chip_spacing=0.5,
+    )
+    channel._epoch_grid_anchored = False
+    openings = _record_epoch_openings(channel)
+
+    _drive(channel, code_phase_ms=2.34, buffers=4)
+
+    assert openings, "no epoch ever opened"
+    symbol_ms = channel._epoch_anchor_period_ms
+    assert symbol_ms == 10, "L5's shortest symbol is I's 10 ms CNAV symbol"
+
+    first_code_phase, was_anchored = openings[0]
+    assert not was_anchored, "the first opening should be the one that anchors the grid"
+    assert first_code_phase % symbol_ms == 0, (
+        f"first epoch opened at code phase {first_code_phase} ms, "
+        f"which is not a multiple of the {symbol_ms} ms symbol period"
+    )
+    assert first_code_phase == 10, (
+        f"expected the first epoch at 10 ms (seed 2.34 -> intervals from 3), "
+        f"got {first_code_phase}"
+    )
+    # Every later epoch stays on the lattice.  The channel may extend from 5 ms to
+    # 10 ms part-way through, and both grids are anchored at multiples of 10, so
+    # every opening is a multiple of the shorter epoch length either way.
+    assert all(code_phase % 5 == 0 for code_phase, _ in openings), (
+        f"an epoch opened off the 5 ms lattice: {openings}"
+    )
+    assert all(not was_anchored_before for _, was_anchored_before in openings[:1])
+
+
+def test_changing_epoch_length_lands_on_a_symbol_boundary():
+    """
+    The post-lock extension must not simply continue from wherever the shorter
+    epochs happened to end, or the longer grid inherits the offset anchoring exists
+    to remove.  It waits at the shorter length instead of switching and discarding
+    intervals, so the transition costs no output.
+    """
+    channel = _seeded_channel(CORRECT_SEEDED_COUNTER_234, code_phase_ms=2.34)
+    openings = _record_epoch_openings(channel)
+
+    _drive(channel, code_phase_ms=2.34, buffers=14)
+
+    assert channel.coherent_duration_ms > 1, "expected the channel to extend"
+    symbol_ms = channel._epoch_anchor_period_ms
+    # Find the first opening after the length changed: spacing jumps to the new
+    # epoch length, and that opening must sit on a symbol boundary.
+    spacings = [b - a for (a, _), (b, _) in zip(openings, openings[1:])]
+    changed = next(
+        (i for i, gap in enumerate(spacings) if gap == channel.coherent_duration_ms),
+        None,
+    )
+    assert changed is not None, "never saw the extended epoch cadence"
+    assert openings[changed][0] % symbol_ms == 0
+
+
+def _track_for_cn0(coherent_duration_ms, buffers=6, buffer_ms=50, period_ms=100):
+    """Track a synthetic L5 signal with the C/N0 estimator running."""
+    from utils import sample_streaming, tracking_channel
+
+    channel = _seeded_channel(CORRECT_SEEDED_COUNTER, code_phase_ms=0.31)
+    channel.cn0_params = tracking_channel.CN0EstimatorParameters(
+        period_ms=period_ms, overlap_fraction=0.5
+    )
+    channel.coherent_duration_ms = coherent_duration_ms
+    channel._synced_coherent_duration_ms = coherent_duration_ms  # keep the epoch fixed
+    channel.loop_params = tracking_channel.TrackingLoopParameters(
+        DLL_bandwidth_hz=2.0, PLL_bandwidth_hz=20.0, FLL_bandwidth_hz=50.0,
+        coherent_duration_ms=coherent_duration_ms, EPL_chip_spacing=0.5,
+    )
+    channel._epoch_grid_anchored = False
+    channel._cn0_power = np.zeros((period_ms, channel.outputs.num_components))
+    channel._cn0_fill = channel._cn0_write = channel._cn0_since_estimate = 0
+    channel.outputs.cn0_capacity = 64
+    channel.outputs.cn0_dbhz = np.zeros((64, channel.outputs.num_components))
+    channel.outputs.cn0_uptime_ms = np.zeros(64)
+    channel.outputs.cn0_index = 0
+    _drive(channel, code_phase_ms=0.31, buffers=buffers, buffer_ms=buffer_ms)
+    return channel
+
+
+def test_cn0_input_is_one_interval_regardless_of_coherent_duration():
+    """
+    The requirement the whole feature exists for.  C/N0 is a density, so its
+    samples must be one correlation interval long whatever the epoch is; if the
+    estimator were fed epochs, the count would fall with the epoch length and the
+    reported dB-Hz would be wrong by that factor.
+    """
+    short = _track_for_cn0(1)
+    long = _track_for_cn0(5)
+
+    assert long.outputs.output_index < short.outputs.output_index, (
+        "5 ms epochs should produce fewer epochs than 1 ms ones -- otherwise this "
+        "test is not exercising what it claims"
+    )
+    assert short.outputs.cn0_index == long.outputs.cn0_index, (
+        f"C/N0 estimate count must follow duration, not epochs: "
+        f"{short.outputs.cn0_index} at 1 ms vs {long.outputs.cn0_index} at 5 ms"
+    )
+    assert short.outputs.cn0_index > 0
+
+
+def test_cn0_estimates_arrive_on_the_configured_hop():
+    channel = _track_for_cn0(1, period_ms=100)
+    stamps = channel.outputs.cn0_uptime_ms[channel.outputs.cn0_valid]
+    assert len(stamps) >= 3
+    # 50% overlap of a 100-interval window -> one estimate per 50 ms.
+    assert np.allclose(np.diff(stamps), 50.0, atol=1.0)
+
+
+def test_cn0_counts_intervals_dropped_by_epoch_anchoring():
+    """
+    A grid waiting for a symbol boundary discards intervals for tiling reasons, not
+    because they are bad correlations.  Excluding them would delay the first
+    estimate and put a hole at the start of every channel.
+    """
+    channel = _track_for_cn0(5, period_ms=100)
+    stamps = channel.outputs.cn0_uptime_ms[channel.outputs.cn0_valid]
+    assert len(stamps) > 0
+    # Seeded at 0.31 ms the first interval is at 1 ms and the 5 ms grid waits for
+    # code phase 10; those 9 intervals still feed the estimator, so the first
+    # estimate lands one window after tracking starts, not one window after 10 ms.
+    assert stamps[0] < 115.0, f"first estimate at {stamps[0]} ms is too late"
 
 
 def test_seeded_overlay_starts_synced_without_extending():
@@ -656,7 +1057,7 @@ def test_seeded_overlay_starts_synced_without_extending():
     channel = _seeded_channel(CORRECT_SEEDED_COUNTER)
 
     assert channel.overlay_sync.synced, "a supplied counter means no search is needed"
-    assert channel.coherent_integration_ms == 1, "must not extend before the loops have pulled in"
+    assert channel.coherent_duration_ms == 1, "must not extend before the loops have pulled in"
     assert channel.policy.costas is False, "the pilot discriminator is available at once"
 
 
@@ -669,7 +1070,7 @@ def test_seeded_overlay_extends_only_once_the_pll_has_locked():
     assert extended_at_mode is tracking_channel.TrackingLoopMode.PLL, (
         "coherent integration lengthened while still in FLL"
     )
-    assert channel.coherent_integration_ms == 10
+    assert channel.coherent_duration_ms == 10
     assert channel.loop_params.PLL_bandwidth_hz < 20.0, "loop filter was not retuned"
 
 
@@ -687,7 +1088,7 @@ def test_a_wrong_seeded_counter_never_locks():
     wrong = _seeded_channel((CORRECT_SEEDED_COUNTER + 5) % 20)
     _drive(wrong)
 
-    assert wrong.coherent_integration_ms == 1
+    assert wrong.coherent_duration_ms == 1
     assert wrong.loop_state.mode is tracking_channel.TrackingLoopMode.FLL
 
     right = _seeded_channel(CORRECT_SEEDED_COUNTER)
@@ -703,7 +1104,7 @@ def test_seeding_a_counter_needs_a_tiered_code():
         tracking_channel.TrackingChannel(
             loop_params=tracking_channel.TrackingLoopParameters(
                 DLL_bandwidth_hz=2.0, PLL_bandwidth_hz=20.0, FLL_bandwidth_hz=50.0,
-                coherent_integration_ms=1,
+                coherent_duration_ms=1,
             ),
             signal_params=tracking_channel.TrackingSignalParameters(
                 code_set=signal.code_set,
@@ -732,18 +1133,18 @@ def test_extended_epochs_start_on_a_code_phase_the_epoch_length_divides():
     real = channel.run_loop_filter
 
     def spy():
-        if channel.coherent_integration_ms > 1:
+        if channel.coherent_duration_ms > 1:
             # start of the epoch that just closed
             epoch_starts.append(
                 channel.corr_interval.start_code_phase_ms
-                - (channel.coherent_integration_ms - tracking_channel.CORRELATION_INTERVAL_MS)
+                - (channel.coherent_duration_ms - tracking_channel.CORRELATION_INTERVAL_MS)
             )
         return real()
 
     channel.run_loop_filter = spy
     _drive(channel)
 
-    assert channel.coherent_integration_ms == 10, "never extended"
+    assert channel.coherent_duration_ms == 10, "never extended"
     assert epoch_starts, "no extended epochs ran"
     epoch_ms = 10
     offenders = [s for s in epoch_starts if s % epoch_ms != 0]

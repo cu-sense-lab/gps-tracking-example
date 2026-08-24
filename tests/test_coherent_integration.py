@@ -1,7 +1,7 @@
 """
 How long one coherent accumulation may last, and what rejects a bad choice.
 
-There is one knob, `coherent_integration_ms`, and one fixed granularity,
+There is one knob, `coherent_duration_ms`, and one fixed granularity,
 `CORRELATION_INTERVAL_MS = 1`.  The interval is not a user choice: an overlay chip
 lasts one primary code period -- 1 ms for every signal here -- so a longer interval
 could span a sign change.  Integration is built out of intervals, folded with
@@ -39,13 +39,13 @@ from utils.signal_interfaces import (
 )
 
 
-def _channel(signal_type, coherent_integration_ms, synced_coherent_integration_ms=None):
+def _channel(signal_type, coherent_duration_ms, synced_coherent_duration_ms=None):
     signal = build_signals(signal_type, prns=[1])["G01"]
     policy = TRACKING_POLICIES[signal_type.signal_type_id]
     return tracking_channel.TrackingChannel(
         loop_params=tracking_channel.TrackingLoopParameters(
             DLL_bandwidth_hz=2.0, PLL_bandwidth_hz=20.0, FLL_bandwidth_hz=50.0,
-            coherent_integration_ms=coherent_integration_ms,
+            coherent_duration_ms=coherent_duration_ms,
         ),
         signal_params=tracking_channel.TrackingSignalParameters(
             code_set=signal.code_set,
@@ -60,8 +60,8 @@ def _channel(signal_type, coherent_integration_ms, synced_coherent_integration_m
         output_capacity=10,
         discriminator_policy=policy.discriminator_policy,
         synced_policy=policy.synced_discriminator_policy,
-        synced_coherent_integration_ms=(
-            synced_coherent_integration_ms or coherent_integration_ms
+        synced_coherent_duration_ms=(
+            synced_coherent_duration_ms or coherent_duration_ms
         ),
     )
 
@@ -74,7 +74,7 @@ def test_one_interval_is_the_default():
     params = tracking_channel.TrackingLoopParameters(
         DLL_bandwidth_hz=2.0, PLL_bandwidth_hz=20.0, FLL_bandwidth_hz=50.0
     )
-    assert params.coherent_integration_ms == tracking_channel.CORRELATION_INTERVAL_MS
+    assert params.coherent_duration_ms == tracking_channel.CORRELATION_INTERVAL_MS
     assert params.intervals_per_epoch == 1
 
 
@@ -83,7 +83,7 @@ def test_integration_is_a_whole_number_of_intervals():
         with pytest.raises(ValueError, match="positive multiple"):
             tracking_channel.TrackingLoopParameters(
                 DLL_bandwidth_hz=2.0, PLL_bandwidth_hz=20.0, FLL_bandwidth_hz=50.0,
-                coherent_integration_ms=bad,
+                coherent_duration_ms=bad,
             )
 
 
@@ -91,11 +91,11 @@ def test_loop_gains_follow_the_integration_length():
     """Every gain is proportional to the update period, which is the epoch."""
     short = tracking_channel.TrackingLoopParameters(
         DLL_bandwidth_hz=2.0, PLL_bandwidth_hz=20.0, FLL_bandwidth_hz=50.0,
-        coherent_integration_ms=1,
+        coherent_duration_ms=1,
     )
     long = tracking_channel.TrackingLoopParameters(
         DLL_bandwidth_hz=2.0, PLL_bandwidth_hz=20.0, FLL_bandwidth_hz=50.0,
-        coherent_integration_ms=10,
+        coherent_duration_ms=10,
     )
     assert long.DLL_filter_coeff == pytest.approx(10 * short.DLL_filter_coeff)
     assert long.intervals_per_epoch == 10
@@ -116,7 +116,7 @@ def test_loop_gains_follow_the_integration_length():
 )
 def test_integration_dividing_the_symbol_is_accepted(signal_type, coherent_ms):
     channel = _channel(signal_type, coherent_ms)
-    assert channel.coherent_integration_ms == coherent_ms
+    assert channel.coherent_duration_ms == coherent_ms
 
 
 @pytest.mark.parametrize(
@@ -139,9 +139,9 @@ def test_an_unstripped_overlay_caps_integration_at_one_primary_period():
     longer is coherent -- regardless of the 10 ms CNAV symbol behind it.
     """
     with pytest.raises(ValueError, match="overlay chip"):
-        _channel(GpsL5, 5, synced_coherent_integration_ms=10)
+        _channel(GpsL5, 5, synced_coherent_duration_ms=10)
 
-    assert _channel(GpsL5, 1, synced_coherent_integration_ms=10)
+    assert _channel(GpsL5, 1, synced_coherent_duration_ms=10)
 
 
 def test_the_synced_configuration_is_checked_up_front():
@@ -153,16 +153,16 @@ def test_the_synced_configuration_is_checked_up_front():
     the epoch is shared, and I's CNAV symbol is 10 ms.  Switching the loops onto
     the pilot does not exempt the epoch from the data component riding in it.
     """
-    assert TRACKING_POLICIES[GpsL5.signal_type_id].synced_coherent_integration_ms == 10
-    assert _channel(GpsL5, 1, synced_coherent_integration_ms=10)
+    assert TRACKING_POLICIES[GpsL5.signal_type_id].synced_coherent_duration_ms == 10
+    assert _channel(GpsL5, 1, synced_coherent_duration_ms=10)
 
     with pytest.raises(ValueError, match="exceeds 10 ms"):
-        _channel(GpsL5, 1, synced_coherent_integration_ms=20)
+        _channel(GpsL5, 1, synced_coherent_duration_ms=20)
 
 
 def test_a_dataless_pilot_has_no_symbol_limit():
     """L2 CL and L5 Q carry no data, so only Doppler bounds them."""
-    for signal_type, pilot in ((GpsL2C, "CL"), (GpsL5, "Q")):
+    for signal_type, pilot in ((GpsL2C, "L2CL"), (GpsL5, "L5Q")):
         signal = build_signals(signal_type, prns=[1])["G01"]
         component = signal.code_set.components[signal.code_set.index_of(pilot)]
         assert component.symbol_period_ms is None
