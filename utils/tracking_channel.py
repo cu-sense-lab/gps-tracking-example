@@ -658,6 +658,17 @@ class SignalTrackingOutputs:
         # FLL->PLL handover is invisible in the correlator outputs alone, and
         # reading a lock transient correctly means knowing which loop was running.
         self.pll_mode = np.zeros(capacity, dtype=bool)
+        # How long this epoch's coherent accumulation actually was.  It is not
+        # constant across a run: `_maybe_extend_coherent_duration` lengthens it once
+        # the overlay is stripped and the PLL has locked.  Without it a consumer has
+        # to infer epoch length by differencing timestamps, which is fragile exactly
+        # where it matters -- across the extension boundary.
+        self.epoch_duration_ms = np.zeros(capacity, dtype=float)
+        # Whether the tiered (overlay) code was being wiped off for this epoch.
+        # A navigation-message decoder needs this: before sync the epochs are not
+        # symbol-aligned and the overlay is still flipping the data component's
+        # sign, so those epochs are not symbols and must be dropped.
+        self.overlay_synced = np.zeros(capacity, dtype=bool)
         self.output_index = 0
 
         # C/N0 lands on its own cadence -- one estimate per hop of correlation
@@ -982,6 +993,7 @@ class TrackingChannel:
         self._epoch_anchor_period_ms: int | None = min(symbol_periods) if symbol_periods else None
         # Cleared whenever the epoch length changes, so the new grid re-anchors.
         self._epoch_grid_anchored = False
+
         self._unit_signs = np.ones(num_components, dtype=np.int8)
         self._synced_policy = synced_policy
         self._synced_coherent_duration_ms = synced_coherent_duration_ms
@@ -1316,6 +1328,10 @@ class TrackingChannel:
             self.outputs.delta_omega[idx] = delta_omega
             self.outputs.prompt_corr_circ_length[idx] = circ_length
             self.outputs.pll_mode[idx] = epoch_used_pll
+            self.outputs.epoch_duration_ms[idx] = self.coherent_duration_ms
+            self.outputs.overlay_synced[idx] = (
+                self.overlay_sync is not None and self.overlay_sync.synced
+            )
             self.outputs.output_index += 1
 
         # ---- prior for the next epoch: the posterior, propagated to its start. ----

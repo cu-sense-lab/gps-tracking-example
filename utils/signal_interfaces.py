@@ -755,6 +755,7 @@ def create_tracking_channels(
     cn0_params: tracking_channel.CN0EstimatorParameters | None = None,
 ) -> dict[str, TrackingChannelAdapter]:
     tracking_policy = TRACKING_POLICIES[signal_type.signal_type_id]
+
     channels: dict[str, TrackingChannelAdapter] = {}
     for signal_id in tracking_signal_ids:
         signal = signals[signal_id]
