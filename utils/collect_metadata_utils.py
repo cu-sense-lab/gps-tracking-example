@@ -175,7 +175,6 @@ def parse_experiment_metadata(metadata_dict: Dict[str, Any], verbose: bool = Fal
     return ExperimentMetadata.from_dict(metadata_dict, verbose=verbose)
 
 def print_experiment_available_collects_and_bands(metadata: ExperimentMetadata, print_prefix: str = ""):
-    print(print_prefix + f"Available bands: " + " ".join(metadata.band_ids))
     print(print_prefix + f"Available collects:")
     for collect_id in metadata.collect_ids:
         collect = metadata.collects[collect_id]
@@ -257,6 +256,14 @@ def resolve_collect(
     collect_config = metadata.collects[collect_id]
     channel_config = metadata.channel_configurations[collect_config.channel_config_id]
     band_config = metadata.band_configurations[band_id]
+
+    if band_id not in channel_config.band_ids:
+        raise ValueError(
+            f"Collect {collect_id!r} (channel config {collect_config.channel_config_id!r}) "
+            f"does not carry band {band_id!r}; it carries {channel_config.band_ids}. "
+            "`collect_ids` and `band_ids` are independently sorted lists, so indexing them "
+            "with the same index does not guarantee they refer to the same recording."
+        )
 
     return ResolvedCollect(
         experiment_name=experiment_name,

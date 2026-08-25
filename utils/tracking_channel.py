@@ -247,6 +247,41 @@ def double_estimator_tap_layout(
     subcarrier taps see a wave six times steeper but repeating.  Neither pair is
     displaced along the other's axis, which is what keeps the two discriminators
     independent.
+
+    THE DOUBLE ESTIMATOR
+    --------------------
+    Hodgart, M.S., P.D. Blunt and M. Unwin, "Double Estimator -- A New Receiver
+    Principle for Tracking BOC Signals", Inside GNSS, Spring 2008, pp. 26-36.
+    Also Hodgart and Blunt, "Dual estimate receiver of binary offset carrier
+    modulated signals for global navigation satellite systems", Electronics
+    Letters 43(16), 2007, and Hodgart, Blunt and Unwin, ION GNSS 2007.
+
+    The code and the subcarrier of course leave the satellite with the SAME
+    delay -- they are multiplied together there, and nothing separates them in
+    flight.  Estimating them independently is deliberate over-parameterisation.
+
+    A conventional receiver constrains its search to the line tau_code =
+    tau_subcarrier, and along that line the correlation is the multi-peaked BOC
+    ACF: R(tau, tau) = Lambda(tau) * S(tau), whose extra peaks are just S's own,
+    weighted by the code triangle.  That is where false lock comes from -- not
+    from anything about the signal, but from the shape of that one slice.
+
+    Relax the constraint and the surface separates: Lambda alone has one peak and
+    no ambiguity, S alone is steep but periodic.  Two easy one-dimensional
+    problems in place of one hard one.  The constraint is then re-imposed at the
+    end, which is what `subcarrier_ambiguity_chips` and the rounding in
+    `run_loop_filter` do -- the coarse estimate says which cycle of the fine one
+    is the right one.
+
+    The same trade as resolving an RTK carrier-phase integer against a code
+    pseudorange: two measurements of one quantity, one unambiguous and noisy, one
+    precise and ambiguous, combined by rounding their difference.  A subcarrier
+    cycle instead of a carrier cycle.
+
+    The alternative that keeps one delay is bump jumping (Fine, P. and W. Wilson,
+    "Tracking algorithm for GPS offset carrier signals", ION NTM 1999): very-early
+    and very-late taps detect that the loop settled on a side peak and jump it.
+    That recovers from false lock; this cannot have one.
     """
     if code_spacing_chips <= 0.0 or subcarrier_spacing_chips <= 0.0:
         raise ValueError("tap spacings must be positive")

@@ -82,7 +82,7 @@ def plot_receiver_channel_bands(
                 ax2.fill_betweenx([i - samp_bandwidth_height / 2, i + samp_bandwidth_height / 2], rf_band_center_MHz - samp_bandwidth_MHz / 2, rf_band_center_MHz + samp_bandwidth_MHz / 2, color="r", alpha=0.3)
 
     ax1.set_yticks(range(len(metadata.channel_ids)))
-    ax1.set_yticklabels(metadata.channel_ids)
+    ax1.set_yticklabels([f"{channel_id}: {metadata.channel_configurations[channel_id].band_ids[0]}" for channel_id in metadata.channel_ids])
     for ax in [ax1, ax2]:
         ax.grid()
     ax1.set_xlabel("Baseband Frequency [MHz]")
