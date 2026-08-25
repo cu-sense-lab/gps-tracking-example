@@ -17,7 +17,7 @@ from dataclasses import dataclass
 @dataclass(frozen=True)
 class TrackingScenario:
     name: str
-    family: str  # "L1CA" | "L2C" | "L5"
+    family: str  # "L1CA" | "L2C" | "L5" | "L1C"
     prn: int
     duration_ms: int
     samp_rate: float
@@ -177,6 +177,97 @@ SCENARIOS: tuple[TrackingScenario, ...] = (
         noise_sigma=3.0,
         nav_bits=True,
         rng_seed=5,
+        buffer_duration_ms=50,
+    ),
+    # GPS L1C.  25 Msps for the same reason L5 needs it, but a different one: not
+    # the chip rate (1.023 Mcps) but the subcarrier -- BOC(6,1) puts twelve
+    # sub-chips in a chip, so the sub-chip rate is 12.276 Mcps.
+    TrackingScenario(
+        name="l1c_clean",
+        family="L1C",
+        prn=1,
+        duration_ms=400,
+        samp_rate=25e6,
+        doppler_hz=1500.0,
+        code_phase_ms=3.27,  # mid-period: L1C's code period is 10 ms, not 1
+        doppler_error_hz=0.0,
+        code_error_chips=0.0,
+        noise_sigma=0.0,
+        nav_bits=False,
+        buffer_duration_ms=50,
+    ),
+    TrackingScenario(
+        name="l1c_navbits_seeded",
+        family="L1C",
+        prn=1,
+        duration_ms=400,
+        samp_rate=25e6,
+        doppler_hz=1500.0,
+        code_phase_ms=7.31,
+        # Acquisition on a 10 ms replica gives 100 Hz bins, so half a bin is 50 Hz.
+        doppler_error_hz=50.0,
+        # A BOC delay discriminator is linear over a far narrower window than a
+        # BPSK one, so the seeding error that matters here is smaller.
+        code_error_chips=0.1,
+        noise_sigma=0.0,
+        nav_bits=True,
+        buffer_duration_ms=50,
+    ),
+    TrackingScenario(
+        name="l1c_noisy",
+        family="L1C",
+        prn=7,
+        duration_ms=400,
+        samp_rate=25e6,
+        doppler_hz=-2400.0,
+        code_phase_ms=0.72,
+        doppler_error_hz=50.0,
+        code_error_chips=0.1,
+        noise_sigma=3.0,
+        nav_bits=True,
+        rng_seed=5,
+        buffer_duration_ms=50,
+    ),
+    # Seeded onto a BOC side peak.  The composite |ACF| has stable secondary maxima
+    # at +/-0.53 chip -- measured -- and a single-loop BOC discriminator locks onto
+    # one and stays there, 158 m out, reporting a healthy prompt the whole time.
+    # The double estimator cannot: its code loop rides the plain code triangle,
+    # which has one peak.  This is the scenario the technique exists for, so it is
+    # a golden rather than a one-off test.
+    TrackingScenario(
+        name="l1c_side_peak_seed",
+        family="L1C",
+        prn=1,
+        # Long enough for the 0.5 Hz code loop to settle well clear of the +/-0.25
+        # chip wrap: 0.15 chip of residual at 600 ms, 0.04 at 1500.  A golden
+        # sitting near the boundary would swing wildly rather than drift if any
+        # later change nudged the loop, which is not what a baseline is for.
+        duration_ms=1500,
+        samp_rate=25e6,
+        doppler_hz=900.0,
+        code_phase_ms=4.10,
+        doppler_error_hz=0.0,
+        code_error_chips=0.53,
+        noise_sigma=0.0,
+        nav_bits=True,
+        buffer_duration_ms=50,
+    ),
+    # Long enough to reach overlay sync with the shipped 200-prompt window (2 s of
+    # 10 ms prompts, after PLL lock), so the golden covers the discriminator switch
+    # and the move to 10 ms epochs -- the part of the channel that only L1C's
+    # 10 ms primary period exercises.
+    TrackingScenario(
+        name="l1c_overlay_synced",
+        family="L1C",
+        prn=1,
+        duration_ms=2600,
+        samp_rate=25e6,
+        doppler_hz=800.0,
+        code_phase_ms=2.15,
+        doppler_error_hz=0.0,
+        code_error_chips=0.0,
+        noise_sigma=0.0,
+        nav_bits=True,
         buffer_duration_ms=50,
     ),
 )

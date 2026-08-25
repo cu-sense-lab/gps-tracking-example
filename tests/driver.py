@@ -16,12 +16,19 @@ import numpy as np
 
 from utils import sample_streaming
 from utils import tracking_channel
-from utils.signal_interfaces import TRACKING_POLICIES, GpsL1CA, GpsL2C, GpsL5, build_signals
+from utils.signal_interfaces import (
+    TRACKING_POLICIES,
+    GpsL1C,
+    GpsL1CA,
+    GpsL2C,
+    GpsL5,
+    build_signals,
+)
 
 from . import synthetic
 from .scenarios import TrackingScenario
 
-# Loop settings mirror notebooks/02-acquisition-and-tracking.ipynb.
+# Loop settings mirror notebooks/01-acquisition-and-tracking.ipynb.
 BLOCK_DURATION_MS = 1
 LOOP_KWARGS = dict(
     DLL_bandwidth_hz=2.0,
@@ -32,16 +39,46 @@ LOOP_KWARGS = dict(
     prompt_corr_circ_length_threshold=0.9,
 )
 
+# Early/late spacing is the one loop setting that is not signal-agnostic.  A BPSK
+# correlation peak is linear out to a full chip, so half-chip taps sit on its
+# slope; BOC(1,1)'s peak crosses zero at 1/3 chip, which puts those same taps on
+# the negative shoulder where the discriminator has the wrong sign.
+FAMILY_LOOP_OVERRIDES = {
+    # L1C runs the double estimator, so its two delay loops split the work the one
+    # loop used to do badly.
+    #
+    #   EPL_chip_spacing  back to 0.5, the BPSK value.  Under the double estimator
+    #                     the code taps ride the plain code triangle, whose slope
+    #                     is 1, so the (2 - s) normalisation is right again and the
+    #                     0.1 chip override is no longer needed.
+    #   DLL_bandwidth_hz  narrowed to 0.5.  All the code loop has to do is stay
+    #                     inside half an ambiguity interval (+/-0.25 chip); it is
+    #                     not carrying the precision any more, so it can afford to
+    #                     be quiet.
+    #   subcarrier_*      2.0 Hz on taps 0.04 chip out.  That is inside BOC(6,1)'s
+    #                     main peak, which reaches zero at 1/23 = 0.043 chip, so
+    #                     these taps sit on the steep part -- slope about 6.4
+    #                     against the code axis's 1.
+    "L1C": dict(
+        EPL_chip_spacing=0.5,
+        DLL_bandwidth_hz=0.5,
+        subcarrier_bandwidth_hz=2.0,
+        subcarrier_chip_spacing=0.04,
+    ),
+}
+
 _SIGNAL_TYPES = {
     "L1CA": GpsL1CA,
     "L2C": GpsL2C,
     "L5": GpsL5,
+    "L1C": GpsL1C,
 }
 
 _FAMILY_GENERATORS = {
     "L1CA": synthetic.generate_l1ca_samples,
     "L2C": synthetic.generate_l2c_samples,
     "L5": synthetic.generate_l5_samples,
+    "L1C": synthetic.generate_l1c_samples,
 }
 
 OUTPUT_FIELDS = (
@@ -56,6 +93,11 @@ OUTPUT_FIELDS = (
     "code_phase_ms",
     "delta_omega",
     "prompt_corr_circ_length",
+    # The double estimator's second state.  Flat zero for every signal that does
+    # not track a subcarrier, so it costs the BPSK goldens nothing -- but without
+    # it the regression would not cover the subcarrier loop at all, and the delay
+    # actually estimated (code_phase_ms plus this) would not be pinned.
+    "subcarrier_offset_chips",
 )
 
 
@@ -65,7 +107,9 @@ def _build_channel(scenario: TrackingScenario):
     exercise the same configuration the notebook does rather than a parallel one.
     """
     signal_type = _SIGNAL_TYPES[scenario.family]
-    loop_params = tracking_channel.TrackingLoopParameters(**LOOP_KWARGS)
+    loop_params = tracking_channel.TrackingLoopParameters(
+        **{**LOOP_KWARGS, **FAMILY_LOOP_OVERRIDES.get(scenario.family, {})}
+    )
     policy = TRACKING_POLICIES[signal_type.signal_type_id]
 
     signal = build_signals(signal_type, prns=[scenario.prn])[f"G{scenario.prn:02d}"]
@@ -101,6 +145,8 @@ def _build_channel(scenario: TrackingScenario):
         # wipe-off without the extended integration and policy switch it enables.
         synced_policy=policy.synced_discriminator_policy,
         synced_coherent_duration_ms=policy.synced_coherent_duration_ms,
+        overlay_search=policy.overlay_search,
+        overlay_prompts_to_observe=policy.overlay_prompts_to_observe,
     )
 
 

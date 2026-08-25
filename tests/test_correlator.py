@@ -284,19 +284,35 @@ def test_kernel_reads_each_component_from_its_own_block():
             )
 
 
-def test_subcarrier_signals_are_rejected_until_implemented():
-    """BOC/TMBOC correlation lands with GPS L1C; until then it must not silently pass."""
+def test_a_subcarrier_code_set_routes_to_the_subcarrier_kernel():
+    """
+    The two kernels are separate functions chosen by `has_subcarrier`, so the only
+    thing that proves the dispatch is that the same samples give different answers.
+
+    A BOC(1,1) replica against BPSK noise is not merely a different number: the
+    subcarrier is odd-symmetric within each chip, so it removes roughly half the
+    correlation a BPSK replica would have accumulated.  See `tests/test_subcarrier.py`
+    for the kernel's own correctness.
+    """
     from utils.code_components import Subcarrier, SubcarrierKind
 
-    code_set = build_code_set(
+    code = synthetic.get_l1ca_code(1)
+    bpsk_set = build_code_set([CodeComponent(name="P", sequence=code, branch=Branch.Q)])
+    boc_set = build_code_set(
         [
             CodeComponent(
                 name="P",
-                sequence=synthetic.get_l1ca_code(1),
+                sequence=code,
                 branch=Branch.Q,
                 subcarrier=Subcarrier(kind=SubcarrierKind.BOC_SIN, rate_hz=1.023e6),
             )
-        ]
+        ],
+        chip_rate_hz=gps_l1ca.CODE_RATE,
     )
-    with pytest.raises(NotImplementedError, match="subcarrier"):
-        _correlate(_noise(1, 100), code_set, gps_l1ca.CODE_RATE, 0.0, [0.0])
+    assert not bpsk_set.has_subcarrier
+    assert boc_set.has_subcarrier
+
+    samples = _noise(1, 4000)
+    bpsk = _correlate(samples, bpsk_set, gps_l1ca.CODE_RATE, 0.0, [0.0])
+    boc = _correlate(samples, boc_set, gps_l1ca.CODE_RATE, 0.0, [0.0])
+    assert not np.allclose(bpsk, boc)

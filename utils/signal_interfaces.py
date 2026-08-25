@@ -32,12 +32,13 @@ from __future__ import annotations
 
 import warnings
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from typing import ClassVar, Iterable
 
 import numpy as np
 
+import gnss_tools.signals.gps_l1c as gps_l1c
 import gnss_tools.signals.gps_l1ca as gps_l1ca
 import gnss_tools.signals.gps_l2c as gps_l2c
 import gnss_tools.signals.gps_l5 as gps_l5
@@ -45,11 +46,14 @@ import gnss_tools.signals.gps_l5 as gps_l5
 from . import ambiguity_resolution
 from . import bpsk_acquisition
 from . import sample_streaming
+from . import secondary_code
 from . import tracking_channel
 from .code_components import (
     Branch,
     CodeComponent,
     CodeSet,
+    Subcarrier,
+    SubcarrierKind,
     build_code_set,
 )
 
@@ -142,7 +146,10 @@ class Signal(ABC):
     def __init__(self, prn: int) -> None:
         self.prn = prn
         self.signal_id = f"G{prn:02d}"
-        self.code_set: CodeSet = build_code_set(self._build_components(prn))
+        self.code_set: CodeSet = build_code_set(
+            self._build_components(prn),
+            chip_rate_hz=self.tracking_code_rate_chips_per_sec,
+        )
 
     @staticmethod
     @abstractmethod
@@ -251,10 +258,69 @@ class GpsL5(Signal):
         ]
 
 
+class GpsL1C(Signal):
+    """
+    GPS L1C: a data component and a pilot, co-located on every chip at 1.023 Mcps
+    and -- unlike L5's I/Q -- in the SAME carrier phase (IS-GPS-800J 3.2.1.6.1).
+    They are separated by their codes and by a 25/75 power split, nothing else.
+
+    Both carry a subcarrier, which is what makes L1C the first signal here needing
+    more than the BPSK correlator: L1CD is BOC(1,1) throughout, and L1CP is
+    TMBOC(6,1,4/33) -- BOC(6,1) on 4 of every 33 chips, BOC(1,1) on the rest.
+
+    The pilot carries the 1800-bit L1CO overlay, one bit per 10 ms code period, so
+    it repeats only every 18 s.  That is 90 times L5's NH20 and is why the overlay
+    search is FFT-based here and runs on a window far shorter than one period.
+    """
+
+    signal_type_id = "GPS_L1C"
+    link = LINKS[LinkId.L1]
+    carrier_freq_hz = gps_l1c.CARRIER_FREQ
+    tracking_code_rate_chips_per_sec = gps_l1c.CODE_RATE
+    # 10230 chips at 1.023 Mcps.  The first signal here whose primary period is
+    # longer than one correlation interval while also carrying an overlay -- see
+    # `TrackingChannel._intervals_per_primary_period`.
+    primary_period_ms = gps_l1c.PRIMARY_PERIOD_MS
+
+    @staticmethod
+    def _build_components(prn: int) -> list[CodeComponent]:
+        code_d = (1 - 2 * gps_l1c.get_GPS_L1CD_code_sequence(prn)).astype(np.int8)
+        code_p = (1 - 2 * gps_l1c.get_GPS_L1CP_code_sequence(prn)).astype(np.int8)
+        overlay_p = (1 - 2 * gps_l1c.get_GPS_L1CO_overlay_sequence(prn)).astype(np.int8)
+        return [
+            CodeComponent(
+                name="L1CD", sequence=code_d, branch=Branch.I,
+                power_weight=gps_l1c.L1CD_POWER_FRACTION,
+                # One CNAV-2 symbol is exactly one code period, so a symbol flip
+                # never lands inside a code period -- and 10 ms is the ceiling on
+                # coherent integration for the whole signal, pilot included, since
+                # one epoch serves every component.
+                symbol_period_ms=_symbol_period_ms(gps_l1c),
+                subcarrier=Subcarrier(
+                    kind=SubcarrierKind.BOC_SIN, rate_hz=gps_l1c.BOC_SUBCARRIER_RATE
+                ),
+            ),
+            # The dataless pilot, at three times the data component's power.  Same
+            # branch as L1CD, so the carrier loop could be handed between them
+            # phase-continuously; it starts on the pilot and stays there.
+            CodeComponent(
+                name="L1CP", sequence=code_p, branch=Branch.I, overlay=overlay_p,
+                power_weight=gps_l1c.L1CP_POWER_FRACTION,
+                subcarrier=Subcarrier(
+                    kind=SubcarrierKind.TMBOC,
+                    rate_hz=gps_l1c.BOC_SUBCARRIER_RATE,
+                    pattern=gps_l1c.TMBOC_PATTERN,
+                    pattern_rate_hz=gps_l1c.TMBOC_SUBCARRIER_RATE,
+                ),
+            ),
+        ]
+
+
 SIGNALS: dict[str, type[Signal]] = {
     GpsL1CA.signal_type_id: GpsL1CA,
     GpsL2C.signal_type_id: GpsL2C,
     GpsL5.signal_type_id: GpsL5,
+    GpsL1C.signal_type_id: GpsL1C,
 }
 
 
@@ -310,6 +376,17 @@ ACQUISITION_POLICIES: dict[str, AcquisitionPolicy] = {
     #     (measured on real L5: G14 +16.9 -> +18.7, G01 +12.8 -> +14.5,
     #     G08 +1.9 -> +3.4 dB of margin over threshold).
     "GPS_L5": AcquisitionPolicy(component_name="L5Q", include_overlay=True),
+    # Acquire on the pilot: three times the data component's power, and dataless
+    # within its own 10 ms period.
+    #
+    # The overlay is NOT folded in, unlike L5's.  L5's NH20 makes a 20 ms replica;
+    # L1CO would make an 18 SECOND one.  So acquisition pins the code phase modulo
+    # 10 ms and leaves the overlay phase to the post-lock search -- which is what
+    # `utils.secondary_code.fft_search` exists for.
+    #
+    # Nothing is left ambiguous in the `ambiguous_component` sense: both components
+    # are 10230 chips, so locating one locates the other.
+    "GPS_L1C": AcquisitionPolicy(component_name="L1CP"),
 }
 
 
@@ -336,6 +413,13 @@ class TrackingPolicy:
     synced_discriminator_policy: tracking_channel.LoopDiscriminatorPolicy | None = None
     synced_coherent_duration_ms: int = tracking_channel.CORRELATION_INTERVAL_MS
     resolved_discriminator_policy: tracking_channel.LoopDiscriminatorPolicy | None = None
+
+    # How the overlay phase is searched for, when acquisition did not supply it.
+    # Both defaults suit a short Neuman-Hofman overlay; a long one needs an FFT
+    # search and a window stated in prompts rather than whole overlay periods --
+    # see `utils.secondary_code`.  Strategy, not structure, so it lives here.
+    overlay_search: secondary_code.OverlaySearch | None = None
+    overlay_prompts_to_observe: int | None = None
 
 
 TRACKING_POLICIES: dict[str, TrackingPolicy] = {
@@ -405,6 +489,39 @@ TRACKING_POLICIES: dict[str, TrackingPolicy] = {
         # retuned at the same moment (see TrackingChannel).
         synced_coherent_duration_ms=10,
     ),
+    "GPS_L1C": TrackingPolicy(
+        # Carrier on L1CP, the pilot, from the start -- three times L1CD's power.
+        # Unlike L5 there is no quadrature penalty for choosing either, since both
+        # components are in the same carrier phase; the pilot is simply stronger
+        # and eventually dataless.
+        #
+        # The delay discriminator combines both, weighted 75/25 by
+        # `power_weight` -- the first signal here where that weighting is not
+        # uniform, and the reason `_combine_code_magnitude` weights at all.
+        #
+        # Costas stays on until the overlay is stripped: L1CO flips L1CP's sign
+        # every 10 ms, so the pilot is not yet effectively dataless.
+        discriminator_policy=tracking_channel.LoopDiscriminatorPolicy(
+            carrier_component=1, code_components=(0, 1), costas=True
+        ),
+        # Once L1CO is wiped off, L1CP really is dataless and the phase
+        # discriminator can use the full four-quadrant angle.  That is the whole
+        # prize here -- about 6 dB.
+        synced_discriminator_policy=tracking_channel.LoopDiscriminatorPolicy(
+            carrier_component=1, code_components=(0, 1), costas=False
+        ),
+        # NOT longer than 10 ms, and the reason is worth stating because it differs
+        # from L5's: the binding limit is L1CD's CNAV-2 symbol, not the overlay.
+        # One epoch serves every component, so integrating past 10 ms would leave
+        # the pilot happy and quietly cancel the data component.  Stripping L1CO
+        # therefore buys a better discriminator, not a longer accumulation.
+        synced_coherent_duration_ms=gps_l1c.PRIMARY_PERIOD_MS,
+        # 1800 offsets is where brute force stops being sensible, and four whole
+        # periods would be 72 seconds of tracking before the first attempt.  200
+        # prompts is 2 s, and at 40 dB-Hz a 10 ms prompt already carries ~20 dB.
+        overlay_search=secondary_code.fft_search,
+        overlay_prompts_to_observe=200,
+    ),
 }
 
 
@@ -432,27 +549,28 @@ class AmbiguitySearchPlan:
     description: str
 
 
+def _acquisition_component(signal_type: type[Signal], signal: Signal) -> CodeComponent:
+    policy = ACQUISITION_POLICIES[signal_type.signal_type_id]
+    return signal.code_set.components[signal.code_set.index_of(policy.component_name)]
+
+
 def acquisition_code(signal_type: type[Signal], signal: Signal) -> np.ndarray:
     """The replica sequence acquisition correlates against, on its own chip clock."""
     policy = ACQUISITION_POLICIES[signal_type.signal_type_id]
-    component = signal.code_set.components[
-        signal.code_set.index_of(policy.component_name)
-    ]
+    component = _acquisition_component(signal_type, signal)
+
+    sequence = component.sequence
     if not policy.include_overlay:
-        return component.sequence
+        return sequence
     if component.overlay is None:
         raise ValueError(
             f"{signal_type.signal_type_id}: acquisition policy asks to fold in an "
             f"overlay, but component {policy.component_name!r} has none"
         )
-    return _tiered_code(component.sequence, component.overlay)
+    return _tiered_code(sequence, component.overlay)
 
 
 def acquisition_code_period_ms(signal_type: type[Signal], signal: Signal) -> float:
-    policy = ACQUISITION_POLICIES[signal_type.signal_type_id]
-    component = signal.code_set.components[
-        signal.code_set.index_of(policy.component_name)
-    ]
     rate = signal_type.tracking_code_rate_chips_per_sec
     return len(acquisition_code(signal_type, signal)) / rate * 1e3
 
@@ -569,6 +687,10 @@ def build_acquisition_code_params(
             length_chips=len(sequence),
             sequence=sequence,
             carrier_freq_hz=signal_type.carrier_freq_hz,
+            # Acquisition evaluates it from the fractional chip position, exactly
+            # as the correlator does, so the replica and the tracking channel see
+            # one subcarrier on one chip axis.
+            subcarrier=_acquisition_component(signal_type, signal).subcarrier,
         )
     return params
 
@@ -620,6 +742,27 @@ def resolve_acquisition_ambiguities(
     return resolutions
 
 
+def requires_bit_sync(signal_type: type[Signal], signal: Signal) -> bool:
+    """
+    Whether the data symbol boundary has to be found statistically.
+
+    True for GPS L1 C/A alone, and for the reason `utils.nav.bitsync` describes:
+    every other signal here hands the boundary over for free, either through an
+    overlay whose phase is synchronised or through a primary code period that is
+    itself one symbol long.  L1 C/A has a 1 ms code under a 20 ms bit and nothing
+    tying the two together, so the twenty candidate boundaries are
+    indistinguishable until the data itself picks one out.
+    """
+    if signal.overlay_period_ms:
+        return False
+    symbol_periods = [
+        c.symbol_period_ms
+        for c in signal.code_set.components
+        if c.symbol_period_ms is not None
+    ]
+    return bool(symbol_periods) and min(symbol_periods) > signal_type.primary_period_ms
+
+
 def create_tracking_channels(
     signal_type: type[Signal],
     signals: dict[str, Signal],
@@ -633,6 +776,37 @@ def create_tracking_channels(
     cn0_params: tracking_channel.CN0EstimatorParameters | None = None,
 ) -> dict[str, TrackingChannelAdapter]:
     tracking_policy = TRACKING_POLICIES[signal_type.signal_type_id]
+
+    # A signal whose symbol boundary is not known yet cannot open a multi-interval
+    # epoch grid: there is nothing to anchor it to, and anchoring on the code phase
+    # lattice instead misplaces every epoch by the offset between the two (see
+    # `TrackingChannel._observe_bit_sync`).  So the requested duration becomes the
+    # duration to extend TO, and the channel starts at one correlation interval --
+    # the only length at which the boundary is measurable at all.  For every other
+    # signal this is a no-op and `loop_params` is used exactly as given.
+    interval_ms = tracking_channel.CORRELATION_INTERVAL_MS
+    start_loop_params = loop_params
+    synced_coherent_duration_ms = tracking_policy.synced_coherent_duration_ms
+    # Any PRN answers this -- overlay presence and symbol periods are properties of
+    # the signal, not of the satellite -- and `tracking_signal_ids` is only an
+    # Iterable, so peeking into it here would consume a caller's generator.
+    probe = next(iter(signals.values()), None)
+    if (
+        probe is not None
+        and requires_bit_sync(signal_type, probe)
+        and loop_params.coherent_duration_ms > interval_ms
+    ):
+        synced_coherent_duration_ms = loop_params.coherent_duration_ms
+        start_loop_params = replace(loop_params, coherent_duration_ms=interval_ms)
+        # Capacity is one row per epoch, and the epochs before the extension are
+        # the short ones.  A channel whose bit sync never converges stays short for
+        # the whole run, so the honest bound is the run length in intervals --
+        # anything less truncates the record silently, exactly where a reader would
+        # be looking to find out why the sync failed.
+        output_capacity = output_capacity * (
+            loop_params.coherent_duration_ms // interval_ms
+        )
+
     channels: dict[str, TrackingChannelAdapter] = {}
     for signal_id in tracking_signal_ids:
         signal = signals[signal_id]
@@ -694,11 +868,14 @@ def create_tracking_channels(
         # waits for PLL lock (see TrackingChannel).
         initial_overlay_counter = None
         if acquisition_resolves_overlay_phase(signal_type, signal):
-            # The first correlation interval starts at ceil(code phase), so its
-            # overlay index is that integer millisecond.
+            # The first correlation interval starts at ceil(code phase); the
+            # overlay counter counts PRIMARY CODE PERIODS, so that millisecond is
+            # divided by the period rather than used directly.  The two are the
+            # same number on L5 and only on L5.
+            primary_period_ms = signal_type.primary_period_ms
             initial_overlay_counter = int(
-                np.ceil(initial_state.code_phase_ms)
-            ) % signal.overlay_period_ms
+                np.ceil(initial_state.code_phase_ms) // primary_period_ms
+            ) % (signal.overlay_period_ms // primary_period_ms)
 
         # A resolved ambiguity makes a component usable that was not before, so it
         # can change which components drive the loops -- for L2C that is the whole
@@ -708,15 +885,17 @@ def create_tracking_channels(
             discriminator_policy = tracking_policy.resolved_discriminator_policy
 
         channel = tracking_channel.TrackingChannel(
-            loop_params=loop_params,
+            loop_params=start_loop_params,
             signal_params=signal_params,
             initial_signal_state=initial_state,
             output_capacity=output_capacity,
             discriminator_policy=discriminator_policy,
             synced_policy=tracking_policy.synced_discriminator_policy,
-            synced_coherent_duration_ms=tracking_policy.synced_coherent_duration_ms,
+            synced_coherent_duration_ms=synced_coherent_duration_ms,
             cn0_params=cn0_params,
             initial_overlay_counter=initial_overlay_counter,
+            overlay_search=tracking_policy.overlay_search,
+            overlay_prompts_to_observe=tracking_policy.overlay_prompts_to_observe,
         )
 
         adapter = TrackingChannelAdapter(signal=signal, channel=channel)

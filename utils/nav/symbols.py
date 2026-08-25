@@ -1,0 +1,378 @@
+"""
+From tracking outputs to navigation-message symbols.
+
+The decoders in this package take soft symbols, one per data symbol.  A tracking
+channel produces prompt correlator values, one per *epoch*, and an epoch is not
+generally a symbol.  This module is the bridge, and it exists as its own file
+because the mapping is different for every signal and each difference is a
+property of the signal rather than of the decoder:
+
+    signal   data component   symbol    where the boundary comes from
+    ------   --------------   ------    -----------------------------
+    L1 C/A   0 (the only one)  20 ms    statistical bit sync -- nothing else exists
+    L2C      0 (CM)            20 ms    the CM code period IS the symbol
+    L5       0 (L5I)           10 ms    NH10 overlay sync
+    L1C      0 (L1CD)          10 ms    L1CD's code period; L1CO gives the frame
+
+The two things that make this more than a reshape:
+
+**Epoch length changes mid-run.**  `TrackingChannel._maybe_extend_coherent_duration`
+lengthens the coherent accumulation once the overlay is stripped and the PLL has
+locked -- for L5, from 5 ms to 10 ms.  So the same output array holds epochs of two
+different lengths, and only the longer ones are whole symbols.  That is what
+`outputs.epoch_duration_ms` is for.
+
+**Not every epoch is usable.**  Two edges have to be behind the channel before its
+epochs are symbols.  Until the overlay is synced the tiered code is still flipping
+the data component's sign every code period; and until the carrier loop is in PLL
+the epochs have random relative phase, so summing them cancels rather than
+integrates.  Epochs before either edge are dropped rather than salvaged -- see
+`_usable_slice`, which explains why salvaging them would fail silently.
+
+What this module deliberately does not do is resolve the carrier's 180 degree
+phase ambiguity.  That is not knowable here; it is knowable at frame sync, where a
+preamble either matches or does not, so `cnav.decode` and `lnav.decode` handle it.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import numpy as np
+
+from . import bitsync
+
+# Data component index and symbol period, per signal type.  The component is index
+# 0 in every case -- the pilot is always the later component in this project's
+# catalog (see `utils.signal_interfaces`) -- but stating it explicitly keeps the
+# table readable against the signal definitions rather than relying on a
+# coincidence that a future signal could break.
+DATA_COMPONENT: dict[str, int] = {
+    "GPS_L1CA": 0,
+    "GPS_L2C": 0,  # CM
+    "GPS_L5": 0,  # L5I
+    "GPS_L1C": 0,  # L1CD
+}
+
+SYMBOL_PERIOD_MS: dict[str, int] = {
+    "GPS_L1CA": 20,
+    "GPS_L2C": 20,
+    "GPS_L5": 10,
+    "GPS_L1C": 10,
+}
+
+# Whether the signal's symbol boundary is established by an overlay code.  L1 C/A
+# is the only one that has to find it statistically.
+NEEDS_BIT_SYNC: dict[str, bool] = {
+    "GPS_L1CA": True,
+    "GPS_L2C": False,
+    "GPS_L5": False,
+    "GPS_L1C": False,
+}
+
+# Whether the channel had a tiered (overlay) code to synchronise, and therefore
+# whether `overlay_synced` is a meaningful gate on the epochs.
+#
+# NOT the complement of `NEEDS_BIT_SYNC`, which is the mistake this table exists
+# to prevent: L2C needs neither.  Its 20 ms CM code period *is* one symbol, so the
+# code phase locates the boundary with nothing to sync and nothing to search for,
+# and `overlay_synced` stays False for the whole run.  Gating on it there discards
+# every epoch and the channel silently yields no symbols at all.
+# The longest epoch at which this module can still find a bit boundary itself.
+# One code period: a longer epoch has already summed the 1 ms structure the
+# histogram is built from into a single number, and no amount of such numbers
+# brings it back.  Beyond this length the boundary has to come from the channel,
+# which measured it while its epochs were still short.
+RESOLVABLE_EPOCH_MS = 1.0
+
+HAS_OVERLAY: dict[str, bool] = {
+    "GPS_L1CA": False,   # 1 ms code, 20 ms bit, nothing tying them together
+    "GPS_L2C": False,    # CM code period is the symbol
+    "GPS_L5": True,      # NH10/NH20
+    "GPS_L1C": True,     # L1CO, 1800 bits at one per 10 ms code period
+}
+
+# Whether the data component sits 90 degrees from the carrier loop's reference.
+#
+# This decides whether a soft symbol is the real or the imaginary part of the
+# prompt correlator, and getting it wrong costs the entire message -- the decoder
+# is handed the noise axis and simply never syncs.
+#
+# L5 is the one signal where it is True, and the reason is in
+# `TRACKING_POLICIES["GPS_L5"]`: the carrier loop runs on the Q pilot from the
+# first epoch, and L5's I and Q are separated by carrier phase, so the data
+# component lands in quadrature with the reference.  Everywhere else the data
+# component shares the reference's phase -- L1 C/A tracks the data component
+# itself; L2C's CM and CL are time-multiplexed on one carrier branch, which is
+# exactly why the carrier can move between them without a re-pull; L1C sums L1CD
+# and L1CP in phase (IS-GPS-800J 3.2.1.6.1).
+DATA_IN_QUADRATURE: dict[str, bool] = {
+    "GPS_L1CA": False,
+    "GPS_L2C": False,
+    "GPS_L5": True,
+    "GPS_L1C": False,
+}
+
+
+@dataclass
+class SymbolStream:
+    """Soft symbols with enough context to tie a decoded time back to tracking."""
+
+    values: np.ndarray
+    """Complex soft symbols, one per data symbol."""
+
+    uptime_ms: np.ndarray
+    """Uptime at the *start* of each symbol.  Same length as `values`."""
+
+    code_phase_ms: np.ndarray
+    """Cumulative code phase at the start of each symbol.  This is what turns a
+    decoded time of week into a transmit time for every later epoch, because it
+    measures satellite code time and advances at the satellite's own rate."""
+
+    symbol_period_ms: int
+    signal_type_id: str
+    epochs_per_symbol: int
+    """How many tracking epochs were summed into each symbol."""
+
+    dropped_epochs: int
+    """Epochs discarded before the first whole symbol -- unsynced, unlocked, or a
+    partial leading symbol.  A large value on a long run means the channel spent a
+    long time pulling in, not that anything is wrong."""
+
+    bit_sync: bitsync.BitSyncResult | None = None
+    """The boundary search this module ran, when it ran one.
+
+    None whenever the boundary arrived already established: from an overlay, from a
+    code period that is itself a symbol, or -- on L1 C/A tracked at more than one
+    code period per epoch -- from the channel, which measured it while its epochs
+    were still short and anchored the longer grid to it.  A populated value here
+    therefore means the phase was recovered from these symbols, not that the signal
+    is L1 C/A."""
+
+    data_in_quadrature: bool = False
+    """Whether the data rides 90 degrees from the carrier reference -- see
+    `DATA_IN_QUADRATURE`.  True for L5 only."""
+
+    @property
+    def soft(self) -> np.ndarray:
+        """
+        Real soft symbols, sign carrying the bit -- what every decoder here takes.
+
+        Which axis that is depends on the signal, not on the decoder, so the
+        projection happens once here.  See `DATA_IN_QUADRATURE`.
+        """
+        return np.imag(self.values) if self.data_in_quadrature else np.real(self.values)
+
+    @property
+    def quadrature_energy_ratio(self) -> float:
+        """
+        Mean magnitude on the data axis over the mean on the other one.
+
+        A diagnostic, not a decision: it should be large, and a value near 1
+        means the carrier is not locked the way `DATA_IN_QUADRATURE` assumes --
+        which is worth seeing before blaming the decoder for not syncing.
+        """
+        if not len(self.values):
+            return 0.0
+        data_axis = np.abs(self.soft).mean()
+        other = np.abs(
+            np.real(self.values) if self.data_in_quadrature else np.imag(self.values)
+        ).mean()
+        return float(data_axis / other) if other > 0 else float("inf")
+
+    def __len__(self) -> int:
+        return len(self.values)
+
+
+def _usable_slice(outputs, *, require_overlay_sync: bool) -> tuple[int, int]:
+    """
+    The half-open range of epochs worth turning into symbols.
+
+    Three conditions, all of them edges that happen once and do not reverse, so a
+    single start index suffices rather than a per-epoch mask.
+
+    **Carrier lock.**  Summing epochs into a symbol is *coherent* summation, and
+    without a phase-locked carrier the epochs have random relative phase -- they
+    cancel instead of integrating, and the data/quadrature split that
+    `DATA_IN_QUADRATURE` relies on does not exist at all.  A channel that never
+    reached PLL has no symbols in it, however many epochs it produced.  Skipping
+    this check does not fail loudly: it yields the right *number* of symbols, made
+    of noise, and the decoder simply never syncs.
+
+    **Final coherent duration.**  Before the extension the epochs are shorter and
+    do not tile the symbol grid the same way.
+
+    **Overlay sync**, for signals that have an overlay.  Until the tiered code is
+    stripped it is still flipping the data component's sign every code period.
+    """
+    valid = outputs.valid
+    start, stop = valid.start, valid.stop
+    if stop <= start:
+        return start, start
+
+    pll = outputs.pll_mode[start:stop]
+    locked = np.nonzero(pll)[0]
+    if not len(locked):
+        return start, start  # never locked: nothing here is a symbol
+    first = start + int(locked[0])
+
+    durations = outputs.epoch_duration_ms[start:stop]
+    final_duration = durations[-1]
+    at_final = np.nonzero(durations == final_duration)[0]
+    if len(at_final):
+        first = max(first, start + int(at_final[0]))
+
+    if require_overlay_sync:
+        synced = outputs.overlay_synced[start:stop]
+        synced_indices = np.nonzero(synced)[0]
+        if not len(synced_indices):
+            return start, start  # never synced: nothing here is a symbol
+        first = max(first, start + int(synced_indices[0]))
+
+    return first, stop
+
+
+def extract(
+    outputs,
+    signal_type_id: str,
+    *,
+    component: int | None = None,
+    bit_sync_confidence_threshold: float = 2.0,
+) -> SymbolStream:
+    """
+    Turn one channel's tracking outputs into a decodable symbol stream.
+
+    `outputs` is a `utils.tracking_channel.SignalTrackingOutputs`.  Only the epochs
+    that are genuinely symbols are used -- see the module docstring for what that
+    excludes and why.
+
+    Raises `ValueError` for a signal this module has no mapping for, rather than
+    guessing a symbol period.  A wrong symbol period does not fail loudly later; it
+    produces a stream that simply never frame-syncs, which is a much harder thing
+    to diagnose.
+    """
+    if signal_type_id not in SYMBOL_PERIOD_MS:
+        raise ValueError(
+            f"no symbol mapping for {signal_type_id!r}; known signals are "
+            f"{sorted(SYMBOL_PERIOD_MS)}"
+        )
+    if component is None:
+        component = DATA_COMPONENT[signal_type_id]
+
+    symbol_period_ms = SYMBOL_PERIOD_MS[signal_type_id]
+    needs_bit_sync = NEEDS_BIT_SYNC[signal_type_id]
+
+    first, stop = _usable_slice(outputs, require_overlay_sync=HAS_OVERLAY[signal_type_id])
+    if stop <= first:
+        return SymbolStream(
+            values=np.zeros(0, dtype=complex),
+            uptime_ms=np.zeros(0),
+            code_phase_ms=np.zeros(0),
+            symbol_period_ms=symbol_period_ms,
+            signal_type_id=signal_type_id,
+            epochs_per_symbol=0,
+            dropped_epochs=outputs.output_index,
+            data_in_quadrature=DATA_IN_QUADRATURE[signal_type_id],
+        )
+
+    prompts = outputs.prompt_corr[first:stop, component]
+    uptime = outputs.uptime_epoch_ms[first:stop]
+    code_phase = outputs.code_phase_ms[first:stop]
+    epoch_ms = float(outputs.epoch_duration_ms[stop - 1])
+
+    if epoch_ms <= 0:
+        raise ValueError(
+            "epoch duration was never recorded; these outputs predate "
+            "SignalTrackingOutputs.epoch_duration_ms and cannot be turned into symbols"
+        )
+    if symbol_period_ms % epoch_ms != 0:
+        raise ValueError(
+            f"{signal_type_id} has a {symbol_period_ms} ms symbol but the channel's "
+            f"epochs are {epoch_ms:g} ms, which does not divide it. Set "
+            "COHERENT_DURATION_MS to a divisor of the symbol period."
+        )
+    epochs_per_symbol = int(symbol_period_ms // epoch_ms)
+
+    sync: bitsync.BitSyncResult | None = None
+    phase = 0
+    if needs_bit_sync and epoch_ms > RESOLVABLE_EPOCH_MS:
+        # The channel found the boundary and opened this grid on it, so epoch zero
+        # is symbol zero and there is nothing left to search for.  Re-deriving it
+        # here would be worse than redundant: at one epoch per symbol the histogram
+        # has a single bin and no runner-up to measure confidence against.
+        #
+        # It has to be checked rather than assumed.  A channel built directly at
+        # this length -- rather than through `create_tracking_channels`, which
+        # starts short and extends -- anchors its grid on the code phase lattice
+        # instead, which on L1 C/A is offset from the bit lattice by an unknown
+        # 0-19 ms.  The outputs look identical either way, and the only visible
+        # consequence is a pseudorange wrong by a whole number of milliseconds:
+        # 300 km, on a fix that otherwise converges and looks entirely healthy.
+        if not outputs.bit_synced[first:stop].all():
+            raise ValueError(
+                f"{signal_type_id} epochs are {epoch_ms:g} ms, but the channel never "
+                "anchored its grid to a measured data bit boundary, so where a symbol "
+                "starts is unknown to within a code period. Build the channel with "
+                "`signal_interfaces.create_tracking_channels`, which starts at one "
+                "code period and extends once the boundary is found, or track at "
+                f"{RESOLVABLE_EPOCH_MS:g} ms and let this module find it."
+            )
+    elif needs_bit_sync:
+        # Bit sync reads sign transitions, so it must look at the data axis too.
+        sync = bitsync.synchronise(
+            1j * prompts if DATA_IN_QUADRATURE[signal_type_id] else prompts,
+            periods_per_bit=epochs_per_symbol,
+            confidence_threshold=bit_sync_confidence_threshold,
+        )
+        if not sync.synced:
+            return SymbolStream(
+                values=np.zeros(0, dtype=complex),
+                uptime_ms=np.zeros(0),
+                code_phase_ms=np.zeros(0),
+                symbol_period_ms=symbol_period_ms,
+                signal_type_id=signal_type_id,
+                epochs_per_symbol=epochs_per_symbol,
+                dropped_epochs=outputs.output_index,
+                bit_sync=sync,
+                data_in_quadrature=DATA_IN_QUADRATURE[signal_type_id],
+            )
+        phase = sync.phase
+    else:
+        # The overlay already aligned the epoch grid to symbol boundaries, but the
+        # first usable epoch is not necessarily the first epoch OF a symbol.  Code
+        # phase says which: it counts code periods from a symbol-aligned origin, so
+        # the offset into the current symbol is code phase modulo the symbol period.
+        offset_ms = code_phase[0] % symbol_period_ms
+        phase = int(round((symbol_period_ms - offset_ms) % symbol_period_ms / epoch_ms))
+
+    usable = (len(prompts) - phase) // epochs_per_symbol
+    if usable <= 0:
+        return SymbolStream(
+            values=np.zeros(0, dtype=complex),
+            uptime_ms=np.zeros(0),
+            code_phase_ms=np.zeros(0),
+            symbol_period_ms=symbol_period_ms,
+            signal_type_id=signal_type_id,
+            epochs_per_symbol=epochs_per_symbol,
+            dropped_epochs=outputs.output_index,
+            bit_sync=sync,
+            data_in_quadrature=DATA_IN_QUADRATURE[signal_type_id],
+        )
+
+    trimmed = prompts[phase : phase + usable * epochs_per_symbol]
+    values = trimmed.reshape(usable, epochs_per_symbol).sum(axis=1)
+    # Timestamps come from the FIRST epoch of each symbol, not an average: the
+    # symbol's epoch is when it started, and that is what a decoded time of week
+    # refers to.
+    starts = np.arange(usable) * epochs_per_symbol + phase
+    return SymbolStream(
+        values=values,
+        uptime_ms=uptime[starts],
+        code_phase_ms=code_phase[starts],
+        symbol_period_ms=symbol_period_ms,
+        signal_type_id=signal_type_id,
+        epochs_per_symbol=epochs_per_symbol,
+        dropped_epochs=first - outputs.valid.start + phase,
+        bit_sync=sync,
+        data_in_quadrature=DATA_IN_QUADRATURE[signal_type_id],
+    )

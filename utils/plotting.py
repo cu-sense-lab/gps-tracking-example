@@ -1022,3 +1022,326 @@ def plot_prompt_circ_length(
 
     ax.legend(handles=handles, markerscale=4, loc="lower right", fontsize=8)
     return ax
+
+
+# ===========================================================================
+# Navigation solution
+#
+# These five read a `utils.navigation.SolutionSeries` (and a skyplot's geometry)
+# rather than a tracking channel, so they sit apart from everything above.
+# ===========================================================================
+
+
+# Below this the troposphere is poorly modelled, the multipath is worse, and the
+# geometry gain does not make up for it.  Drawn on the skyplot so a marginal
+# satellite is visibly marginal rather than just low.
+DEFAULT_ELEVATION_MASK_DEG = 10.0
+
+
+def plot_skyplot(
+    fig: Figure | SubFigure,
+    azimuth_deg: dict[str, np.ndarray],
+    elevation_deg: dict[str, np.ndarray],
+    *,
+    cn0_dbhz: Optional[dict[str, float]] = None,
+    tracked: Optional[Iterable[str]] = None,
+    mask_deg: float = DEFAULT_ELEVATION_MASK_DEG,
+    title: Optional[str] = None,
+) -> Axes:
+    """
+    Where the satellites were, in the receiver's own sky.
+
+    Each entry of `azimuth_deg`/`elevation_deg` is that satellite's track over the
+    collect -- usually a short arc, since a GPS satellite moves a few degrees in a
+    minute.  Passing a single value per satellite works too and draws a point.
+
+    `tracked` distinguishes the satellites the receiver actually acquired from the
+    ones that were merely up.  That contrast is the most useful thing on the plot:
+    it turns "we got five satellites" into a statement about the front end, since
+    the ones that were missed are almost always the low ones.
+
+    Elevation is drawn increasing *inward*, which is the convention: the zenith is
+    the centre of the sky, not its edge.
+    """
+    ax = fig.add_subplot(1, 1, 1, projection="polar")
+    ax.set_theta_zero_location("N")
+    ax.set_theta_direction(-1)  # azimuth runs clockwise from north
+    ax.set_rlim(90, 0)          # zenith at the centre
+    ax.set_rgrids([0, 15, 30, 45, 60, 75, 90], labels=["90", "75", "60", "45", "30", "15", "0"])
+    ax.set_xticks(np.deg2rad([0, 45, 90, 135, 180, 225, 270, 315]))
+    ax.set_xticklabels(["N", "NE", "E", "SE", "S", "SW", "W", "NW"])
+
+    if mask_deg > 0:
+        ax.fill_between(
+            np.linspace(0, 2 * np.pi, 181),
+            mask_deg,
+            90,
+            color="tab:red",
+            alpha=0.06,
+            zorder=0,
+        )
+        ax.plot(np.linspace(0, 2 * np.pi, 181), np.full(181, mask_deg),
+                color="tab:red", lw=1, ls="--", alpha=0.5, zorder=1)
+
+    tracked = set(tracked) if tracked is not None else set(azimuth_deg)
+    values = [cn0_dbhz[s] for s in cn0_dbhz or {} if np.isfinite(cn0_dbhz[s])]
+    norm = None
+    if values:
+        norm = plt.Normalize(vmin=min(values), vmax=max(values))
+
+    scatter = None
+    for sat_id in sorted(azimuth_deg):
+        az = np.deg2rad(np.atleast_1d(azimuth_deg[sat_id]))
+        el = np.atleast_1d(elevation_deg[sat_id])
+        above = el > 0
+        if not above.any():
+            continue
+        is_tracked = sat_id in tracked
+
+        if len(az) > 1:
+            ax.plot(az[above], el[above],
+                    color="tab:blue" if is_tracked else "gray",
+                    lw=1.5 if is_tracked else 0.8,
+                    alpha=0.9 if is_tracked else 0.4, zorder=2)
+
+        end_az, end_el = az[above][-1], el[above][-1]
+        if is_tracked and cn0_dbhz and np.isfinite(cn0_dbhz.get(sat_id, np.nan)):
+            scatter = ax.scatter(end_az, end_el, c=[cn0_dbhz[sat_id]], cmap="viridis",
+                                 norm=norm, s=90, edgecolors="k", linewidths=0.6, zorder=3)
+        else:
+            ax.scatter(end_az, end_el,
+                       color="tab:blue" if is_tracked else "white",
+                       edgecolors="k" if is_tracked else "gray",
+                       s=90 if is_tracked else 55, linewidths=0.6,
+                       zorder=3 if is_tracked else 2)
+        ax.annotate(sat_id, (end_az, end_el), textcoords="offset points",
+                    xytext=(8, 6), fontsize=8,
+                    color="black" if is_tracked else "gray")
+
+    if scatter is not None:
+        fig.colorbar(scatter, ax=ax, pad=0.1, shrink=0.75, label="C/N0 [dB-Hz]")
+
+    ax.set_title(title if title is not None else "Sky view")
+    return ax
+
+
+def plot_position_enu(
+    fig: Figure | SubFigure,
+    enu_m: np.ndarray,
+    time_s: Optional[np.ndarray] = None,
+    *,
+    title: Optional[str] = None,
+) -> Axes:
+    """
+    The position solution: east/north scatter beside the three components in time.
+
+    The scatter carries a one-sigma error ellipse from the sample covariance, which
+    is the honest way to summarise a cloud that is almost never circular -- GPS
+    geometry couples east and north differently depending on which satellites are
+    up.
+
+    Height is plotted with the horizontal components rather than on its own so its
+    larger scatter is visible next to them.  A ground receiver's vertical error is
+    reliably two to three times its horizontal error, because every satellite is
+    above the antenna and none below.
+    """
+    enu_m = np.atleast_2d(enu_m)
+    good = np.isfinite(enu_m[:, 0])
+    east, north, up = enu_m[good, 0], enu_m[good, 1], enu_m[good, 2]
+
+    axes = fig.subplots(1, 2, width_ratios=[1.0, 1.4])
+    ax_scatter, ax_time = axes
+
+    if len(east):
+        ax_scatter.scatter(east, north, s=12, alpha=0.5, color="tab:blue",
+                           edgecolors="none", label="fixes")
+        ax_scatter.scatter([east.mean()], [north.mean()], marker="x", s=90,
+                           color="tab:red", linewidths=2, label="mean", zorder=3)
+
+        if len(east) > 2:
+            covariance = np.cov(np.vstack([east, north]))
+            eigenvalues, eigenvectors = np.linalg.eigh(covariance)
+            angle = np.degrees(np.arctan2(eigenvectors[1, -1], eigenvectors[0, -1]))
+            width, height = 2.0 * np.sqrt(np.maximum(eigenvalues[::-1], 0.0))
+            ax_scatter.add_patch(
+                plt.matplotlib.patches.Ellipse(
+                    (east.mean(), north.mean()), width, height, angle=angle,
+                    fill=False, edgecolor="tab:red", lw=1.5, ls="--",
+                    label="1$\\sigma$",
+                )
+            )
+        rms = np.sqrt(np.mean(east**2 + north**2))
+        ax_scatter.annotate(
+            f"horizontal RMS {rms:.1f} m\nvertical RMS {np.sqrt(np.mean(up**2)):.1f} m",
+            xy=(0.03, 0.97), xycoords="axes fraction", va="top", fontsize=9,
+            bbox=dict(boxstyle="round", fc="white", ec="gray", alpha=0.8),
+        )
+
+    ax_scatter.axhline(0, color="gray", lw=0.6)
+    ax_scatter.axvline(0, color="gray", lw=0.6)
+    ax_scatter.set_xlabel("East [m]")
+    ax_scatter.set_ylabel("North [m]")
+    ax_scatter.set_aspect("equal", adjustable="datalim")
+    ax_scatter.grid(True)
+    if ax_scatter.get_legend_handles_labels()[0]:
+        ax_scatter.legend(fontsize=8, loc="lower right")
+
+    t = np.arange(len(enu_m)) if time_s is None else np.asarray(time_s)
+    for column, label, color in ((0, "East", "tab:blue"), (1, "North", "tab:orange"),
+                                 (2, "Up", "tab:green")):
+        ax_time.plot(t[good], enu_m[good, column], lw=1.2, label=label, color=color)
+    ax_time.axhline(0, color="gray", lw=0.6)
+    ax_time.set_xlabel("Time [s]" if time_s is not None else "Epoch")
+    ax_time.set_ylabel("Offset from reference [m]")
+    ax_time.grid(True)
+    ax_time.legend(fontsize=9)
+
+    fig.suptitle(title if title is not None else "Position solution")
+    return ax_scatter
+
+
+def plot_clock_solution(
+    fig: Figure | SubFigure,
+    time_s: np.ndarray,
+    clock_bias_m: np.ndarray,
+    *,
+    title: Optional[str] = None,
+) -> Axes:
+    """
+    The receiver clock: its offset from GPS time, and what is left after a straight
+    line is removed.
+
+    The line is the whole point.  The receiver's clock here is the sample counter,
+    so a constant slope in the bias is the front end's oscillator running at the
+    wrong rate -- a real measurement of the hardware, quoted in ppm.  The residual
+    below says how much of the trace that line does *not* explain, which is where
+    measurement noise and any real clock instability show up.
+    """
+    time_s = np.asarray(time_s, dtype=float)
+    bias = np.asarray(clock_bias_m, dtype=float)
+    good = np.isfinite(bias)
+
+    axes = fig.subplots(2, 1, sharex=True, height_ratios=[2, 1])
+    ax_bias, ax_residual = axes
+
+    ax_bias.plot(time_s[good], bias[good] * 1e-3, lw=1.5, color="tab:blue", label="Clock bias")
+    ax_bias.set_ylabel("Clock bias [km]")
+    ax_bias.grid(True)
+
+    if good.sum() > 1:
+        t = time_s[good] - time_s[good][0]
+        slope, intercept = np.polyfit(t, bias[good], 1)
+        ax_bias.plot(time_s[good], (slope * t + intercept) * 1e-3, lw=1.2, ls="--",
+                     color="tab:red", label="Linear fit")
+        drift_ppm = slope / 2.99792458e8 * 1e6
+        residual = bias[good] - (slope * t + intercept)
+        ax_bias.annotate(
+            f"drift {drift_ppm:+.3f} ppm ({slope:+.1f} m/s)\n"
+            f"residual RMS {np.sqrt(np.mean(residual**2)):.2f} m",
+            xy=(0.03, 0.05), xycoords="axes fraction", fontsize=9,
+            bbox=dict(boxstyle="round", fc="white", ec="gray", alpha=0.8),
+        )
+        ax_residual.plot(time_s[good], residual, lw=1.0, color="tab:purple")
+        ax_residual.axhline(0, color="gray", lw=0.6)
+
+    ax_bias.legend(fontsize=9)
+    ax_residual.set_ylabel("Residual [m]")
+    ax_residual.set_xlabel("Time [s]")
+    ax_residual.grid(True)
+
+    fig.suptitle(title if title is not None else "Receiver clock solution")
+    return ax_bias
+
+
+def plot_pseudorange_residuals(
+    fig: Figure | SubFigure,
+    time_s: np.ndarray,
+    residuals_m: np.ndarray,
+    sat_ids: Sequence[str],
+    *,
+    title: Optional[str] = None,
+) -> Axes:
+    """
+    Post-fit residuals per satellite -- the honest measure of whether the
+    corrections are doing their job.
+
+    Read the *structure*, not just the size.  Residuals that scatter about zero are
+    measurement noise; one satellite sitting consistently off is an ephemeris or
+    multipath problem on that satellite; all of them drifting together means
+    something common-mode is unmodelled, and that is usually the clock.
+
+    With exactly four satellites these are zero by construction and mean nothing;
+    the caller should say so rather than let a flat line read as a good fix.
+    """
+    time_s = np.asarray(time_s, dtype=float)
+    residuals_m = np.atleast_2d(residuals_m)
+
+    ax = fig.add_subplot(1, 1, 1)
+    for j, sat_id in enumerate(sat_ids):
+        column = residuals_m[:, j]
+        good = np.isfinite(column)
+        if good.any():
+            ax.plot(time_s[good], column[good], lw=1.0, marker=".", ms=3, label=sat_id)
+
+    ax.axhline(0, color="gray", lw=0.8)
+    ax.set_xlabel("Time [s]")
+    ax.set_ylabel("Post-fit residual [m]")
+    ax.grid(True)
+    if ax.get_legend_handles_labels()[0]:
+        ax.legend(fontsize=8, ncol=2)
+
+    finite = residuals_m[np.isfinite(residuals_m)]
+    if finite.size:
+        ax.set_title(
+            (title if title is not None else "Pseudorange residuals")
+            + f"  (RMS {np.sqrt(np.mean(finite**2)):.2f} m)"
+        )
+    else:
+        ax.set_title(title if title is not None else "Pseudorange residuals")
+    return ax
+
+
+def plot_correction_magnitudes(
+    fig: Figure | SubFigure,
+    terms: dict[str, np.ndarray],
+    sat_ids: Sequence[str],
+    *,
+    title: Optional[str] = None,
+) -> Axes:
+    """
+    What each correction is worth, on a log scale because the range is enormous.
+
+    The satellite clock is tens of kilometres, Sagnac tens of metres, the
+    troposphere a few metres, the ionosphere a few more.  Seeing five orders of
+    magnitude side by side is the point -- it explains why an uncorrected fix is
+    not merely inaccurate but nonsensical, and why the last correction is worth far
+    less effort than the first.
+    """
+    ax = fig.add_subplot(1, 1, 1)
+    labels, magnitudes = [], []
+    for name, values in terms.items():
+        if name.endswith("_deg"):  # geometry, not a range correction
+            continue
+        finite = np.abs(np.asarray(values)[np.isfinite(values)])
+        if finite.size:
+            labels.append(name.replace("_", " "))
+            magnitudes.append(finite.mean())
+
+    if labels:
+        # Ascending, because barh draws the first entry at the bottom -- so
+        # ascending order puts the largest correction at the TOP of the chart,
+        # which is where a reader looks first.
+        order = np.argsort(magnitudes)
+        labels = [labels[i] for i in order]
+        magnitudes = [magnitudes[i] for i in order]
+        bars = ax.barh(labels, magnitudes, color="tab:blue", alpha=0.8)
+        ax.set_xscale("log")
+        for bar, value in zip(bars, magnitudes):
+            ax.annotate(f"{value:,.2f} m", (value, bar.get_y() + bar.get_height() / 2),
+                        xytext=(6, 0), textcoords="offset points", va="center", fontsize=9)
+        ax.set_xlim(right=max(magnitudes) * 8)
+
+    ax.set_xlabel("Mean absolute correction [m]")
+    ax.grid(True, axis="x", which="both")
+    ax.set_title(title if title is not None else "Pseudorange corrections")
+    return ax

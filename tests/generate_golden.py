@@ -6,12 +6,19 @@ reviewed:
 
     python -m tests.generate_golden
 
+Adding a signal is the one routine reason to run this afterwards, and then only
+for the new scenarios -- pass their names so the existing baselines are left
+untouched and keep doing their job:
+
+    python -m tests.generate_golden l1c_clean l1c_noisy
+
 `tests/test_tracking_regression.py` diffs live output against these files.
 """
 
 from __future__ import annotations
 
 import pathlib
+import sys
 
 import numpy as np
 
@@ -21,9 +28,16 @@ from .scenarios import SCENARIOS
 GOLDEN_DIR = pathlib.Path(__file__).parent / "golden"
 
 
-def main() -> None:
+def main(names: list[str] | None = None) -> None:
     GOLDEN_DIR.mkdir(exist_ok=True)
-    for scenario in SCENARIOS:
+    scenarios = SCENARIOS
+    if names:
+        known = {s.name for s in SCENARIOS}
+        unknown = sorted(set(names) - known)
+        if unknown:
+            raise SystemExit(f"no such scenario(s): {unknown}; have {sorted(known)}")
+        scenarios = tuple(s for s in SCENARIOS if s.name in set(names))
+    for scenario in scenarios:
         outputs = run_scenario(scenario)
         path = GOLDEN_DIR / f"{scenario.name}.npz"
         np.savez_compressed(path, **outputs)
@@ -43,4 +57,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    main(sys.argv[1:])

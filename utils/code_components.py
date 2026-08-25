@@ -22,7 +22,7 @@ rather than metadata: L2C's CM is (CM_0, 0, CM_1, 0, ...) and its CL is
     GPS L1 C/A   one component, every chip
     GPS L2C      CM/CL interleaved chip by chip (IS-GPS-200), zero-filled apart
     GPS L5       I/Q co-located on every chip, separated by carrier phase
-    GPS L1C      D/P co-located on every chip, separated by carrier phase
+    GPS L1C      D/P co-located on every chip, separated by CODE and power alone
 
 Storing the zeros costs one byte per chip per component and buys a correlator
 inner loop with no modulo and no divide in it -- measurably faster than deriving
@@ -60,11 +60,38 @@ qualified is the *per-component* array a code set flattens into
 (`component_code_lengths`, `component_code_start_indices`), because those index
 components rather than chips.
 
-`subcarrier` and `power_weight` describe structure that later signals need
-(BOC/TMBOC on L1C, L1C's 25/75 power split).  They are carried by the data model
-from the outset so that adding those signals is a matter of configuration plus
-one correlator capability, rather than a redesign.  Nothing consumes them yet.
-`branch` is carried for the same reason, and is documented above.
+SUBCARRIERS
+-----------
+A BOC signal multiplies each chip by a square wave -- the subcarrier -- running
+at `2 * rate_hz / chip_rate_hz` half-cycles per chip: 2 for BOC(1,1), 12 for
+BOC(6,1).  Those half-cycles are called SUB-CHIPS here.  TMBOC picks between two
+subcarriers per chip from a repeating mask; GPS L1C-P uses BOC(6,1) on 4 of every
+33 chips and BOC(1,1) on the rest.
+
+The wave is sine-phased by default -- it starts a half-cycle at the chip boundary.
+Cosine phasing advances it by a quarter of a subcarrier period, so a chip opens
+and closes on half-width segments; it is carried as a half-sub-chip offset rather
+than a second code path (`_PHASE_OFFSET_SUB_CHIPS`).  GPS uses sine phasing
+throughout; Galileo's E1 PRS and E6 are the cosine-phased cases.
+
+Unlike multiplexing, a subcarrier is deliberately NOT folded into `sequence`.  It
+could be -- state L1C on a 12.276 Mcps axis and the subcarrier becomes data,
+exactly as time-division multiplexing did above -- but then "chip" would mean a
+sub-chip everywhere downstream, and `code_phase_chips`, `EPL_chip_spacing` and
+`chip_length_m` would all quietly change units while still reading as chips.  The
+subcarrier is instead evaluated from the fractional chip position at each sample,
+by a second correlator kernel (see `utils.bpsk_correlation`).
+
+What this module owns is the conversion: the kernel cannot use a rate in Hz, only
+a count of sub-chips per chip, and deriving that needs the signal's chip rate --
+which is why `build_code_set` takes `chip_rate_hz` and insists on it as soon as
+any component has a subcarrier.  Acquisition builds its replica the same way, from
+the fractional chip position it already computes, via `subcarrier_signs` below.
+
+`power_weight` is the other thing a multi-component signal needs and a
+single-component one never notices: GPS L1C splits its power 25/75 between data
+and pilot, so a delay discriminator combining both non-coherently has to weight
+them (`TrackingChannel._combine_code_magnitude`).  `branch` is documented above.
 
 This module is deliberately free of any GPS-specific constants; concrete signals are
 assembled in `utils.signal_interfaces`.
@@ -87,7 +114,12 @@ class Branch(StrEnum):
         GPS L1 C/A   Q
         GPS L2C      CM Q, CL Q   (same branch -- see the module docstring)
         GPS L5       I  I,  Q Q
-        GPS L1C      D  I,  P Q
+        GPS L1C      D  I,  P I   (both in phase with P(Y), IS-GPS-800J 3.2.1.6.1)
+
+    L1C is the case that shows `branch` is a record rather than a mechanism: its
+    two components are co-located in time AND in phase, separated only by their
+    codes and a 25/75 power split.  Sharing a branch is what lets its carrier loop
+    move between them without a quarter-cycle re-pull.
 
     Only differences between components of one signal are meaningful to a
     receiver; there is no default because the simplest signal in the catalog
@@ -109,9 +141,14 @@ class Subcarrier:
     """
     Square-wave subcarrier applied on top of a component's spreading code.
 
-    Not yet consumed by the correlator.  For TMBOC, `pattern` is a per-chip mask
-    selecting which chips use `pattern_rate_hz` instead of `rate_hz` (GPS L1C-P uses
-    BOC(6,1) on 4 of every 33 chips, BOC(1,1) on the rest).
+    Rates are in Hz because that is what the interface control documents state and
+    what the spectrum shows; `build_code_set` converts them to the sub-chips per
+    chip the correlator needs, which is why it wants the chip rate.
+
+    For TMBOC, `pattern` is a per-chip mask selecting which chips use
+    `pattern_rate_hz` instead of `rate_hz` (GPS L1C-P uses BOC(6,1) on 4 of every
+    33 chips, BOC(1,1) on the rest).  The mask is stated once and tiled: it needs
+    to divide the code length, or the last block would be truncated.
     """
 
     kind: SubcarrierKind
@@ -127,6 +164,11 @@ class Subcarrier:
                 raise ValueError("TMBOC requires a per-chip pattern")
             if self.pattern_rate_hz <= 0.0:
                 raise ValueError("TMBOC requires a positive pattern_rate_hz")
+        elif self.pattern is not None:
+            raise ValueError(
+                f"a {self.kind} subcarrier has one rate everywhere, so a per-chip "
+                "pattern cannot mean anything; use SubcarrierKind.TMBOC"
+            )
 
 
 @dataclass(frozen=True)
@@ -198,7 +240,24 @@ class CodeSet:
     codes_flat: np.ndarray  # int8, all component codes concatenated
     component_code_start_indices: np.ndarray  # int64, where each component's block starts in codes_flat
     component_code_lengths: np.ndarray  # int64, chips in each component's code
-    pattern_period_chips: int  # chips before the whole pattern repeats
+    pattern_period_chips: int  # chips before the whole multiplexed pattern repeats
+
+    # Subcarrier, in the only form the kernel can use: sub-chips per chip, with 0
+    # meaning "no subcarrier on this component" -- which is how a mixed signal, or
+    # a signal with none at all, costs nothing on the fast path.
+    #
+    # `subcarrier_pattern_*` is the TMBOC mask and is packed end to end exactly
+    # like `codes_flat`, with a length of 0 for a component that has no mask.  The
+    # prefix is load-bearing: `pattern_period_chips` above is the MULTIPLEXING
+    # period and has nothing to do with these.
+    subcarrier_sub_chips_per_chip: np.ndarray  # int64, per component
+    subcarrier_pattern_sub_chips_per_chip: np.ndarray  # int64, per component
+    subcarrier_patterns_flat: np.ndarray  # int8, 1 selects the pattern rate
+    subcarrier_pattern_start_indices: np.ndarray  # int64, base address into the above
+    subcarrier_pattern_lengths: np.ndarray  # int64, chips in each component's mask
+    # 0 for sine phasing, 1/2 for cosine -- added to the sub-chip position before
+    # its parity is taken.  float64 because it is a position, not a count.
+    subcarrier_phase_offset_sub_chips: np.ndarray
 
     @property
     def num_components(self) -> int:
@@ -253,9 +312,15 @@ class CodeSet:
 def build_code_set(
     components: tuple[CodeComponent, ...] | list[CodeComponent],
     allow_partial_coverage: bool = False,
+    chip_rate_hz: float | None = None,
 ) -> CodeSet:
     """
     Flatten components into kernel-ready arrays and derive the pattern period.
+
+    `chip_rate_hz` is required as soon as any component carries a subcarrier, and
+    ignored otherwise.  A subcarrier states its rate in Hz while the correlator
+    can only use sub-chips per chip, and nothing else here knows the chip rate --
+    see the SUBCARRIERS section of the module docstring.
 
     `allow_partial_coverage` waives the check that every chip carries at least
     one component.  That check exists to catch a *transmit* topology which would
@@ -291,6 +356,113 @@ def build_code_set(
         component_code_start_indices=start_indices,
         component_code_lengths=code_lengths,
         pattern_period_chips=pattern_period_chips,
+        **_flatten_subcarriers(components, chip_rate_hz),
+    )
+
+
+# Cosine phasing is the same square wave advanced by a quarter of a subcarrier
+# period, which is half a sub-chip.  Expressing it as an offset rather than a
+# kind keeps the kernel's sign rule one line for both -- and says what phasing
+# IS, instead of enumerating the two cases anyone has needed so far.
+_PHASE_OFFSET_SUB_CHIPS: dict[SubcarrierKind, float] = {
+    SubcarrierKind.BOC_SIN: 0.0,
+    SubcarrierKind.TMBOC: 0.0,
+    SubcarrierKind.BOC_COS: 0.5,
+}
+
+
+def _sub_chips_per_chip(rate_hz: float, chip_rate_hz: float, name: str, field: str) -> int:
+    """
+    Half-cycles of a square-wave subcarrier per chip: 2 for BOC(1,1), 12 for BOC(6,1).
+
+    A whole number is not a convenience, it is what makes the subcarrier periodic
+    on the chip axis -- the kernel derives the sign from the fractional chip
+    position alone, which is only the same sign in every chip when the sub-chips
+    divide the chip evenly.
+    """
+    ratio = 2.0 * rate_hz / chip_rate_hz
+    count = int(round(ratio))
+    if abs(ratio - count) > 1e-9 or count < 2:
+        raise ValueError(
+            f"component {name!r}: {field} {rate_hz:g} Hz against a chip rate of "
+            f"{chip_rate_hz:g} Hz gives {ratio:g} sub-chips per chip; it must be a "
+            "whole number of at least 2"
+        )
+    return count
+
+
+def _flatten_subcarriers(
+    components: tuple[CodeComponent, ...], chip_rate_hz: float | None
+) -> dict[str, np.ndarray]:
+    """Pack every component's subcarrier into the kernel's flat arrays."""
+    num_components = len(components)
+    sub_chips = np.zeros(num_components, dtype=np.int64)
+    pattern_sub_chips = np.zeros(num_components, dtype=np.int64)
+    pattern_start_indices = np.zeros(num_components, dtype=np.int64)
+    pattern_lengths = np.zeros(num_components, dtype=np.int64)
+    phase_offsets = np.zeros(num_components, dtype=np.float64)
+    patterns: list[np.ndarray] = []
+
+    if any(c.subcarrier is not None for c in components):
+        if chip_rate_hz is None:
+            named = ", ".join(
+                repr(c.name) for c in components if c.subcarrier is not None
+            )
+            raise ValueError(
+                f"chip_rate_hz is required because {named} carries a subcarrier: its "
+                "rate is in Hz and the correlator needs sub-chips per chip, which "
+                "cannot be derived without the chip rate"
+            )
+        if chip_rate_hz <= 0.0:
+            raise ValueError(f"chip_rate_hz must be positive, got {chip_rate_hz}")
+
+    offset = 0
+    for index, component in enumerate(components):
+        pattern_start_indices[index] = offset
+        subcarrier = component.subcarrier
+        if subcarrier is None:
+            continue
+        assert chip_rate_hz is not None  # guarded above
+        sub_chips[index] = _sub_chips_per_chip(
+            subcarrier.rate_hz, chip_rate_hz, component.name, "rate_hz"
+        )
+        phase_offsets[index] = _PHASE_OFFSET_SUB_CHIPS[subcarrier.kind]
+        if subcarrier.pattern is None:
+            continue
+
+        pattern_sub_chips[index] = _sub_chips_per_chip(
+            subcarrier.pattern_rate_hz, chip_rate_hz, component.name, "pattern_rate_hz"
+        )
+        pattern = np.ascontiguousarray(subcarrier.pattern, dtype=np.int8)
+        if pattern.ndim != 1 or pattern.size == 0:
+            raise ValueError(
+                f"component {component.name!r}: subcarrier pattern must be a "
+                "non-empty 1-D array"
+            )
+        if not np.isin(pattern, (0, 1)).all():
+            raise ValueError(
+                f"component {component.name!r}: subcarrier pattern is a mask selecting "
+                "which chips use pattern_rate_hz, so it must be 0/1"
+            )
+        if component.code_length % pattern.size:
+            raise ValueError(
+                f"component {component.name!r}: the {pattern.size}-chip subcarrier "
+                f"pattern does not divide its {component.code_length}-chip code, so "
+                "the pattern would be truncated at the code wrap"
+            )
+        patterns.append(pattern)
+        pattern_lengths[index] = pattern.size
+        offset += pattern.size
+
+    return dict(
+        subcarrier_sub_chips_per_chip=sub_chips,
+        subcarrier_pattern_sub_chips_per_chip=pattern_sub_chips,
+        subcarrier_patterns_flat=(
+            np.concatenate(patterns) if patterns else np.zeros(0, dtype=np.int8)
+        ),
+        subcarrier_pattern_start_indices=pattern_start_indices,
+        subcarrier_pattern_lengths=pattern_lengths,
+        subcarrier_phase_offset_sub_chips=phase_offsets,
     )
 
 
@@ -324,6 +496,51 @@ def _validate_chip_coverage(components: tuple[CodeComponent, ...]) -> None:
             "deliberately describes only part of a signal, pass "
             "allow_partial_coverage=True."
         )
+
+
+def subcarrier_signs(
+    component: CodeComponent,
+    chip_rate_hz: float,
+    chip_indices: np.ndarray,
+    fractional_chip: np.ndarray,
+) -> np.ndarray:
+    """
+    Subcarrier sign at each of a run of positions on the chip axis, as +/-1 int8.
+
+    This is the vectorised twin of the correlator kernel's per-sample subcarrier
+    branch, and it exists so that the two places a subcarrier is evaluated -- the
+    kernel, sample by sample, and the acquisition replica, all at once -- share one
+    statement of what a subcarrier *is*.  Keeping them in the same module next to
+    the flattening is what makes disagreement a test failure rather than a silent
+    3 dB.
+
+    `fractional_chip` is the position within the chip, in [0, 1); `chip_indices`
+    selects the TMBOC rate and may be wrapped or not, since a pattern always
+    divides the code length (`build_code_set` enforces it).  A component with no
+    subcarrier gets all +1, so callers need not special-case BPSK.
+    """
+    shape = np.shape(fractional_chip)
+    subcarrier = component.subcarrier
+    if subcarrier is None:
+        return np.ones(shape, dtype=np.int8)
+
+    base = _sub_chips_per_chip(
+        subcarrier.rate_hz, chip_rate_hz, component.name, "rate_hz"
+    )
+    sub_chips = np.full(shape, base, dtype=np.int64)
+    if subcarrier.pattern is not None:
+        patterned = _sub_chips_per_chip(
+            subcarrier.pattern_rate_hz, chip_rate_hz, component.name, "pattern_rate_hz"
+        )
+        pattern = np.asarray(subcarrier.pattern, dtype=np.int8)
+        mask = pattern[np.asarray(chip_indices) % len(pattern)]
+        sub_chips = np.where(mask == 1, patterned, sub_chips)
+
+    # int(), matching the kernel exactly: fractional_chip is non-negative, so
+    # truncation is floor and the two cannot disagree at a half-cycle boundary.
+    offset = _PHASE_OFFSET_SUB_CHIPS[subcarrier.kind]
+    half_cycle = (np.asarray(fractional_chip) * sub_chips + offset).astype(np.int64)
+    return np.where(half_cycle % 2 == 1, -1, 1).astype(np.int8)
 
 
 def epl_delay_bins(chip_spacing: float) -> tuple[float, ...]:

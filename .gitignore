@@ -7,3 +7,6 @@
 !.env.example
 poetry.lock
 TODO.md
+
+# macOS AppleDouble sidecars (this repo lives on an exFAT volume)
+._*

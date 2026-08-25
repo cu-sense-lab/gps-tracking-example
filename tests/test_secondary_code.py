@@ -19,6 +19,7 @@ from utils.secondary_code import (
     OverlaySynchroniser,
     brute_force_search,
     build_synchroniser,
+    fft_search,
 )
 
 from . import synthetic
@@ -172,7 +173,7 @@ def test_ambiguous_run_keeps_trying_rather_than_restarting():
 def test_search_strategy_is_pluggable():
     """
     Brute force is O(len * period), fine for NH10/NH20.  L1C's 1800-symbol
-    overlay will need an FFT-based search; it must drop in without touching the
+    overlay needs `fft_search` instead; either must drop in without touching the
     state machine.
     """
     _, nh_q = synthetic.get_l5_overlays()
@@ -188,3 +189,121 @@ def test_search_strategy_is_pluggable():
     _feed(sync, nh_q, true_offset=0, count=sync.observation_length)
     assert calls, "custom search was never consulted"
     assert sync.synced
+
+
+# --------------------------------------------------------------------------
+# The FFT search
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("true_offset", range(20))
+def test_fft_search_agrees_with_brute_force_at_every_offset(true_offset):
+    """
+    The two must be interchangeable, not merely both plausible.  Brute force is
+    the definition -- an explicit sum per shift -- so it is what the FFT form is
+    checked against, offset by offset, on the overlay small enough to do both.
+    """
+    _, nh_q = synthetic.get_l5_overlays()
+    rng = np.random.default_rng(true_offset)
+    n = 4 * len(nh_q)
+    # Complex prompts with a rotating phase and noise: the search must not depend
+    # on the prompts being real or the carrier being perfectly tracked.
+    clean = nh_q[(np.arange(n) + true_offset) % len(nh_q)] * np.exp(1j * 0.7)
+    prompts = 1000.0 * clean + (rng.standard_normal(n) + 1j * rng.standard_normal(n)) * 60.0
+
+    assert fft_search(prompts, nh_q)[0] == brute_force_search(prompts, nh_q)[0] == true_offset
+    assert fft_search(prompts, nh_q)[1] == pytest.approx(
+        brute_force_search(prompts, nh_q)[1], rel=1e-9
+    )
+
+
+def test_fft_search_finds_a_long_overlay_from_a_fraction_of_one_period():
+    """
+    This is the case the FFT form exists for.  L1C's overlay is 1800 symbols of
+    10 ms, so one period is 18 seconds; the search has to work on a couple of
+    seconds of it.  A matched filter over 1800 hypotheses separates the true
+    offset from every other long before the period is out.
+    """
+    rng = np.random.default_rng(0)
+    overlay = rng.choice(np.array([-1, 1], dtype=np.int8), size=1800)
+
+    true_offset = 1234
+    window = 200  # 2 s at L1C's 10 ms primary period, against an 18 s period
+    clean = overlay[(np.arange(window) + true_offset) % len(overlay)]
+    prompts = 1000.0 * clean + (
+        rng.standard_normal(window) + 1j * rng.standard_normal(window)
+    ) * 250.0
+
+    offset, confidence = fft_search(prompts, overlay)
+    assert offset == true_offset
+    assert confidence > 2.0
+    assert (offset, confidence) == pytest.approx(brute_force_search(prompts, overlay))
+
+
+def test_a_short_window_is_what_makes_a_long_overlay_tractable():
+    """
+    `periods_to_observe` is the wrong unit for L1C: four periods is 72 seconds of
+    tracking before the first attempt.  `prompts_to_observe` sets the window
+    directly, and the synchroniser must otherwise behave identically.
+    """
+    rng = np.random.default_rng(1)
+    overlay = rng.choice(np.array([-1, 1], dtype=np.int8), size=1800)
+
+    default = OverlaySynchroniser(reference_overlay=overlay, period=1800)
+    assert default.observation_length == 4 * 1800
+
+    sync = OverlaySynchroniser(
+        reference_overlay=overlay, period=1800, prompts_to_observe=200, search=fft_search
+    )
+    assert sync.observation_length == 200
+
+    true_offset = 97
+    synced_at = _feed(sync, overlay, true_offset, count=sync.observation_length)
+    assert synced_at == 199, "should sync on the 200th prompt, which fills the window"
+    assert sync.synced
+    # Same convention as the short overlays: the counter is left on the next
+    # interval to arrive.
+    assert sync.counter == (true_offset + synced_at + 1) % 1800
+
+
+def test_the_fold_is_exact_for_a_window_longer_than_the_overlay():
+    """
+    A window of several whole overlay periods -- L5's default -- folds several
+    prompts into each bin.  That has to give the same answer as summing after the
+    shift, not merely a similar one, or the two searches would disagree exactly
+    where L5 uses them.
+    """
+    _, nh_q = synthetic.get_l5_overlays()
+    rng = np.random.default_rng(7)
+    n = 7 * len(nh_q) + 3  # deliberately not a whole number of periods
+    clean = nh_q[(np.arange(n) + 11) % len(nh_q)]
+    prompts = 1000.0 * clean + (
+        rng.standard_normal(n) + 1j * rng.standard_normal(n)
+    ) * 80.0
+
+    assert fft_search(prompts, nh_q)[0] == brute_force_search(prompts, nh_q)[0] == 11
+    assert fft_search(prompts, nh_q)[1] == pytest.approx(
+        brute_force_search(prompts, nh_q)[1], rel=1e-9
+    )
+
+
+def test_a_low_confidence_retry_keeps_most_of_a_short_window():
+    """
+    The retry drops the oldest slice rather than everything.  One overlay period
+    is the natural slice, but L1C's window is a ninth of its overlay, so an
+    uncapped drop would clear the buffer on every attempt and the synchroniser
+    would never accumulate enough to decide.
+    """
+    rng = np.random.default_rng(2)
+    overlay = rng.choice(np.array([-1, 1], dtype=np.int8), size=1800)
+    sync = OverlaySynchroniser(
+        reference_overlay=overlay, period=1800, prompts_to_observe=200,
+        search=fft_search, confidence_threshold=1e9,
+    )
+    for n in range(400):
+        sync.observe(complex(overlay[n % len(overlay)]))
+        sync.advance()
+    assert not sync.synced
+    assert 0 < len(sync._prompts) <= sync.observation_length
+    # Half the window survives each failed attempt, rather than none of it.
+    assert len(sync._prompts) >= 100

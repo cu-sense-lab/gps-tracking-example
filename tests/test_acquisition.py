@@ -23,7 +23,10 @@ import pytest
 
 from utils import bpsk_acquisition as bpsk_acq
 from utils.signal_interfaces import (
+    GpsL1CA,
+    GpsL1C,
     GpsL2C,
+    GpsL5,
     build_acquisition_code_params,
     build_signals,
 )
@@ -225,3 +228,82 @@ def test_splitting_does_not_disturb_a_flip_free_dwell():
     assert split.acq_code_phase_seconds == pytest.approx(
         whole.acq_code_phase_seconds, abs=2.0 / FS
     )
+
+
+# ---------------------------------------------------------------------------
+# The chip axis acquisition reports on
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "signal_type", [GpsL1CA, GpsL2C, GpsL5, GpsL1C], ids=lambda s: s.signal_type_id
+)
+def test_acquisition_reports_the_signals_own_chip_rate(signal_type):
+    """
+    `AcqSignalCodeParameters.rate_chips_per_sec` is the rate a delay in seconds is
+    converted to chips with -- by `plot_acquisition_code_phase_slices`, and by the
+    fine search when it places its taps.  It has to be the same chip rate tracking
+    uses, or "chips" means two different lengths in one pipeline.
+
+    This is a regression test.  An earlier design folded L1C's subcarrier into the
+    replica on a 12x sub-chip axis, which made this rate 12.276 Mcps: correct for
+    the replica, and wrong for every consumer of the number, so the acquisition
+    delay plot came out in sub-chips with an axis labelled chips.
+    """
+    signals = build_signals(signal_type, prns=[PRN])
+    params = build_acquisition_code_params(signal_type, signals)[f"G{PRN:02d}"]
+    assert params.rate_chips_per_sec == signal_type.tracking_code_rate_chips_per_sec
+
+
+def _acquire_l1c():
+    """One clean L1C dwell, enough for a delay slice to be drawn from."""
+    samp_rate = 25e6
+    samples = synthetic.generate_l1c_samples(
+        prn=PRN, start_sec=0.0, duration_sec=0.040, samp_rate=samp_rate,
+        doppler_hz=1500.0, code_phase_ms=3.27, nav_bits=True,
+        noise_sigma=0.5, rng=np.random.default_rng(1),
+    )
+    config = bpsk_acq.AcquisitionConfiguration(
+        coherent_duration_replica_ms=10, num_blocks=4, sample_rate=samp_rate,
+        min_search_doppler_hz=-5000.0, max_search_doppler_hz=5000.0,
+    )
+    signals = build_signals(GpsL1C, prns=[PRN])
+    results = bpsk_acq.run_acquisition(
+        np.ascontiguousarray(samples, dtype=np.complex64), 0.0, config,
+        build_acquisition_code_params(GpsL1C, signals), prob_false_alarm_total=1e-5,
+    )
+    return results, config
+
+
+def test_the_acquisition_delay_plot_axis_is_in_whole_chips():
+    """
+    Read the delay axis back off the rendered line rather than trusting the rate:
+    the window is stated in chips, so a plot drawn on a sub-chip axis silently
+    shows 1/12th of what was asked for -- which is how the bug above stayed
+    invisible.  One chip of L1C is 1/1.023 us, so a +/-3 chip window spans about
+    5.9 us of delay.
+    """
+    matplotlib = pytest.importorskip("matplotlib")
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    from utils import plotting
+
+    results, _ = _acquire_l1c()
+    fig = plt.figure()
+    try:
+        axes = plotting.plot_acquisition_code_phase_slices(
+            fig, results, window_chips=3.0
+        )
+        spans = [
+            line.get_xdata().max() - line.get_xdata().min()
+            for line in axes.get_lines()
+            if len(line.get_xdata()) > 2
+        ]
+    finally:
+        plt.close(fig)
+
+    assert spans, "no delay slice was drawn"
+    # Within a chip of the full +/-3 window, and nowhere near the 0.5 chips a
+    # 12x sub-chip axis would have shown.
+    assert max(spans) == pytest.approx(6.0, abs=1.0)
