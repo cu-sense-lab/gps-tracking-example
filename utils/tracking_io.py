@@ -29,7 +29,7 @@ import numpy as np
 
 from . import tracking_channel
 
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
 
 # Every per-epoch array in SignalTrackingOutputs, and every per-C/N0-hop array.
 # Listed explicitly rather than discovered by introspection: a new output field
@@ -48,6 +48,7 @@ _EPOCH_FIELDS = (
     "pll_mode",
     "epoch_duration_ms",
     "overlay_synced",
+    "bit_synced",
 )
 _CN0_FIELDS = ("cn0_dbhz", "cn0_uptime_ms")
 

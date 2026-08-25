@@ -16,6 +16,7 @@ Architecture, unchanged from before:
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -27,6 +28,7 @@ from utils import sample_streaming
 from . import secondary_code
 from .bpsk_correlation import correlate__multicomponent
 from .code_components import CodeSet, epl_delay_bins
+from .nav import bitsync
 
 
 @dataclass
@@ -142,6 +144,16 @@ class LoopDiscriminatorPolicy:
 # Roles a correlator tap can play.  Named rather than positional because a
 # double-estimator layout has five taps on two axes, and "index 1" stops meaning
 # anything the moment the layout is not the classic early/prompt/late triple.
+# Data bit synchronisation, for the one signal that needs it (GPS L1 C/A).  Two
+# seconds of 1 ms prompts gives about fifty transitions at the true phase against
+# a handful at every other, which `utils.nav.bitsync` turns into a confidence
+# ratio.  Re-testing every 200 prompts rather than every one keeps the
+# O(window) histogram off the per-interval path; the window slides, so a channel
+# that locks late is not held back by the noise it produced while pulling in.
+BIT_SYNC_WINDOW_PROMPTS = 2000
+BIT_SYNC_MIN_PROMPTS = 1000
+BIT_SYNC_RETRY_PROMPTS = 200
+
 PROMPT = "prompt"
 EARLY = "early"
 LATE = "late"
@@ -664,6 +676,15 @@ class SignalTrackingOutputs:
         # to infer epoch length by differencing timestamps, which is fragile exactly
         # where it matters -- across the extension boundary.
         self.epoch_duration_ms = np.zeros(capacity, dtype=float)
+        # Whether the epoch grid was anchored to a data bit boundary this channel
+        # MEASURED, as opposed to a multiple of the symbol period in code phase.
+        # The two coincide for every signal whose code phase locates the boundary,
+        # and on L1 C/A they do not -- so a consumer that wants to treat an epoch
+        # boundary as a symbol boundary has to know which of the two it is looking
+        # at.  Nothing in the outputs distinguishes them otherwise: a misanchored
+        # grid and a correct one produce arrays of identical shape and plausible
+        # content, differing only by whole milliseconds of range.
+        self.bit_synced = np.zeros(capacity, dtype=bool)
         # Whether the tiered (overlay) code was being wiped off for this epoch.
         # A navigation-message decoder needs this: before sync the epochs are not
         # symbol-aligned and the overlay is still flipping the data component's
@@ -994,6 +1015,41 @@ class TrackingChannel:
         # Cleared whenever the epoch length changes, so the new grid re-anchors.
         self._epoch_grid_anchored = False
 
+        # --- data bit synchronisation ----------------------------------------
+        # The grid above anchors on the CODE PHASE lattice, and a multiple of the
+        # symbol period in code phase is a symbol boundary only once something has
+        # tied that lattice to the data.  Two things can: an overlay, whose phase
+        # sync pins it, or a primary code period at least as long as the symbol --
+        # L2C's 20 ms CM period is exactly one symbol, L1C's 10 ms one CNAV-2
+        # symbol, so on both the boundary is wherever the code period starts.
+        #
+        # L1 C/A has neither.  A 1 ms code, a 20 ms bit, and an acquisition code
+        # phase known only modulo one code period: the counter's origin is an
+        # arbitrary code period, so its 20 ms lattice is offset from the bit
+        # lattice by an unknown 0-19 ms.  Anchoring on it regardless puts every
+        # epoch boundary in the wrong place by that offset, which survives all the
+        # way into the pseudoranges as a whole number of milliseconds -- 300 km
+        # each.  The offset has to be measured first; see `_observe_bit_sync`.
+        self._bit_sync_needed = (
+            self.overlay_sync is None
+            and self._epoch_anchor_period_ms is not None
+            and self._epoch_anchor_period_ms > signal_params.primary_period_ms
+        )
+        self._bit_sync: bitsync.BitSyncResult | None = None
+        self._bit_prompts: deque[complex] = deque(maxlen=BIT_SYNC_WINDOW_PROMPTS)
+        self._bit_prompt_origin_code_phase_ms = 0
+        self._bit_next_code_phase_ms: int | None = None
+        self._bit_since_attempt = 0
+        # Set when the extension below opens the longer grid on the measured
+        # boundary.  Deliberately NOT the same thing as "bit sync has converged": a
+        # channel left at one code period per epoch knows the boundary and still
+        # has epochs starting at every code period, so its grid says nothing about
+        # where a symbol begins.  Only the extension makes epoch zero symbol zero.
+        self._bit_grid_anchored = False
+        # Where the symbol boundary sits relative to the code phase lattice's own
+        # multiples of the anchor period.  Zero for every signal whose code phase
+        # already locates the boundary, which is what leaves them untouched.
+        self._symbol_phase_offset_ms = 0
         self._unit_signs = np.ones(num_components, dtype=np.int8)
         self._synced_policy = synced_policy
         self._synced_coherent_duration_ms = synced_coherent_duration_ms
@@ -1075,6 +1131,72 @@ class TrackingChannel:
         self.correlator.reset_epoch()
         self._epoch_interval_count = 0
 
+    @property
+    def _symbol_boundary_known(self) -> bool:
+        """
+        Whether the epoch grid has a real symbol boundary to anchor to yet.
+
+        One question, three mechanisms -- an overlay's phase, a measured bit
+        boundary, or a code period that is itself a symbol -- and the extension is
+        gated on whichever one this signal uses.  Keeping them behind a single
+        property is what stops the gate from silently meaning "has an overlay",
+        which is how a signal with no overlay at all comes to be treated as
+        permanently unsynchronised.
+        """
+        if self.overlay_sync is not None:
+            return self.overlay_sync.synced
+        if self._bit_sync_needed:
+            return self._bit_sync is not None and self._bit_sync.synced
+        return True
+
+    def _observe_bit_sync(self, prompt: complex) -> None:
+        """
+        Accumulate 1 ms prompts and look for the data bit boundary among them.
+
+        The recovered phase is converted straight into a code phase offset, so
+        every anchor test downstream stays plain arithmetic on the code phase
+        lattice and nothing has to carry a prompt index around.
+
+        `bitsync.synchronise` reads its input as consecutive code periods, so a
+        gap in the stream would silently re-map every phase in the buffer.  The
+        buffer is therefore restarted on any discontinuity rather than trusted.
+        """
+        period_ms = self._epoch_anchor_period_ms
+        assert period_ms is not None  # implied by _bit_sync_needed
+        start_ms = self.corr_interval.start_code_phase_ms
+
+        if self._bit_next_code_phase_ms != start_ms:
+            self._bit_prompts.clear()
+            self._bit_since_attempt = 0
+        if not self._bit_prompts:
+            self._bit_prompt_origin_code_phase_ms = start_ms
+        elif len(self._bit_prompts) == self._bit_prompts.maxlen:
+            # Appending is about to evict the oldest prompt, so the origin the
+            # recovered phase is measured from moves up with it.
+            self._bit_prompt_origin_code_phase_ms += CORRELATION_INTERVAL_MS
+        self._bit_prompts.append(prompt)
+        self._bit_next_code_phase_ms = start_ms + CORRELATION_INTERVAL_MS
+        self._bit_since_attempt += 1
+
+        if len(self._bit_prompts) < BIT_SYNC_MIN_PROMPTS:
+            return
+        if self._bit_since_attempt < BIT_SYNC_RETRY_PROMPTS:
+            return
+        self._bit_since_attempt = 0
+
+        result = bitsync.synchronise(
+            np.fromiter(self._bit_prompts, dtype=complex, count=len(self._bit_prompts)),
+            periods_per_bit=period_ms // CORRELATION_INTERVAL_MS,
+            min_prompts=BIT_SYNC_MIN_PROMPTS,
+        )
+        if not result.synced:
+            return
+        self._bit_sync = result
+        self._symbol_phase_offset_ms = (
+            self._bit_prompt_origin_code_phase_ms
+            + result.phase * CORRELATION_INTERVAL_MS
+        ) % period_ms
+
     def _maybe_extend_coherent_duration(self) -> None:
         """
         Lengthen the coherent accumulation, once the carrier is actually tracked.
@@ -1104,7 +1226,7 @@ class TrackingChannel:
         # rather than a requirement.
         if self._synced_coherent_duration_ms <= self.coherent_duration_ms:
             return
-        if self.overlay_sync is None or not self.overlay_sync.synced:
+        if not self._symbol_boundary_known:
             return
         if self.loop_state.mode is not TrackingLoopMode.PLL:
             return
@@ -1121,7 +1243,8 @@ class TrackingChannel:
         next_interval_code_phase_ms = (
             self.corr_interval.start_code_phase_ms + self.corr_interval.duration_ms
         )
-        if next_interval_code_phase_ms % anchor_ms != 0:
+        offset_ms = self._symbol_phase_offset_ms
+        if (next_interval_code_phase_ms - offset_ms) % anchor_ms != 0:
             return
 
         self.coherent_duration_ms = self._synced_coherent_duration_ms
@@ -1129,6 +1252,8 @@ class TrackingChannel:
         self.correlator.reset_epoch()
         self._epoch_interval_count = 0
         self._epoch_grid_anchored = True
+        if self._bit_sync_needed:
+            self._bit_grid_anchored = True
 
     def run_loop_filter(self) -> None:
         # Update signal state to reflect parameters at current correlation epoch.
@@ -1332,6 +1457,7 @@ class TrackingChannel:
             self.outputs.overlay_synced[idx] = (
                 self.overlay_sync is not None and self.overlay_sync.synced
             )
+            self.outputs.bit_synced[idx] = self._bit_grid_anchored
             self.outputs.output_index += 1
 
         # ---- prior for the next epoch: the posterior, propagated to its start. ----
@@ -1440,7 +1566,9 @@ class TrackingChannel:
                 if position == 0:
                     self._overlay_prompt = 0j
                 self._overlay_prompt += complex(
-                    self.correlator.corr_grid[1, 0, self.policy.carrier_component]
+                    self.correlator.corr_grid[
+                        self._prompt_tap, 0, self.policy.carrier_component
+                    ]
                 )
                 if last_interval_of_period:
                     if self.overlay_sync.observe(self._overlay_prompt):
@@ -1453,6 +1581,28 @@ class TrackingChannel:
             signs = self.overlay_sync.signs(self._overlays)
             if last_interval_of_period:
                 self.overlay_sync.advance()
+
+        # The bit-sync equivalent of the overlay feed above, and gated the same
+        # way: an un-locked carrier leaves the prompts rotating, and the sign of a
+        # rotating prompt says nothing about the data.
+        #
+        # Only while the epoch is one interval long.  Folding is what destroys the
+        # 1 ms structure the histogram is built from, so a longer epoch could not
+        # answer this question however many of them went by -- which is exactly
+        # why a bit-sync signal starts short and extends afterwards.
+        if (
+            self._bit_sync_needed
+            and self._bit_sync is None
+            and self.coherent_duration_ms <= CORRELATION_INTERVAL_MS
+            and self.loop_state.mode is TrackingLoopMode.PLL
+        ):
+            self._observe_bit_sync(
+                complex(
+                    self.correlator.corr_grid[
+                        self._prompt_tap, 0, self.policy.carrier_component
+                    ]
+                )
+            )
 
         # Open the epoch grid on a data symbol boundary.
         #
@@ -1497,7 +1647,8 @@ class TrackingChannel:
                 self._epoch_grid_anchored = True
             else:
                 anchor_ms = self._epoch_anchor_period_ms or self.coherent_duration_ms
-                if self.corr_interval.start_code_phase_ms % anchor_ms:
+                offset_ms = self._symbol_phase_offset_ms
+                if (self.corr_interval.start_code_phase_ms - offset_ms) % anchor_ms:
                     return
                 self._epoch_grid_anchored = True
 

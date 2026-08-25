@@ -78,6 +78,19 @@ NEEDS_BIT_SYNC: dict[str, bool] = {
 # code phase locates the boundary with nothing to sync and nothing to search for,
 # and `overlay_synced` stays False for the whole run.  Gating on it there discards
 # every epoch and the channel silently yields no symbols at all.
+# The longest epoch at which this module can still find a bit boundary itself.
+# One code period: a longer epoch has already summed the 1 ms structure the
+# histogram is built from into a single number, and no amount of such numbers
+# brings it back.  Beyond this length the boundary has to come from the channel,
+# which measured it while its epochs were still short.
+RESOLVABLE_EPOCH_MS = 1.0
+
+HAS_OVERLAY: dict[str, bool] = {
+    "GPS_L1CA": False,   # 1 ms code, 20 ms bit, nothing tying them together
+    "GPS_L2C": False,    # CM code period is the symbol
+    "GPS_L5": True,      # NH10/NH20
+    "GPS_L1C": True,     # L1CO, 1800 bits at one per 10 ms code period
+}
 
 # Whether the data component sits 90 degrees from the carrier loop's reference.
 #
@@ -127,7 +140,14 @@ class SymbolStream:
     long time pulling in, not that anything is wrong."""
 
     bit_sync: bitsync.BitSyncResult | None = None
-    """Only for L1 C/A; None where the overlay supplied the boundary."""
+    """The boundary search this module ran, when it ran one.
+
+    None whenever the boundary arrived already established: from an overlay, from a
+    code period that is itself a symbol, or -- on L1 C/A tracked at more than one
+    code period per epoch -- from the channel, which measured it while its epochs
+    were still short and anchored the longer grid to it.  A populated value here
+    therefore means the phase was recovered from these symbols, not that the signal
+    is L1 C/A."""
 
     data_in_quadrature: bool = False
     """Whether the data rides 90 degrees from the carrier reference -- see
@@ -242,7 +262,7 @@ def extract(
     symbol_period_ms = SYMBOL_PERIOD_MS[signal_type_id]
     needs_bit_sync = NEEDS_BIT_SYNC[signal_type_id]
 
-    first, stop = _usable_slice(outputs, require_overlay_sync=not needs_bit_sync)
+    first, stop = _usable_slice(outputs, require_overlay_sync=HAS_OVERLAY[signal_type_id])
     if stop <= first:
         return SymbolStream(
             values=np.zeros(0, dtype=complex),
@@ -275,7 +295,29 @@ def extract(
 
     sync: bitsync.BitSyncResult | None = None
     phase = 0
-    if needs_bit_sync:
+    if needs_bit_sync and epoch_ms > RESOLVABLE_EPOCH_MS:
+        # The channel found the boundary and opened this grid on it, so epoch zero
+        # is symbol zero and there is nothing left to search for.  Re-deriving it
+        # here would be worse than redundant: at one epoch per symbol the histogram
+        # has a single bin and no runner-up to measure confidence against.
+        #
+        # It has to be checked rather than assumed.  A channel built directly at
+        # this length -- rather than through `create_tracking_channels`, which
+        # starts short and extends -- anchors its grid on the code phase lattice
+        # instead, which on L1 C/A is offset from the bit lattice by an unknown
+        # 0-19 ms.  The outputs look identical either way, and the only visible
+        # consequence is a pseudorange wrong by a whole number of milliseconds:
+        # 300 km, on a fix that otherwise converges and looks entirely healthy.
+        if not outputs.bit_synced[first:stop].all():
+            raise ValueError(
+                f"{signal_type_id} epochs are {epoch_ms:g} ms, but the channel never "
+                "anchored its grid to a measured data bit boundary, so where a symbol "
+                "starts is unknown to within a code period. Build the channel with "
+                "`signal_interfaces.create_tracking_channels`, which starts at one "
+                "code period and extends once the boundary is found, or track at "
+                f"{RESOLVABLE_EPOCH_MS:g} ms and let this module find it."
+            )
+    elif needs_bit_sync:
         # Bit sync reads sign transitions, so it must look at the data axis too.
         sync = bitsync.synchronise(
             1j * prompts if DATA_IN_QUADRATURE[signal_type_id] else prompts,

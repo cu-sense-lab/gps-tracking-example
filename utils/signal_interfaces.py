@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import warnings
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from typing import ClassVar, Iterable
 
@@ -742,6 +742,27 @@ def resolve_acquisition_ambiguities(
     return resolutions
 
 
+def requires_bit_sync(signal_type: type[Signal], signal: Signal) -> bool:
+    """
+    Whether the data symbol boundary has to be found statistically.
+
+    True for GPS L1 C/A alone, and for the reason `utils.nav.bitsync` describes:
+    every other signal here hands the boundary over for free, either through an
+    overlay whose phase is synchronised or through a primary code period that is
+    itself one symbol long.  L1 C/A has a 1 ms code under a 20 ms bit and nothing
+    tying the two together, so the twenty candidate boundaries are
+    indistinguishable until the data itself picks one out.
+    """
+    if signal.overlay_period_ms:
+        return False
+    symbol_periods = [
+        c.symbol_period_ms
+        for c in signal.code_set.components
+        if c.symbol_period_ms is not None
+    ]
+    return bool(symbol_periods) and min(symbol_periods) > signal_type.primary_period_ms
+
+
 def create_tracking_channels(
     signal_type: type[Signal],
     signals: dict[str, Signal],
@@ -755,6 +776,36 @@ def create_tracking_channels(
     cn0_params: tracking_channel.CN0EstimatorParameters | None = None,
 ) -> dict[str, TrackingChannelAdapter]:
     tracking_policy = TRACKING_POLICIES[signal_type.signal_type_id]
+
+    # A signal whose symbol boundary is not known yet cannot open a multi-interval
+    # epoch grid: there is nothing to anchor it to, and anchoring on the code phase
+    # lattice instead misplaces every epoch by the offset between the two (see
+    # `TrackingChannel._observe_bit_sync`).  So the requested duration becomes the
+    # duration to extend TO, and the channel starts at one correlation interval --
+    # the only length at which the boundary is measurable at all.  For every other
+    # signal this is a no-op and `loop_params` is used exactly as given.
+    interval_ms = tracking_channel.CORRELATION_INTERVAL_MS
+    start_loop_params = loop_params
+    synced_coherent_duration_ms = tracking_policy.synced_coherent_duration_ms
+    # Any PRN answers this -- overlay presence and symbol periods are properties of
+    # the signal, not of the satellite -- and `tracking_signal_ids` is only an
+    # Iterable, so peeking into it here would consume a caller's generator.
+    probe = next(iter(signals.values()), None)
+    if (
+        probe is not None
+        and requires_bit_sync(signal_type, probe)
+        and loop_params.coherent_duration_ms > interval_ms
+    ):
+        synced_coherent_duration_ms = loop_params.coherent_duration_ms
+        start_loop_params = replace(loop_params, coherent_duration_ms=interval_ms)
+        # Capacity is one row per epoch, and the epochs before the extension are
+        # the short ones.  A channel whose bit sync never converges stays short for
+        # the whole run, so the honest bound is the run length in intervals --
+        # anything less truncates the record silently, exactly where a reader would
+        # be looking to find out why the sync failed.
+        output_capacity = output_capacity * (
+            loop_params.coherent_duration_ms // interval_ms
+        )
 
     channels: dict[str, TrackingChannelAdapter] = {}
     for signal_id in tracking_signal_ids:
@@ -834,13 +885,13 @@ def create_tracking_channels(
             discriminator_policy = tracking_policy.resolved_discriminator_policy
 
         channel = tracking_channel.TrackingChannel(
-            loop_params=loop_params,
+            loop_params=start_loop_params,
             signal_params=signal_params,
             initial_signal_state=initial_state,
             output_capacity=output_capacity,
             discriminator_policy=discriminator_policy,
             synced_policy=tracking_policy.synced_discriminator_policy,
-            synced_coherent_duration_ms=tracking_policy.synced_coherent_duration_ms,
+            synced_coherent_duration_ms=synced_coherent_duration_ms,
             cn0_params=cn0_params,
             initial_overlay_counter=initial_overlay_counter,
             overlay_search=tracking_policy.overlay_search,

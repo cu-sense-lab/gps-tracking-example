@@ -78,6 +78,7 @@ def _nav_bits(
     code_period_index: np.ndarray,
     periods_per_symbol: int,
     symbols: np.ndarray | None = None,
+    phase_periods: int = 0,
 ) -> np.ndarray:
     """
     Data modulation, keyed to the code period rather than to absolute time.
@@ -93,8 +94,14 @@ def _nav_bits(
     exercises bit flips without meaning anything.  Passing a real encoded message
     as +/-1 values instead is what lets a test drive an actual navigation-message
     decoder end to end; the sequence repeats if the capture outlasts it.
+
+    `phase_periods` slides the symbol grid along the code periods.  It exists for
+    one signal and one question: on L1 C/A the 20 ms bit boundary need not fall on
+    a multiple of 20 ms of code phase, because acquisition pins the code phase only
+    modulo one 1 ms period.  Leaving it at the default makes the two coincide,
+    which is the one alignment a receiver must NOT be allowed to assume.
     """
-    symbol_index = code_period_index // periods_per_symbol
+    symbol_index = (code_period_index - phase_periods) // periods_per_symbol
     if symbols is None:
         return 1 - 2 * (symbol_index % 2 == 1)
     symbols = np.asarray(symbols)
@@ -122,9 +129,15 @@ def generate_l1ca_samples(
     code_phase_ms: float,
     noise_sigma: float = 0.0,
     nav_bits: bool | np.ndarray = True,
+    bit_phase_periods: int = 0,
     rng: np.random.Generator | None = None,
 ) -> np.ndarray:
-    """Baseband GPS L1 C/A: a single BPSK code with optional 50 bps data."""
+    """
+    Baseband GPS L1 C/A: a single BPSK code with optional 50 bps data.
+
+    `bit_phase_periods` puts the data bit boundary that many code periods away
+    from a multiple of 20 ms of code phase -- see `_nav_bits`.
+    """
     code = get_l1ca_code(prn)
     n = int(round(samp_rate * duration_sec))
     t = start_sec + np.arange(n) / samp_rate
@@ -134,7 +147,12 @@ def generate_l1ca_samples(
     chip_index = chips.astype(np.int64)
     # 20 ms nav bit = 20 code periods of 1 ms.
     data = (
-        _nav_bits(chip_index // gps_l1ca.CODE_LENGTH, 20, _symbol_sequence(nav_bits))
+        _nav_bits(
+            chip_index // gps_l1ca.CODE_LENGTH,
+            20,
+            _symbol_sequence(nav_bits),
+            phase_periods=bit_phase_periods,
+        )
         if nav_bits is not False
         else 1.0
     )
