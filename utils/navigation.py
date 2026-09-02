@@ -15,10 +15,15 @@ transmit time is measured directly, from cumulative code phase anchored by a
 decoded time of week.  So the orbit is evaluated once, at the time it was actually
 transmitted.
 
-**Sagnac is not optional.**  The satellite's ECEF position is computed at
-transmission, but the fix is expressed in the frame as it stands at reception, and
-the earth turns about 30 metres' worth during a 70 ms transit.  Skipping it leaves
-a bias that looks like a clock error but is not.
+**Sagnac is not optional, and its transit time must not come from the receiver
+clock.**  The satellite's ECEF position is computed at transmission, but the fix is
+expressed in the frame as it stands at reception, and the earth turns about 30
+metres' worth during a 70 ms transit.  The transit that rotation needs is taken
+geometrically, from the a-priori position -- `receive_time_s - t_gps` would carry
+the receiver clock bias into it, and that bias is milliseconds here, not
+microseconds.  Because the error is common to every satellite it is a rigid
+rotation of the whole constellation, so it never shows up in the residuals: it
+moves the fix by 1-3 m on this data and leaves every diagnostic looking clean.
 
 **`gnss_tools` already has the least-squares solve**, and it is used here rather
 than re-implemented.  What this module adds around it is the geometry matrix,
@@ -157,6 +162,7 @@ def satellite_positions(
     ephemerides: dict[str, Ephemeris],
     *,
     apply_sagnac: bool = True,
+    receiver_position_ecef_m: np.ndarray | None = None,
 ) -> np.ndarray:
     """
     (N, M, 3) satellite ECEF positions at transmission, NaN where unavailable.
@@ -172,7 +178,24 @@ def satellite_positions(
     over that signal's transit time, expressing it in the ECEF frame as it stood
     when the signal arrived.  About 30 m at a 70 ms transit -- small next to the
     satellite clock but far larger than the fix's own precision.
+
+    `receiver_position_ecef_m` supplies that transit time **geometrically**, as
+    `|r_sat - r_rx| / c`, and should be given whenever an a-priori is available.
+    Without it the transit falls back to `receive_time_s - t_gps`, which still
+    contains the receiver clock bias -- and that bias is not small here.  The
+    receiver clock is the sample counter, anchored in `utils.observables` to a
+    nominal 75 ms transit, so it starts out wrong by however far the closest
+    satellite's real transit is from 75 ms: measured at 7.2 ms on this L5 collect
+    and -2.6 ms on L1 C/A.  A transit error rotates the satellite by about
+    1.9 m/ms, so the fallback path costs metres, not the centimetres a
+    microsecond-scale bias would.
+
+    The geometric route needs no iteration and no clock estimate.  An a-priori good
+    to a kilometre gives the transit to about 3 microseconds, worth well under a
+    centimetre of rotation -- three orders below the error it removes.
     """
+    if receiver_position_ecef_m is not None:
+        receiver_position_ecef_m = np.asarray(receiver_position_ecef_m, dtype=float)
     n, m = observables.transmit_time_s.shape
     out = np.full((n, m, 3), np.nan)
     for j, sat_id in enumerate(observables.sat_ids):
@@ -196,13 +219,20 @@ def satellite_positions(
             t_gps = t_tx - eph.clock_correction_s(t_tx)
             position = eph.orbit_state(t_gps).position_ecef_m
             if apply_sagnac:
-                # Transit in GPS time, for the same reason.
-                #
-                # What remains inside it is the receiver clock bias, still buried in
-                # `receive_time_s`.  Removing that would mean iterating the whole
-                # fix and re-rotating; at a few microseconds it is worth under a
-                # centimetre, against real errors of metres.
-                transit = observables.receive_time_s[i] - t_gps
+                if receiver_position_ecef_m is None:
+                    # Fallback: carries the receiver clock bias with it.  See the
+                    # docstring -- on this data that is milliseconds, so metres.
+                    transit = observables.receive_time_s[i] - t_gps
+                else:
+                    # Geometry instead of the receiver clock, so no clock bias
+                    # enters.  The un-rotated position is the right one to measure
+                    # from: the rotation is what is being solved for here, and it
+                    # changes the range by far less than the metre or so of
+                    # a-priori error already tolerated.
+                    transit = float(
+                        np.linalg.norm(position - receiver_position_ecef_m)
+                        / SPEED_OF_LIGHT
+                    )
                 # NOTE the sign.  We need the transmit-time position expressed in
                 # the ECEF frame as it stood at RECEPTION, and that frame has
                 # rotated by +Omega*tau in the meantime -- so the coordinates
@@ -260,7 +290,10 @@ def correct_pseudoranges(
     needs_geometry = settings.troposphere or settings.ionosphere
     if needs_geometry and receiver_position_ecef_m is not None:
         positions = satellite_positions(
-            observables, ephemerides, apply_sagnac=settings.sagnac
+            observables,
+            ephemerides,
+            apply_sagnac=settings.sagnac,
+            receiver_position_ecef_m=receiver_position_ecef_m,
         )
         # gnss_tools orders geodetic coordinates (LON, LAT, ALT) -- see
         # `gnss_tools.coords.utils.ecf2geo`.  Reading it as (lat, lon) puts the
@@ -447,7 +480,10 @@ def solve_series(
         iono_beta=iono_beta,
     )
     positions = satellite_positions(
-        observables, ephemerides, apply_sagnac=settings.sagnac
+        observables,
+        ephemerides,
+        apply_sagnac=settings.sagnac,
+        receiver_position_ecef_m=initial_position_ecef_m,
     )
 
     n, m = corrected.shape
@@ -533,7 +569,11 @@ def solve_clock_series(
         iono_beta=iono_beta,
     )
     positions = satellite_positions(
-        observables, ephemerides, apply_sagnac=settings.sagnac
+        observables,
+        ephemerides,
+        apply_sagnac=settings.sagnac,
+        # Held, not a-priori -- so the Sagnac transit here is as good as it gets.
+        receiver_position_ecef_m=position_ecef_m,
     )
 
     n, m = corrected.shape

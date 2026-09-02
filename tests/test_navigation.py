@@ -20,6 +20,8 @@ to the same geometry is the point.
 
 from __future__ import annotations
 
+import dataclasses
+
 import numpy as np
 import pytest
 
@@ -294,13 +296,13 @@ def test_position_and_clock_are_recovered():
     )
     assert series.valid.all()
     error = np.linalg.norm(series.position_ecef_m - REFERENCE_ECEF, axis=1)
-    # Centimetres rather than zero, and the reason is worth knowing.  The transit
-    # time used for the Sagnac rotation is derived from `receive_time_s`, which is
-    # the *receiver's* clock and is offset by the very bias being solved for --
-    # here 1234.5 m, or 4.1 us.  That is about 8 mm of earth rotation at the
-    # satellite, which the geometry then amplifies by VDOP into a few centimetres
-    # of height.  Removing it entirely would mean iterating the whole fix and
-    # re-rotating, which buys centimetres in a system whose real errors are metres.
+    # About 3 cm, and *not* for the reason this comment used to give.  It is not the
+    # Sagnac transit: `solve_series` is given an a-priori, so that rotation is
+    # computed geometrically and the receiver clock bias never enters it.  The floor
+    # is the same to two decimals with the bias set to zero and with group delay
+    # off, so it is neither -- it is the difference between the truth generator's
+    # iterated light-time construction and the module's measured-transmit-time
+    # route, which is exactly the independence that makes this test worth having.
     assert error.max() < 0.1, f"worst position error {error.max():.6f} m"
     assert np.allclose(series.clock_bias_m, bias_m, atol=0.1)
 
@@ -702,3 +704,47 @@ def test_clock_only_marks_epochs_with_no_satellites():
     )
     assert not series.valid[2]
     assert series.num_satellites[2] == 0
+
+
+
+def test_sagnac_transit_does_not_import_the_receiver_clock_bias():
+    """
+    The bias the fix is solving for must not reach the Sagnac rotation.
+
+    It used to.  The transit came from `receive_time_s - t_gps`, and that clock is
+    offset by exactly the bias being estimated -- a few microseconds in this
+    synthetic world, but *milliseconds* on real data, where the receiver clock is a
+    sample counter anchored to a nominal 75 ms transit.  At ~1.9 m of satellite
+    displacement per millisecond it moved the fix by metres.
+
+    What makes it invisible without a test like this one is that the error is
+    common to every satellite, so it is a rigid rotation of the whole constellation:
+    ranges are preserved, residuals are untouched, and every diagnostic the notebook
+    prints looks perfectly healthy while the fix sits metres away.
+
+    So the check is a property, not a tolerance: shift the receiver clock by a large
+    offset and the satellite positions must not move at all.
+    """
+    ephemerides, observables, _, _ = build_truth()
+    shifted = dataclasses.replace(
+        observables, receive_time_s=observables.receive_time_s + 5.0e-3  # 5 ms
+    )
+
+    geometric = [
+        nav.satellite_positions(o, ephemerides, apply_sagnac=True,
+                                receiver_position_ecef_m=REFERENCE_ECEF)
+        for o in (observables, shifted)
+    ]
+    assert np.allclose(geometric[0], geometric[1], atol=1e-9), (
+        "a receiver-clock shift changed the Sagnac-rotated satellite positions"
+    )
+
+    # And the fallback, with no a-priori, demonstrably does import it -- so the
+    # test above is testing the fix rather than an insensitivity that was always
+    # there.
+    from_clock = [
+        nav.satellite_positions(o, ephemerides, apply_sagnac=True)
+        for o in (observables, shifted)
+    ]
+    moved = np.linalg.norm(from_clock[0] - from_clock[1], axis=2)
+    assert moved.min() > 5.0, f"expected metres of movement, saw {moved.min():.3f} m"
