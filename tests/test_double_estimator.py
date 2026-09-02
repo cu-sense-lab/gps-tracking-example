@@ -29,6 +29,7 @@ from utils.signal_interfaces import (
     GpsL1CA,
     TRACKING_POLICIES,
     build_signals,
+    coherent_duration_target_ms,
 )
 
 from . import synthetic
@@ -180,7 +181,7 @@ def _track(seed_error_chips, *, double_estimator, duration_ms=1500, noise_sigma=
         loop, _signal_params(GpsL1C), state, output_capacity=duration_ms + 16,
         discriminator_policy=policy.discriminator_policy,
         synced_policy=policy.synced_discriminator_policy,
-        synced_coherent_duration_ms=policy.synced_coherent_duration_ms,
+        synced_coherent_duration_ms=coherent_duration_target_ms(GpsL1C, signal, 10),
         overlay_search=policy.overlay_search,
         overlay_prompts_to_observe=policy.overlay_prompts_to_observe,
     )
@@ -201,7 +202,23 @@ def _track(seed_error_chips, *, double_estimator, duration_ms=1500, noise_sigma=
     uptime = outputs.uptime_epoch_ms[valid]
     expected = TRUE_CODE_PHASE_MS + (1 + DOPPLER_HZ / GpsL1C.carrier_freq_hz) * uptime
     code_only = (outputs.code_phase_ms[valid] - expected) / CHIP_MS
+    _track.last_uptime_ms = uptime
     return code_only, code_only + outputs.subcarrier_offset_chips[valid]
+
+
+def _settled(values, window_ms=300):
+    """
+    The last `window_ms` of the run, selected by uptime rather than by a count of
+    epochs.
+
+    The epoch length is not constant -- the channel opens at one interval and
+    extends to 10 ms once it locks -- so a fixed slice of the last N epochs means a
+    different amount of wall time depending on when the extension happened.  It
+    reached back over the whole run, convergence included, once L1C stopped waiting
+    for its overlay search before extending.
+    """
+    uptime = _track.last_uptime_ms
+    return values[uptime >= uptime[-1] - window_ms]
 
 
 def test_a_single_loop_locks_onto_a_side_peak_and_stays_there():
@@ -211,7 +228,7 @@ def test_a_single_loop_locks_onto_a_side_peak_and_stays_there():
     whole time, so nothing downstream can tell.
     """
     code_only, _ = _track(0.53, double_estimator=False)
-    settled = code_only[-300:]
+    settled = _settled(code_only)
     assert settled.mean() == pytest.approx(0.53, abs=0.05)
     assert settled.std() < 0.01, "it is not drifting back -- it is locked"
 
@@ -223,7 +240,7 @@ def test_the_double_estimator_recovers_from_the_same_side_peak():
     then supplies the precision.
     """
     _, combined = _track(0.53, double_estimator=True)
-    settled = combined[-300:]
+    settled = _settled(combined)
     assert abs(settled.mean()) < 0.02, f"{settled.mean() * CHIP_M:.1f} m from truth"
 
 
@@ -235,8 +252,8 @@ def test_the_combined_estimate_beats_the_code_loop_alone(seed):
     sum, and that is what has to be accurate.
     """
     code_only, combined = _track(seed, double_estimator=True)
-    assert abs(combined[-300:].mean()) <= abs(code_only[-300:].mean()) + 1e-9
-    assert abs(combined[-300:].mean()) < 0.02
+    assert abs(_settled(combined).mean()) <= abs(_settled(code_only).mean()) + 1e-9
+    assert abs(_settled(combined).mean()) < 0.02
 
 
 def test_the_subcarrier_offset_stays_inside_one_ambiguity_interval():

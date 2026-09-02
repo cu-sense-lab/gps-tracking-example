@@ -271,3 +271,50 @@ def test_relativistic_term_is_not_negligible():
     with_relativity = e.clock_correction_s(t, state)
     polynomial_only = e.af0 + e.af1 * (t - e.toc)
     assert abs(with_relativity - polynomial_only) > 1e-9
+
+
+def test_the_clock_splits_into_a_polynomial_and_a_relativistic_term():
+    """
+    The split exists because the two halves have different audiences.
+
+    A receiver forming a pseudorange wants both.  A comparison against an IGS
+    precise clock wants only the polynomial, because SP3 excludes the periodic
+    relativistic correction exactly as the broadcast parameters do -- and including
+    it there buries the clock error under a sinusoid an order of magnitude larger.
+    """
+    ephemeris = eph.LnavEphemeris(
+        sat_id="G01", week=2258, toe=475200.0, sqrt_a=5153.6, e=0.0127,
+        i0=0.3, i_dot=0.0, Omega0=0.1, Omega_dot=-2.5e-9, omega=0.2, M0=0.4,
+        deln=1.5e-9, Cuc=0.0, Cus=0.0, Crc=0.0, Crs=0.0, Cic=0.0, Cis=0.0,
+        toc=475200.0, af0=1.0e-4, af1=2.0e-12, af2=0.0,
+    )
+    t = 475200.0 + 1800.0
+    state = ephemeris.orbit_state(t)
+
+    # The polynomial is exactly what its three coefficients say.
+    assert ephemeris.clock_polynomial_s(t) == pytest.approx(1.0e-4 + 2.0e-12 * 1800.0)
+    # And the two halves account for the whole of the correction.
+    assert ephemeris.clock_correction_s(t, state=state) == pytest.approx(
+        ephemeris.clock_polynomial_s(t) + ephemeris.relativistic_correction_s(state)
+    )
+
+
+def test_the_relativistic_term_is_periodic_and_metres_in_size():
+    """Its amplitude is F*e*sqrt(A), which for a typical eccentricity is tens of
+    nanoseconds -- metres of range, and the reason it cannot be left in a
+    comparison against a product that omits it."""
+    ephemeris = eph.LnavEphemeris(
+        sat_id="G01", week=2258, toe=0.0, sqrt_a=5153.6, e=0.0127,
+        i0=0.3, i_dot=0.0, Omega0=0.1, Omega_dot=-2.5e-9, omega=0.2, M0=0.0,
+        deln=0.0, Cuc=0.0, Cus=0.0, Crc=0.0, Crs=0.0, Cic=0.0, Cis=0.0,
+        toc=0.0, af0=0.0, af1=0.0, af2=0.0,
+    )
+    over_an_orbit = np.array([
+        ephemeris.relativistic_correction_s(ephemeris.orbit_state(t))
+        for t in np.linspace(0.0, 12 * 3600.0, 200)
+    ])
+    peak_to_peak_m = np.ptp(over_an_orbit) * eph.SPEED_OF_LIGHT
+    # 2 * F * e * sqrt(A) * c, to within the sampling of the orbit above.
+    expected = abs(2 * eph.RELATIVISTIC_F * 0.0127 * 5153.6) * eph.SPEED_OF_LIGHT
+    assert peak_to_peak_m == pytest.approx(expected, rel=0.01)
+    assert 15.0 < peak_to_peak_m < 20.0

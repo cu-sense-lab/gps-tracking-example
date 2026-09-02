@@ -25,13 +25,16 @@ from utils import cddis, precise_orbits
 
 
 class FakeRecord:
-    """The two fields `select_ephemeris` reads, plus an id for assertions."""
+    """The fields `select_ephemeris` reads, plus an id for assertions."""
 
-    def __init__(self, toe, week_num=2258, sv_health_flag=0, tag=""):
+    def __init__(self, toe, week_num=2258, sv_health_flag=0, tag="", transmit_time=None):
         self.toe = toe
         self.week_num = week_num
         self.sv_health_flag = sv_health_flag
         self.tag = tag
+        # Records are broadcast starting about two hours before their own `toe`;
+        # that is measured, not assumed -- see the note in `select_ephemeris`.
+        self.transmit_time = toe - 7200.0 if transmit_time is None else transmit_time
 
 
 # ---------------------------------------------------------------------------
@@ -294,3 +297,41 @@ def test_sp3_reports_every_product_it_tried(tmp_path, monkeypatch):
         precise_orbits.download_sp3(datetime(2023, 4, 17), tmp_path)
     assert "COD0MGXFIN" in str(info.value)
     assert "IGS0OPSFIN" in str(info.value)
+
+
+def test_a_near_duplicate_toe_is_broken_by_transmission_time():
+    """
+    A merged daily file holds pairs whose `toe` differ by one or two LSBs of the
+    16 s field, with different parameters.  Nearest-`toe` alone flips between them
+    as the query crosses the 8 s midpoint, stepping any series computed across it.
+    The later-transmitted record is the fresh upload and measures better, so it
+    wins the whole window rather than half of it.
+    """
+    stale = FakeRecord(toe=453_600, transmit_time=453_600 - 7200, tag="superseded")
+    fresh = FakeRecord(toe=453_584, transmit_time=453_600 - 3060, tag="fresh")
+    records = [stale, fresh]
+    # Either side of the 8 s midpoint between the two `toe` values.
+    for tow in (453_580.0, 453_592.0, 453_600.0, 460_000.0):
+        assert be.select_ephemeris(records, tow_s=tow, week=2258).tag == "fresh"
+
+
+def test_records_a_real_upload_apart_are_still_chosen_by_toe():
+    """The tie-break must not reach across two-hour slots: their ages differ by
+    thousands of seconds, far outside the tolerance."""
+    records = [
+        FakeRecord(toe=446_400, transmit_time=446_400 - 60, tag="older slot"),
+        FakeRecord(toe=453_600, transmit_time=453_600 - 7200, tag="nearer slot"),
+    ]
+    # The older slot was transmitted *later*, and must still lose on `toe`.
+    assert be.select_ephemeris(records, tow_s=453_000, week=2258).tag == "nearer slot"
+
+
+def test_the_duplicate_tolerance_can_be_turned_off():
+    """Zero tolerance restores pure nearest-`toe`, which is what the comparison in
+    notebook 02 uses to show what the tie-break is worth."""
+    stale = FakeRecord(toe=453_600, transmit_time=453_600 - 7200, tag="nearer")
+    fresh = FakeRecord(toe=453_584, transmit_time=453_600 - 3060, tag="fresh")
+    chosen = be.select_ephemeris(
+        [stale, fresh], tow_s=453_600.0, week=2258, duplicate_toe_tolerance_s=0.0
+    )
+    assert chosen.tag == "nearer"

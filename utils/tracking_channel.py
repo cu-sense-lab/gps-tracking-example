@@ -16,6 +16,8 @@ Architecture, unchanged from before:
 
 from __future__ import annotations
 
+import math
+import warnings
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
@@ -806,14 +808,12 @@ def _wrap_cycles(cycles: float, half_range: float) -> float:
 MAX_BANDWIDTH_TIME_PRODUCT = 0.1
 
 
-def validate_coherent_duration(
+def coherent_duration_limits_ms(
     signal_params: TrackingSignalParameters,
-    policy: LoopDiscriminatorPolicy,
-    coherent_duration_ms: int,
     overlay_stripped: bool,
-) -> None:
+) -> list[tuple[int, str]]:
     """
-    Reject a coherent integration that would span a sign change.
+    Every bound on one coherent accumulation, with what imposes it.
 
     An accumulation is only coherent while the thing being accumulated keeps one
     sign.  Two things flip it, and which one binds depends on the state:
@@ -824,29 +824,84 @@ def validate_coherent_duration(
       data symbol           `symbol_period_ms` on the component.  A dataless
                             pilot has none, so only Doppler bounds it.
 
-    Every component is checked, not only the ones driving the loops.  One epoch
-    serves the whole signal -- each component accumulates over it and each is
-    emitted -- so a length that suits the pilot but overruns a data component
-    leaves that component's output quietly self-cancelling.  L5 is the case in
-    point: its Q pilot is dataless and would tolerate any length, but I carries
-    10 ms CNAV symbols, so 10 ms is the signal's limit and 20 ms would wreck I
-    while looking perfectly healthy on Q.
+    Every component contributes a bound, not only the ones driving the loops.
+    One epoch serves the whole signal -- each component accumulates over it and
+    each is emitted -- so a length that suits the pilot but overruns a data
+    component leaves that component's output quietly self-cancelling.  L5 is the
+    case in point: its Q pilot is dataless and would tolerate any length, but I
+    carries 10 ms CNAV symbols, so 10 ms is the signal's limit and 20 ms would
+    wreck I while looking perfectly healthy on Q.
 
-    The requirement is divisibility, not merely "fits".  Epochs are anchored to
-    multiples of their own length in code phase, so with N dividing the symbol
-    period S the epochs tile each symbol exactly; with N = 8 and S = 20 the epoch
-    [16, 24) straddles the boundary at 20 however it is aligned.
+    Returned as a list rather than reduced to the minimum because the two callers
+    want different things from it: `validate_coherent_duration` names the
+    component a bad length actually violates, while `clamp_coherent_duration_ms`
+    needs a length legal for all of them at once.  An empty list means nothing
+    bounds the accumulation but Doppler -- every component a dataless pilot with
+    its overlay already stripped.
     """
+    limits: list[tuple[int, str]] = []
     for component in signal_params.code_set.components:
         if component.overlay is not None and not overlay_stripped:
-            limit_ms = signal_params.primary_period_ms
-            reason = f"{component.name!r}'s overlay chip (not yet stripped)"
+            limits.append((
+                signal_params.primary_period_ms,
+                f"{component.name!r}'s overlay chip (not yet stripped)",
+            ))
         elif component.symbol_period_ms is not None:
-            limit_ms = component.symbol_period_ms
-            reason = f"{component.name!r}'s data symbol"
-        else:
-            continue  # dataless pilot with no overlay in the way
+            limits.append((
+                component.symbol_period_ms, f"{component.name!r}'s data symbol"
+            ))
+        # else: dataless pilot with no overlay in the way, so nothing to bound it
+    return limits
 
+
+def clamp_coherent_duration_ms(
+    signal_params: TrackingSignalParameters,
+    requested_ms: int,
+    overlay_stripped: bool,
+) -> int:
+    """
+    Round `requested_ms` down onto the lengths this signal can actually use.
+
+    Two constraints, and rounding down satisfies both at once.  The length must
+    not exceed any component's limit, and it must DIVIDE each of them: epochs are
+    anchored to multiples of their own length in code phase, so with N dividing
+    the symbol period S the epochs tile each symbol exactly, while N = 8 against
+    S = 20 puts the epoch [16, 24) across the boundary at 20 however it is
+    aligned.  "Divides every limit" is "divides their gcd", which is why the
+    search below is over divisors of one number rather than over every component.
+
+    The result is at least one correlation interval, because 1 divides
+    everything -- so there is always a legal answer to fall back to and this
+    never has to report failure.
+    """
+    limits = coherent_duration_limits_ms(signal_params, overlay_stripped)
+    if not limits:
+        return requested_ms
+    grid_ms = math.gcd(*(limit for limit, _ in limits)) if len(limits) > 1 else limits[0][0]
+    duration_ms = min(requested_ms, grid_ms)
+    while grid_ms % duration_ms:
+        duration_ms -= 1
+    return duration_ms
+
+
+def validate_coherent_duration(
+    signal_params: TrackingSignalParameters,
+    policy: LoopDiscriminatorPolicy,
+    coherent_duration_ms: int,
+    overlay_stripped: bool,
+) -> None:
+    """
+    Reject a coherent integration that would span a sign change.
+
+    A hard error, and deliberately so: by the time a length reaches here it has
+    already been through `clamp_coherent_duration_ms`, so anything it rejects is
+    an internal inconsistency rather than a user asking for too much.  What a
+    user asked for is capped with a warning, in `signal_interfaces`; what the
+    channel then builds out of that is checked here and must be right.
+
+    See `coherent_duration_limits_ms` for where the bounds come from.
+    """
+    for limit_ms, reason in coherent_duration_limits_ms(signal_params, overlay_stripped):
         if coherent_duration_ms > limit_ms:
             raise ValueError(
                 f"coherent_duration_ms {coherent_duration_ms} exceeds {limit_ms} ms, "
@@ -922,6 +977,42 @@ class TrackingChannel:
         overlay_search: secondary_code.OverlaySearch | None = None,
         overlay_prompts_to_observe: int | None = None,
     ) -> None:
+        # The bandwidth-time product has to hold for the epoch this channel STARTS
+        # with, not only for one it may later extend to.
+        # `_retune_for_update_period` enforces it on the extension and nothing
+        # enforced it here, so a caller asking for a long epoch with bandwidths
+        # chosen for a short one got a loop far past the guideline -- at 10 ms the
+        # default 50 Hz FLL is Bn*T = 0.5, five times the cap. Such a loop does not
+        # lock at ANY carrier-to-noise ratio, and nothing in the outputs says why:
+        # the channel simply runs to completion having never left FLL.
+        #
+        # Narrowed rather than rejected, because the configuration is reasonable and
+        # only its bandwidths are not -- and narrowing is what the extension path
+        # already does. Warned about rather than done silently, because these are
+        # numbers the caller chose deliberately and the tracking behaviour changes.
+        capped = _retune_for_update_period(loop_params, loop_params.coherent_duration_ms)
+        narrowed = [
+            (name, getattr(loop_params, name), getattr(capped, name))
+            for name in (
+                "DLL_bandwidth_hz", "PLL_bandwidth_hz",
+                "FLL_bandwidth_hz", "subcarrier_bandwidth_hz",
+            )
+            if getattr(capped, name) < getattr(loop_params, name)
+        ]
+        if narrowed:
+            detail = ", ".join(
+                f"{name} {was:g} -> {now:g} Hz" for name, was, now in narrowed
+            )
+            warnings.warn(
+                f"coherent_duration_ms={loop_params.coherent_duration_ms} caps loop "
+                f"bandwidths at {MAX_BANDWIDTH_TIME_PRODUCT / (loop_params.coherent_duration_ms * 1e-3):g} Hz "
+                f"(Bn*T <= {MAX_BANDWIDTH_TIME_PRODUCT:g}); narrowing {detail}. Choose "
+                "bandwidths for the epoch length, or shorten the epoch.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            loop_params = capped
+
         self.loop_params = loop_params
         self.signal_params = signal_params
         self.policy = discriminator_policy or LoopDiscriminatorPolicy()
@@ -1088,6 +1179,21 @@ class TrackingChannel:
         self._unit_signs = np.ones(num_components, dtype=np.int8)
         self._synced_policy = synced_policy
         self._synced_coherent_duration_ms = synced_coherent_duration_ms
+        # The longest accumulation that stays coherent while the overlay is STILL
+        # FLIPPING, or None if nothing bounds it.  A second, independent gate on the
+        # extension, and separating it from `_symbol_boundary_known` is the point:
+        # on L5 both say "wait for the overlay" and the two were indistinguishable,
+        # but on L1C both say "go" and conflating them cost 2 s of 1 ms epochs.
+        #
+        # L1CO's chip lasts one primary code period -- 10 ms -- so it bounds nothing
+        # the 10 ms CNAV-2 symbol did not already bound.  NH20's chip lasts 1 ms, so
+        # on L5 it binds hard and the wait is real.
+        unstripped_limits = coherent_duration_limits_ms(
+            signal_params, overlay_stripped=False
+        )
+        self._unstripped_limit_ms = min(
+            (limit for limit, _ in unstripped_limits), default=None
+        )
         # Loop gains scale with the update period, so extending the coherent
         # accumulation demands a retuned filter.  Built up front to keep the
         # transition free of allocation and surprises.
@@ -1096,6 +1202,32 @@ class TrackingChannel:
             if synced_coherent_duration_ms > loop_params.coherent_duration_ms
             else loop_params
         )
+        # And say so if that retune narrowed anything.  Every channel now opens at
+        # one correlation interval, where Bn*T is small for any sane bandwidth, so
+        # the check above this constructor's body can no longer catch a caller whose
+        # bandwidths do not suit the epoch they actually asked for -- it only ever
+        # sees the 1 ms warm-up.  The extension is where their numbers really land.
+        narrowed_on_extend = [
+            (name, getattr(loop_params, name), getattr(self._synced_loop_params, name))
+            for name in (
+                "DLL_bandwidth_hz", "PLL_bandwidth_hz",
+                "FLL_bandwidth_hz", "subcarrier_bandwidth_hz",
+            )
+            if getattr(self._synced_loop_params, name) < getattr(loop_params, name)
+        ]
+        if narrowed_on_extend:
+            detail = ", ".join(
+                f"{name} {was:g} -> {now:g} Hz" for name, was, now in narrowed_on_extend
+            )
+            warnings.warn(
+                f"extending to {synced_coherent_duration_ms} ms caps loop bandwidths at "
+                f"{MAX_BANDWIDTH_TIME_PRODUCT / (synced_coherent_duration_ms * 1e-3):g} Hz "
+                f"(Bn*T <= {MAX_BANDWIDTH_TIME_PRODUCT:g}); narrowing {detail} at the "
+                "handover. The longer accumulation is what pays for the narrower loop, "
+                "but the loop after the extension is not the one configured.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
         # (validation follows)
         # Both configurations are checked up front, so a bad choice fails at
@@ -1165,19 +1297,43 @@ class TrackingChannel:
         # Start the first wiped-off epoch clean.
         self.correlator.reset_epoch()
         self._epoch_interval_count = 0
+        # And re-anchor, because this reset lands MID-GRID.  Sync is detected on the
+        # last interval of a primary code period, so the next interval to be folded
+        # sits one interval past a period boundary -- fine when the epoch is one
+        # interval long, and a permanently offset grid when it is not.  L1C is the
+        # case: its epoch may already be 10 ms here (nothing about an un-stripped
+        # L1CO stops it), and without this the grid would restart at code phase 9,
+        # 19, 29 ... and straddle every CNAV-2 symbol from then on.
+        if self.coherent_duration_ms > CORRELATION_INTERVAL_MS:
+            self._epoch_grid_anchored = False
 
     @property
     def _symbol_boundary_known(self) -> bool:
         """
         Whether the epoch grid has a real symbol boundary to anchor to yet.
 
-        One question, three mechanisms -- an overlay's phase, a measured bit
-        boundary, or a code period that is itself a symbol -- and the extension is
-        gated on whichever one this signal uses.  Keeping them behind a single
-        property is what stops the gate from silently meaning "has an overlay",
-        which is how a signal with no overlay at all comes to be treated as
-        permanently unsynchronised.
+        One question, three mechanisms -- a code period that is itself a symbol, an
+        overlay's phase, or a measured bit boundary -- and the extension is gated on
+        whichever one this signal uses.  Keeping them behind a single property is
+        what stops the gate from silently meaning "has an overlay", which is how a
+        signal with no overlay at all comes to be treated as permanently
+        unsynchronised.
+
+        ORDER MATTERS, and the cheapest mechanism has to be asked about first.  A
+        code period at least as long as the symbol locates the boundary outright,
+        from the seeded code phase, at epoch zero -- and it does so whether or not
+        the signal also carries an overlay.  Asking about the overlay first made
+        L1C wait for a 1800-hypothesis FFT search it did not need: L1CD's 10 ms
+        code period IS one CNAV-2 symbol, so L1C knows where its symbols start
+        before it has any idea where it is in L1CO.  What the overlay actually
+        gates on L1C is the four-quadrant discriminator, and that is switched in
+        `_on_overlay_synced`, not here.
         """
+        if (
+            self._epoch_anchor_period_ms is not None
+            and self._epoch_anchor_period_ms <= self.signal_params.primary_period_ms
+        ):
+            return True
         if self.overlay_sync is not None:
             return self.overlay_sync.synced
         if self._bit_sync_needed:
@@ -1247,23 +1403,38 @@ class TrackingChannel:
         from acquisition instead, because then sync happens at epoch zero with the
         loops still pulling in.
 
+        The overlay is not irrelevant here, only secondary: it gates the extension
+        exactly when wipe-off is what buys the length, which the guard below tests
+        directly rather than assuming from the presence of a tiered code.
+
         The loop filter is retuned in the same step: every gain scales with the
         update period, so a 20 ms epoch driving gains built for 1 ms is a 20x
         mistuning.  The two must not be separated.
         """
-        # Only ever extend.  `synced_coherent_duration_ms` defaults to one
-        # interval, so a channel *started* multi-interval would otherwise be
-        # contracted here the moment its overlay synced -- and contracted onto
-        # `_synced_loop_params`, which is the un-retuned filter built for the
-        # longer epoch, so the gains would be wrong by the ratio as well.  No
-        # signal in the catalog configures it that way, because the ones that
-        # start long have no overlay; the guard is what keeps that an accident
-        # rather than a requirement.
+        # Only ever extend.  `signal_interfaces.create_tracking_channels` opens
+        # every channel at one interval, so this cannot fire on that path -- but
+        # `TrackingChannel` is constructed directly too, and a channel *started*
+        # multi-interval with a shorter target would otherwise be CONTRACTED here
+        # the moment it synced, onto `_synced_loop_params`, which in that case is
+        # the un-retuned filter built for the longer epoch.  The gains would then
+        # be wrong by the ratio as well.
         if self._synced_coherent_duration_ms <= self.coherent_duration_ms:
             return
         if not self._symbol_boundary_known:
             return
         if self.loop_state.mode is not TrackingLoopMode.PLL:
+            return
+        # The target has to be coherent at the CURRENT overlay state, not merely at
+        # the stripped one the constructor validated.  Where wipe-off is what buys
+        # the length -- L5 -- this is what makes the extension wait for it; where it
+        # is not -- L1C, whose overlay chip is already a whole primary code period
+        # -- it lets the extension happen without ever consulting the overlay.
+        if (
+            self.overlay_sync is not None
+            and not self.overlay_sync.synced
+            and self._unstripped_limit_ms is not None
+            and self._synced_coherent_duration_ms > self._unstripped_limit_ms
+        ):
             return
 
         # Switch exactly on a symbol boundary, so the longer grid is anchored the
@@ -1623,8 +1794,10 @@ class TrackingChannel:
         #
         # Only while the epoch is one interval long.  Folding is what destroys the
         # 1 ms structure the histogram is built from, so a longer epoch could not
-        # answer this question however many of them went by -- which is exactly
-        # why a bit-sync signal starts short and extends afterwards.
+        # answer this question however many of them went by -- one of the two
+        # reasons every channel starts at a single interval and extends afterwards
+        # (the other, which applies to all signals, is FLL pull-in; see
+        # `signal_interfaces.create_tracking_channels`).
         if (
             self._bit_sync_needed
             and self._bit_sync is None

@@ -16,11 +16,12 @@ property of the signal rather than of the decoder:
 
 The two things that make this more than a reshape:
 
-**Epoch length changes mid-run.**  `TrackingChannel._maybe_extend_coherent_duration`
-lengthens the coherent accumulation once the overlay is stripped and the PLL has
-locked -- for L5, from 5 ms to 10 ms.  So the same output array holds epochs of two
-different lengths, and only the longer ones are whole symbols.  That is what
-`outputs.epoch_duration_ms` is for.
+**Epoch length changes mid-run.**  Every channel opens at one 1 ms correlation
+interval, and `TrackingChannel._maybe_extend_coherent_duration` lengthens the
+coherent accumulation to the configured duration once the PLL has locked and the
+symbol boundary is known -- on L5, 1 ms to at most 10 ms.  So the same output array
+holds epochs of two different lengths, and only the longer ones tile whole symbols.
+That is what `outputs.epoch_duration_ms` is for.
 
 **Not every epoch is usable.**  Two edges have to be behind the channel before its
 epochs are symbols.  Until the overlay is synced the tiered code is still flipping
@@ -164,21 +165,50 @@ class SymbolStream:
         return np.imag(self.values) if self.data_in_quadrature else np.real(self.values)
 
     @property
-    def quadrature_energy_ratio(self) -> float:
-        """
-        Mean magnitude on the data axis over the mean on the other one.
+    def quadrature_axis(self) -> np.ndarray:
+        """The axis the data is *not* on, which is therefore noise alone."""
+        return np.real(self.values) if self.data_in_quadrature else np.imag(self.values)
 
-        A diagnostic, not a decision: it should be large, and a value near 1
-        means the carrier is not locked the way `DATA_IN_QUADRATURE` assumes --
-        which is worth seeing before blaming the decoder for not syncing.
+    @property
+    def symbol_snr_db(self) -> float:
+        """
+        Signal-to-noise ratio of one symbol, in dB, measured off the two axes.
+
+        The data axis carries signal plus noise; the axis 90 degrees from it
+        carries noise alone.  That second fact is what makes this cheap -- the
+        noise power is not modelled, it is measured on an axis the signal is not
+        supposed to be on:
+
+            N = mean(quadrature axis squared)    noise power per axis
+            S = mean(data axis squared) - N      what is left on the data axis
+
+        Subtracting rather than reading the data axis as signal is what keeps the
+        estimate honest at low SNR, where most of what sits on that axis is noise.
+
+        This is the SNR of one **symbol**, after its epochs were summed -- not
+        C/N0, which is a density and is what `utils.tracking_channel` estimates
+        per correlation interval.  They differ by the symbol duration:
+        `C/N0 = SNR + 10*log10(1/T)`, so a 20 ms symbol sits about 17 dB below the
+        C/N0 figure notebook 01 plots and a 10 ms symbol about 20 dB below.
+        Comparing the two is a real check -- they are measured on different
+        quantities at different rates -- but only a rough one, since this makes no
+        allowance for the coherence the summing actually achieved.
+
+        Returns -inf when the data axis holds no more power than the quadrature
+        one.  That is not a weak signal but a signal on the wrong axis: the carrier
+        is not locked the way `DATA_IN_QUADRATURE` says it is, and the decoder is
+        about to be handed the noise axis.  Worth seeing before blaming the decoder
+        for failing to sync.  A residual carrier phase error tilts the estimate the
+        same way, by rotating signal onto the noise axis, so this reads low rather
+        than high when phase lock is poor.
         """
         if not len(self.values):
-            return 0.0
-        data_axis = np.abs(self.soft).mean()
-        other = np.abs(
-            np.real(self.values) if self.data_in_quadrature else np.imag(self.values)
-        ).mean()
-        return float(data_axis / other) if other > 0 else float("inf")
+            return float("-inf")
+        noise_power = float(np.mean(self.quadrature_axis**2))
+        signal_power = float(np.mean(self.soft**2)) - noise_power
+        if noise_power <= 0.0 or signal_power <= 0.0:
+            return float("-inf")
+        return float(10.0 * np.log10(signal_power / noise_power))
 
     def __len__(self) -> int:
         return len(self.values)

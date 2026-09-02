@@ -2,6 +2,7 @@
 from . import (
     bpsk_acquisition,
     bpsk_correlation,
+    catalog,
     broadcast_ephemeris,
     cddis,
     code_components,

@@ -73,9 +73,10 @@ def _track(
     Track through `create_tracking_channels`, which is the pipeline's own path.
 
     Going through the factory rather than building a `TrackingChannel` directly is
-    the point: the factory is what turns a requested multi-interval epoch into
-    "start at one interval, extend once the boundary is known" for the signals that
-    need it, and a test that bypassed it would not exercise the fix at all.
+    the point: the factory is what turns a requested epoch length into "start at
+    one interval, extend once the loops are locked and the boundary is known" --
+    for every signal, not only the ones that have to measure that boundary -- and a
+    test that bypassed it would not exercise the fix at all.
     """
     signals = build_signals(signal_type, prns=[PRN])
     loop_params = tracking_channel.TrackingLoopParameters(

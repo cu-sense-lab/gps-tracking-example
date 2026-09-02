@@ -134,8 +134,26 @@ def test_short_coherent_gives_a_grid_finer_than_the_response():
     assert config.acq_total_duration_ms == pytest.approx(20.0)
 
 
-def test_coherent_longer_than_the_replica_is_rejected():
-    with pytest.raises(ValueError, match="coherent <= replica"):
+def test_coherent_longer_than_the_replica_folds():
+    """
+    A coherent block spanning several replica periods sums them onto one window
+    before the transform, rather than correlating against a tiled replica.  The
+    two are the same computation; the fold is the one that does not repeat its
+    answer once per period.
+    """
+    config = _config(coherent_duration_sample_ms=100.0)      # 5 x the 20 ms replica
+    assert config.fold_factor == 5
+    assert config.coherent_length_samples == 5 * config.replica_length_samples
+    # Whole-bin steps coarsen with the shorter FFT, and sub-bin offsets put the
+    # search grid back exactly where an unfolded replica would have placed it.
+    assert len(config.doppler_sub_offsets_hz) == 5
+    assert config.doppler_step_hz == pytest.approx(config.fft_resolution / 5)
+    assert config.doppler_response_width_hz == pytest.approx(config.doppler_step_hz)
+
+
+def test_a_fractional_multiple_of_the_replica_is_rejected():
+    """Folding sums whole periods; a part period would count for less, silently."""
+    with pytest.raises(ValueError, match="not a whole multiple"):
         _config(coherent_duration_sample_ms=25.0)
 
 
@@ -307,3 +325,230 @@ def test_the_acquisition_delay_plot_axis_is_in_whole_chips():
     # Within a chip of the full +/-3 window, and nowhere near the 0.5 chips a
     # 12x sub-chip axis would have shown.
     assert max(spans) == pytest.approx(6.0, abs=1.0)
+
+
+def test_the_acquisition_delay_axis_puts_a_late_reflection_on_the_right():
+    """
+    The axis says "code delay", so a signal that arrives LATER must plot to the
+    RIGHT.  That is not what the correlation grid gives: it is indexed by code
+    phase, which runs the other way -- a signal delayed by `d` chips peaks at index
+    `L - d` -- so the plot negates it.
+
+    Nothing about a single curve reveals which sign is being drawn, and both
+    readings look equally plausible, so the direction is pinned here with a signal
+    whose answer is known by construction: a direct path plus a copy of itself
+    delayed by a known fraction of a chip.  Get the sign wrong and every statement
+    the figure exists to support inverts -- early and late swap, and multipath is
+    read on the side it can never appear on.
+    """
+    matplotlib = pytest.importorskip("matplotlib")
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    from utils import plotting
+
+    samp_rate = 25e6
+    chip_rate = GpsL1CA.tracking_code_rate_chips_per_sec
+    echo_chips = 0.6
+
+    signals = build_signals(GpsL1CA, prns=[PRN])
+    params = build_acquisition_code_params(GpsL1CA, signals)
+    code = params[f"G{PRN:02d}"]
+    config = bpsk_acq.AcquisitionConfiguration(
+        coherent_duration_replica_ms=1, num_blocks=4, sample_rate=samp_rate,
+        min_search_doppler_hz=-1000.0, max_search_doppler_hz=1000.0,
+    )
+
+    def code_at(t_s, delay_s):
+        chips = ((t_s - delay_s) * code.rate_chips_per_sec).astype(np.int64)
+        return code.sequence[chips % code.length_chips].astype(np.complex64)
+
+    direct_s = 0.3e-3
+    t = np.arange(int(samp_rate * config.acq_total_duration_ms * 1e-3)) / samp_rate
+    samples = code_at(t, direct_s) + 0.6 * code_at(t, direct_s + echo_chips / chip_rate)
+
+    results = bpsk_acq.run_acquisition(
+        np.ascontiguousarray(samples, dtype=np.complex64), 0.0, config, params,
+        prob_false_alarm_total=1e-3,
+    )
+
+    fig = plt.figure()
+    try:
+        axes = plotting.plot_acquisition_code_phase_slices(fig, results, window_chips=1.5)
+        curves = [line for line in axes.get_lines() if len(line.get_xdata()) > 2]
+        assert curves, "no delay slice was drawn"
+        x, y = curves[0].get_xdata(), curves[0].get_ydata()
+    finally:
+        plt.close(fig)
+
+    # The shoulder the echo puts on the correlation, either side of the main peak.
+    late = y[x > 0.15].max()
+    early = y[x < -0.15].max()
+    assert late > early + 1.0, (
+        f"a {echo_chips}-chip LATE reflection left more energy at negative delay "
+        f"({early:.1f} dB) than at positive ({late:.1f} dB): the axis is inverted, "
+        "so it is code phase rather than code delay"
+    )
+
+
+# --------------------------------------------------------------------------
+# Folding a coherent block onto one replica period
+# --------------------------------------------------------------------------
+#
+# Correlating N code periods of data against a replica tiled N times computes
+# something exactly periodic in one period: a tiled replica's spectrum is
+# non-zero only every Nth bin, and those bins are precisely the transform of the
+# folded data.  So the long correlation is the folded one, repeated N times.
+# Folding says so directly -- a shorter FFT, an unambiguous code phase, and a
+# false-alarm correction over the cells that are actually distinct.
+
+
+def _folding_pair(sample_rate=2_046_000, replica_ms=1, fold=5):
+    """The same dwell, once with a tiled replica and once folded."""
+    common = dict(
+        num_blocks=2, sample_rate=sample_rate,
+        min_search_doppler_hz=-1000, max_search_doppler_hz=1000,
+    )
+    tiled = bpsk_acq.AcquisitionConfiguration(
+        coherent_duration_replica_ms=replica_ms * fold,
+        coherent_duration_sample_ms=float(replica_ms * fold), **common)
+    folded = bpsk_acq.AcquisitionConfiguration(
+        coherent_duration_replica_ms=replica_ms,
+        coherent_duration_sample_ms=float(replica_ms * fold), **common)
+    return tiled, folded
+
+
+def test_folding_leaves_the_doppler_grid_where_it_was():
+    """
+    Whole-bin steps coarsen by `fold`, sub-bin offsets divide them back down, and
+    the product is the grid the tiled replica searched -- same spacing, same
+    hypothesis count, same worst-case seeding error.
+    """
+    tiled, folded = _folding_pair()
+    assert folded.fft_resolution == pytest.approx(tiled.fft_resolution * 5)
+    assert folded.doppler_step_hz == pytest.approx(tiled.doppler_step_hz)
+    assert folded.num_doppler_hypotheses == tiled.num_doppler_hypotheses
+    assert folded.doppler_error_hz == pytest.approx(tiled.doppler_error_hz)
+    np.testing.assert_allclose(
+        folded.doppler_hypotheses_hz, tiled.doppler_hypotheses_hz, atol=1e-9
+    )
+
+
+def test_folding_counts_only_the_distinct_delay_cells():
+    """The repeated copies are the same numbers, not further chances to false-alarm."""
+    tiled, folded = _folding_pair()
+    assert folded.replica_length_samples * 5 == tiled.replica_length_samples
+
+
+def test_folded_packing_matches_summing_the_periods_by_hand():
+    """`pack_coherent_blocks` folds; state what that means arithmetically."""
+    rng = np.random.default_rng(0)
+    L, fold, blocks = 64, 5, 2
+    x = (rng.normal(size=L * fold * blocks)
+         + 1j * rng.normal(size=L * fold * blocks)).astype(np.complex64)
+    packed = bpsk_acq.pack_coherent_blocks(x, blocks, L, L * fold)
+    for j in range(blocks):
+        chunk = x[j * L * fold : (j + 1) * L * fold]
+        np.testing.assert_allclose(packed[j], chunk.reshape(fold, L).sum(axis=0),
+                                   rtol=1e-6, atol=1e-5)
+
+
+def test_the_doppler_ramp_is_applied_before_the_fold():
+    """
+    The inter-period rotation is the whole difference between one coherent
+    integration of `fold` periods and `fold` incoherent ones.  Wiping off after
+    the fold cannot express it: at a Doppler whose per-period step is 360/fold
+    degrees the contributions cancel exactly.
+    """
+    fs, L, fold = 1000.0, 100, 5
+    period_s = L / fs
+    doppler = 1.0 / (fold * period_s)          # 2 Hz -> 72 deg per period
+    x = np.ones(L * fold, dtype=np.complex64)  # constant signal at baseband
+    carried = (x * np.exp(2j * np.pi * doppler * np.arange(len(x)) / fs)).astype(np.complex64)
+
+    right = bpsk_acq.pack_coherent_blocks(carried, 1, L, L * fold,
+                                          doppler_hz=doppler, sample_rate=fs)
+    assert np.abs(right[0]).mean() == pytest.approx(float(fold), rel=1e-6)
+
+    # Fold first, then ramp: every period lands on the same index with the same
+    # phase, so the rotation that should have separated them is simply absent.
+    wrong = bpsk_acq.pack_coherent_blocks(carried, 1, L, L * fold)[0]
+    assert np.abs(wrong).mean() < 1e-3 * fold
+
+
+# ---------------------------------------------------------------------------
+# Code phase vs code delay
+# ---------------------------------------------------------------------------
+
+
+class _FakeResolution:
+    """Enough of an `AmbiguityResolution` for the ambiguity arithmetic."""
+
+    def __init__(self, num_hypotheses: int, resolved: bool):
+        self.scores = np.zeros(num_hypotheses)
+        self.resolved = resolved
+
+
+def _result_with_ambiguity(ambiguity_ms: float):
+    result = object.__new__(bpsk_acq.AcquisitionResult)
+    result.code_phase_ambiguity_ms = ambiguity_ms
+    return result
+
+
+def test_code_delay_is_uptime_minus_code_phase_and_starts_negative():
+    """
+    The two quantities are easy to conflate: both advance at nearly one millisecond
+    per millisecond and differ only by the delay between them.  Tracking seeds the
+    code phase at the phase acquisition measured, so the raw difference starts at
+    exactly minus that -- which is why it needs the ambiguity added back.
+    """
+    acquired_phase_ms = 0.7737
+    uptime = np.array([0.0, 1.0, 2.0])
+    code_phase = uptime + acquired_phase_ms  # what tracking actually holds
+
+    raw = bpsk_acq.code_delay_ms(uptime, code_phase)
+    assert np.allclose(raw, -acquired_phase_ms)
+
+    wrapped = bpsk_acq.code_delay_ms(uptime, code_phase, ambiguity_ms=1.0)
+    assert np.all(wrapped >= 0.0) and np.all(wrapped < 1.0)
+    assert np.allclose(wrapped, 1.0 - acquired_phase_ms)
+
+
+def test_code_phase_and_code_delay_move_in_opposite_directions():
+    """A satellite moving away makes its transmit-time coordinate fall further
+    behind receiver time, so a rising delay is a falling code phase."""
+    uptime = np.arange(5.0)
+    receding = uptime + 0.5 - np.arange(5) * 0.01   # code phase advancing slower
+    assert np.all(np.diff(bpsk_acq.code_delay_ms(uptime, receding)) > 0)
+
+
+def test_an_unresolved_long_code_leaves_the_acquisition_ambiguity():
+    result = _result_with_ambiguity(20.0)
+    assert bpsk_acq.code_phase_ambiguity_ms(result) == 20.0
+    assert bpsk_acq.code_phase_ambiguity_ms(
+        result, _FakeResolution(75, resolved=False)
+    ) == 20.0
+
+
+def test_resolving_the_long_code_extends_the_ambiguity_to_its_whole_period():
+    """L2C acquires on CM's 20 ms period and resolves which of CL's 75 blocks it
+    sat in, so the code phase is settled over CL's full 1.5 s -- longer than any
+    transit time, which is what makes an L2C code delay a transit time outright."""
+    result = _result_with_ambiguity(20.0)
+    assert bpsk_acq.code_phase_ambiguity_ms(
+        result, _FakeResolution(75, resolved=True)
+    ) == pytest.approx(1500.0)
+
+
+def test_a_wrapped_l2c_code_delay_lands_in_the_gps_transit_band():
+    """
+    The check that ties the convention to physics.  GPS transit time runs about
+    67 ms overhead to 86 ms at the horizon.  Only L2C's resolved ambiguity is
+    longer than that, so only there should the wrapped delay be a transit time --
+    and if the sign convention were inverted it would land outside the band.
+    """
+    result = _result_with_ambiguity(20.0)
+    ambiguity = bpsk_acq.code_phase_ambiguity_ms(result, _FakeResolution(75, True))
+    # A code phase seeded 1424.2875 ms ahead of uptime, as an L2C channel is.
+    delay = bpsk_acq.code_delay_ms(0.0, 1424.2875, ambiguity)
+    assert 67.0 < delay < 86.0

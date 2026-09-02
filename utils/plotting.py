@@ -6,6 +6,7 @@ import scipy.signal
 import scipy.stats
 from matplotlib.axes import Axes
 from matplotlib.figure import Figure, SubFigure
+from scipy.constants import speed_of_light
 
 from . import bpsk_acquisition, tracking_channel
 from .collect_metadata_utils import ExperimentMetadata
@@ -391,8 +392,11 @@ def plot_acquisition_dwell_layout(
 
     Left panel -- the dwell in time.  `num_blocks` coherent blocks of
     `coherent_duration_sample_ms` are taken back to back from the stream, and each
-    is zero-padded out to `coherent_duration_replica_ms` before its FFT (the
-    correlation is circular, so the FFT length is the replica length).
+    is fitted to `coherent_duration_replica_ms` before its FFT (the correlation is
+    circular, so the FFT length is the replica length).  Which way it is fitted
+    depends on which length is longer: a block shorter than the replica is
+    zero-padded, and a block longer than it is FOLDED -- its whole code periods
+    summed onto one window, filling it with no padding at all.
 
     Each block sits at the offset it actually occupied within the code period --
     block `j` at `j * T_coherent` modulo `T_replica`, wrapping if it straddles the
@@ -409,11 +413,19 @@ def plot_acquisition_dwell_layout(
     the symbol alignment, so the realistic picture is an arbitrary offset, and
     keeping blocks short is what bounds the damage whatever it turns out to be.
 
-    Right panel -- the same two lengths in frequency.  Grid ticks are the Doppler
-    bins the FFT actually produces, spaced `1 / T_replica`.  The curve is the
-    coherent response, whose mainlobe is `1 / T_coherent` wide.  A short coherent
-    length therefore widens the response without widening the grid, which is what
-    lets a short integration still be located to a fine Doppler.
+    Right panel -- the same two lengths in frequency.  The curve is the coherent
+    response, whose mainlobe is `1 / T_coherent` wide.  Orange ticks are the grid
+    the search actually steps on.
+
+    Those two are not the same as the FFT's own bin spacing, `1 / T_replica`.
+    Rolling the replica's spectrum by whole bins is what steps Doppler for free,
+    so an unfolded search steps exactly one bin at a time.  Folding shortens the
+    transform, which coarsens those bins by the fold factor while leaving the
+    mainlobe -- set by how much data is integrated, not by the FFT length --
+    exactly where it was.  The missing steps come back as sub-bin phase ramps
+    applied before the fold, and the green ticks show which of the orange ones the
+    FFT supplied.  Left unfilled, a 1 ms replica would search a 5 ms integration
+    on a 1 kHz grid, and `sinc(500 Hz * 5 ms)` is -18 dB: a hole in every gap.
     """
     axes = fig.subplots(1, 2, width_ratios=[1.4, 1])
     ax_time: Axes = axes[0]
@@ -422,28 +434,45 @@ def plot_acquisition_dwell_layout(
     t_coh = float(acq_config.coherent_duration_sample_ms)
     t_rep = float(acq_config.coherent_duration_replica_ms)
     num_blocks = acq_config.num_blocks
+    fold = getattr(acq_config, "fold_factor", 1)
 
     for m in range(num_blocks):
         y = num_blocks - 1 - m
-        # Where this block's data actually sits in the window, wrapping if it
-        # straddles the end of the code period.
-        start = (m * t_coh) % t_rep
-        spans = [(start, min(t_coh, t_rep - start))]
-        if start + t_coh > t_rep:
-            spans.append((0.0, start + t_coh - t_rep))
+        if fold > 1:
+            # Folded: the block is `fold` whole code periods summed onto the
+            # window, so it covers all of it and there is nothing to pad.  Its
+            # offset is `m * t_coh` modulo `t_rep`, which is zero for every block
+            # because `t_coh` is a whole multiple of `t_rep`.
+            spans = [(0.0, t_rep)]
+        else:
+            # Where this block's data actually sits in the window, wrapping if it
+            # straddles the end of the code period.
+            start = (m * t_coh) % t_rep
+            spans = [(start, min(t_coh, t_rep - start))]
+            if start + t_coh > t_rep:
+                spans.append((0.0, start + t_coh - t_rep))
 
         ax_time.broken_barh([(0.0, t_rep)], (y - 0.32, 0.64),
                             facecolors="lightgrey", edgecolor="k",
                             linewidth=0.5, hatch="//")
         ax_time.broken_barh(spans, (y - 0.32, 0.64),
                             facecolors="tab:blue", edgecolor="k", linewidth=0.5)
-        ax_time.text(spans[0][0] + spans[0][1] / 2, y, f"{m}", ha="center",
+        label = f"{m}" if fold == 1 else f"{m}  ({fold} periods summed)"
+        ax_time.text(spans[0][0] + spans[0][1] / 2, y, label, ha="center",
                      va="center", fontsize=8, color="white")
 
-    if symbol_period_ms:
-        # Boundaries are absolute in the window: it is one code period, and the
-        # blocks have been placed back onto their true positions within it.
-        edges = np.arange(symbol_phase_ms % symbol_period_ms, t_rep, symbol_period_ms)
+    # Boundaries are absolute in the window: it is one code period, and the blocks
+    # have been placed back onto their true positions within it.  A symbol longer
+    # than the window may simply not have one inside it -- which is the case once
+    # folding makes the window a single code period -- so draw what falls in it
+    # rather than assuming one does.
+    edges = (
+        np.arange(symbol_phase_ms % symbol_period_ms, t_rep, symbol_period_ms)
+        if symbol_period_ms
+        else np.zeros(0)
+    )
+    draw_symbols = len(edges) > 0
+    if draw_symbols:
         ax_time.vlines(edges, -0.5, num_blocks - 0.5, color="tab:red", lw=2, zorder=3)
 
     ax_time.set_yticks(range(num_blocks))
@@ -451,26 +480,49 @@ def plot_acquisition_dwell_layout(
     ax_time.set_ylabel("Block")
     ax_time.set_xlabel("Time within the FFT window [ms]")
     ax_time.set_xlim(0, t_rep)
-    ax_time.set_title(f"Dwell: {num_blocks} x {t_coh:g} ms coherent, {t_rep:g} ms replica")
+    folded_note = f", folded {fold}x" if fold > 1 else ""
+    ax_time.set_title(
+        f"Dwell: {num_blocks} x {t_coh:g} ms coherent, {t_rep:g} ms replica{folded_note}"
+    )
     handles = [
         plt.Rectangle((0, 0), 1, 1, facecolor="tab:blue", edgecolor="k", label="data integrated"),
-        plt.Rectangle((0, 0), 1, 1, facecolor="lightgrey", edgecolor="k", hatch="//", label="zero padding"),
     ]
-    if symbol_period_ms:
+    if fold == 1:
+        handles.append(plt.Rectangle((0, 0), 1, 1, facecolor="lightgrey", edgecolor="k",
+                                     hatch="//", label="zero padding"))
+    if draw_symbols:
         handles.append(plt.Line2D([0], [0], color="tab:red", lw=2,
                                   label=f"symbol boundary ({symbol_period_ms:g} ms)"))
+    elif symbol_period_ms:
+        # A 20 ms symbol cannot be drawn inside a 1 ms window, but the block it
+        # can straddle is 5 ms long, and saying so is the whole point.
+        handles.append(plt.Line2D([0], [0], color="none",
+                                  label=f"symbol {symbol_period_ms:g} ms: none in this window"))
     ax_time.legend(handles=handles, fontsize=7, loc="upper right")
 
     # --- frequency ---
-    grid_hz = acq_config.fft_resolution
+    # What the search actually steps, which is the FFT bin spacing divided by the
+    # fold: whole-bin rolls coarsen with the shorter transform, and the sub-bin
+    # ramps put the steps back.  Plotting `fft_resolution` here would claim a
+    # 1 kHz grid for a search that is really stepping 200 Hz.
+    grid_hz = getattr(acq_config, "doppler_step_hz", acq_config.fft_resolution)
+    bin_hz = acq_config.fft_resolution
     response_hz = acq_config.doppler_response_width_hz
     span = 3 * response_hz
     f = np.linspace(-span, span, 1001)
     ax_freq.plot(f, np.abs(np.sinc(f / response_hz)), color="k", lw=2,
                  label=f"response, {response_hz:.0f} Hz wide")
-    ticks = np.arange(-span, span + grid_hz, grid_hz)
-    ax_freq.vlines(ticks, 0, 0.12, color="tab:orange", lw=1.5,
-                   label=f"Doppler bins, {grid_hz:.0f} Hz apart")
+    # Centred on the true value, not on the edge of the plotted span: these mark
+    # where the search can land relative to truth, so a tick belongs at zero.
+    def _centred(spacing: float) -> np.ndarray:
+        k = int(np.floor(span / spacing))
+        return np.arange(-k, k + 1) * spacing
+
+    ax_freq.vlines(_centred(grid_hz), 0, 0.12, color="tab:orange", lw=1.5,
+                   label=f"search grid, {grid_hz:.0f} Hz apart")
+    if fold > 1:
+        ax_freq.vlines(_centred(bin_hz), 0, 0.26, color="tab:green", lw=1.5,
+                       label=f"FFT bins, {bin_hz:.0f} Hz ({fold} sub-bin ramps fill in)")
     ax_freq.set_xlabel("Doppler offset from the true value [Hz]")
     ax_freq.set_ylabel("Normalised correlation")
     ax_freq.set_title("Grid spacing vs response width")
@@ -491,10 +543,23 @@ def plot_acquisition_code_phase_slices(
     Correlation power against code delay, one curve per signal, each taken at its
     own peak Doppler bin.
 
+    **The axis is delay, increasing to the right**, so it reads the way the words
+    do: a point to the *left* of the peak is a replica that arrives earlier than the
+    signal (an early correlator), one to the *right* arrives later (late), and a
+    reflection -- always later than the direct path -- adds energy on the right.
+
+    That takes a negation.  The correlation grid is indexed by code phase, which
+    runs the other way: a signal delayed by `d` chips peaks at index `L - d` of an
+    `L`-chip code, so plotting the index directly puts early on the right and
+    multipath on the left.  The two are easy to conflate because they differ only
+    in sign, and nothing about a single curve reveals which one is being drawn --
+    which is why `tests/test_acquisition.py` pins the direction with an injected
+    echo rather than leaving it to inspection.
+
     This is the view for reading **multipath**, which lives in the delay dimension:
     a reflection is always delayed relative to the direct path, so it shows up as
-    asymmetry about zero -- a shoulder on the late side, a broadened or flattened
-    peak -- rather than as a change in peak height.
+    asymmetry about zero -- a shoulder on the late (right) side, a broadened or
+    flattened peak -- rather than as a change in peak height.
 
     Delay is plotted relative to each signal's own peak, so the curves are
     comparable; absolute code phase is in the acquisition table.  Power is in dB
@@ -515,14 +580,13 @@ def plot_acquisition_code_phase_slices(
     a smoothly resolved shoulder.  Anything finer needs a higher sample rate or an
     interpolated peak.
 
-    **Do not read asymmetry as multipath without checking the sign.**  With 2.15
-    samples per chip the true peak almost never lands on a sample, so the two
-    neighbours are unequal purely from where the sampling grid happened to fall.
-    On the rooftop collect the late-minus-early difference is -6.4, +5.8 and
-    -0.8 dB for G01, G14 and G30 -- random in sign, which is the signature of
-    sub-sample placement.  Multipath is a *delayed* reflection, so it skews late
-    consistently, across satellites and over time.  A single dwell cannot separate
-    the two; a run of dwells can.
+    **Do not read asymmetry as multipath without checking the sign.**  At a couple
+    of samples per chip the true peak almost never lands on a sample, so its two
+    neighbours are unequal purely from where the sampling grid happened to fall --
+    and that lands either way at random, differing in sign from one satellite to
+    the next.  Multipath is a *delayed* reflection, so it skews late consistently,
+    across satellites and over time.  A single dwell cannot separate the two; a run
+    of dwells can.
 
     Signals are taken from `acq_results` by default only where `signal_detected` is
     set; elsewhere the "peak" is a noise maximum whose neighbourhood means nothing.
@@ -542,8 +606,15 @@ def plot_acquisition_code_phase_slices(
             power_db = 10.0 * np.log10(
                 power / result.noise_var / (2 * result.config.num_blocks)
             )
+        # NEGATED, and this is the whole reason the axis reads as delay.  The
+        # correlation index is a code phase, and code phase runs *opposite* to
+        # delay: a signal arriving `d` chips later peaks at index `L - d` of an
+        # `L`-chip code.  Plotted raw, a late reflection would appear to the LEFT
+        # of the direct path and an early correlator to the right -- both backwards
+        # from every description of what this figure is for.  Verified rather than
+        # derived: inject a 0.6-chip echo and it lands at +0.6 here.
         delay_chips = (
-            corr.code_phase_bins_seconds - reference_seconds
+            reference_seconds - corr.code_phase_bins_seconds
         ) * result.acquisition_code_rate_chips_per_sec
         keep = np.abs(delay_chips) <= window_chips
         order = np.argsort(delay_chips[keep])
@@ -623,9 +694,19 @@ def plot_acquisition_code_phase_slices(
     ax.set_ylim(bottom=max(-12.0, ax.get_ylim()[0]))
     ax.set_xlabel("Code delay relative to the refined peak [chips]")
     ax.set_ylabel("Correlation power [dB above noise]")
-    ax.set_title("Acquisition correlation vs code delay")
+    # Which way is which, at the ends of the axis rather than in the caption: the
+    # sign of this axis is the one thing about the figure that cannot be read off
+    # it.  Above the frame, so they never collide with the legend or the curves,
+    # with the title padded up to make room.
+    ax.set_title("Acquisition correlation vs code delay", pad=18)
+    for x, ha, text in (
+        (0.0, "left", "\u2190 early: replica ahead, shorter delay"),
+        (1.0, "right", "late: replica behind, longer delay (multipath) \u2192"),
+    ):
+        ax.text(x, 1.01, text, transform=ax.transAxes, ha=ha, va="bottom",
+                fontsize=7.5, color="0.35")
     ax.grid(True)
-    ax.legend(fontsize=8, ncol=2)
+    ax.legend(fontsize=8, ncol=1, loc="upper right", bbox_to_anchor=(1.0, 1.0))
     return ax
 
 
@@ -851,57 +932,142 @@ def plot_prompt_components(
     return axes
 
 
+def _detrend(x: np.ndarray, y: np.ndarray, order: Optional[int]) -> np.ndarray:
+    """Subtract a least-squares polynomial fit of the given order from y(x)."""
+    if order is None or len(x) <= order:
+        return y
+    trend = np.polyval(np.polyfit(x, y, order), x)
+    return y - trend
+
+
 def plot_code_delay_and_doppler(
     fig: Figure | SubFigure,
     adapter: "TrackingChannelAdapter",
     sig_id: str,
     title: Optional[str] = None,
+    code_delay_detrend_order: Optional[int] = 2,
+    doppler_detrend_order: Optional[int] = 1,
+    ambiguity_ms: Optional[float] = None,
 ) -> Axes:
     """
     Code delay and carrier Doppler on shared axes, as the line-of-sight dynamics.
 
-    Code delay is plotted as the *residual*: the tracked code phase minus the
-    nominal one-millisecond-per-millisecond advance, referenced to the first
-    epoch.  The raw code phase is dominated by that nominal advance and shows
-    nothing; the residual is the part that reflects the satellite actually moving,
-    and is reported in chips (the right-hand axis carries Doppler in Hz).
+    **Code phase and code delay are different quantities**, and the difference is
+    the whole content of this docstring.  `code_phase_ms` is what tracking reports:
+    the satellite's own transmit-time coordinate, advancing at very nearly one
+    millisecond per millisecond of receiver time.  The **code delay** is
+
+        code delay = uptime - code phase
+
+    -- receiver time minus transmit time, which is the transit time plus the
+    receiver clock offset, i.e. a pseudorange in milliseconds.  Two consequences
+    worth holding on to: the two run in *opposite* directions as range changes,
+    because a satellite moving away makes its transmit-time coordinate fall further
+    behind receiver time; and the delay is tiny beside either of them, which is why
+    the raw difference has to be plotted as a residual to show anything.
+
+    **The delay is ambiguous, and negative without the ambiguity added back.**
+    Acquisition seeds the code phase at the phase it measured, so `uptime -
+    code_phase` starts at exactly minus that -- and the seed is only known modulo
+    the acquired code's period.  Pass `ambiguity_ms`
+    (`bpsk_acquisition.code_phase_ambiguity_ms`) and the reported starting delay is
+    wrapped into `[0, ambiguity_ms)`, which is what makes it a delay rather than a
+    negative number.  Only the annotation is wrapped; the plotted curve is the
+    unwrapped, continuous difference, because a delay drifting across the modulus
+    mid-run would otherwise jump by a whole period.
+
+    The curve is the *residual*: the delay referenced to its first epoch, so what
+    is left is the part that reflects the satellite actually moving, reported as an
+    equivalent range in metres (`c * delay`; the right-hand axis carries Doppler in
+    Hz).
 
     The two are related by construction, not independently measured: this tracker
     slaves the code rate to the carrier, `code_rate = (1 + doppler / f_carrier)`,
-    so the delay residual is the integral of Doppler over the carrier frequency.
-    What the plot is good for is seeing that dynamic directly -- a steady Doppler
-    of a few kHz produces a delay ramp of a fraction of a chip per second -- and
-    seeing both break together when a channel loses lock.
+    so the delay residual is the *negative* integral of Doppler over the carrier
+    frequency -- approaching (positive Doppler) shrinks the delay, receding
+    (negative Doppler) grows it.  What the plot is good for is seeing that dynamic
+    directly -- a steady Doppler of a few kHz produces a delay ramp of a fraction
+    of a chip per second -- and seeing both break together when a channel loses
+    lock.
+
+    Over a short pass the line-of-sight range accelerates roughly steadily, so the
+    code delay residual (its integral) is dominated by a quadratic trend and the
+    Doppler (its derivative) by a linear one -- both of which swamp the finer
+    structure on the plot. `code_delay_detrend_order` and `doppler_detrend_order`
+    remove a least-squares polynomial fit of that order before plotting (default
+    2nd and 1st order respectively); pass `None` for either to plot the raw
+    residual/Doppler instead.
     """
     outputs = adapter.outputs
     valid = outputs.valid
     plot_time = outputs.uptime_epoch_ms[valid] * 1e-3
-    doppler_freq_hz = outputs.doppler_freq_hz[valid]
+    doppler_freq_hz = _detrend(plot_time, outputs.doppler_freq_hz[valid], doppler_detrend_order)
 
-    # Code phase accumulates without wrapping, so subtracting elapsed time leaves
-    # only the departure from the nominal rate.
-    residual_ms = outputs.code_phase_ms[valid] - outputs.uptime_epoch_ms[valid]
-    if len(residual_ms):
-        residual_ms = residual_ms - residual_ms[0]
-    residual_chips = residual_ms * 1e-3 * adapter.signal.tracking_code_rate_chips_per_sec
+    # Code phase accumulates without wrapping and runs behind uptime by the transit
+    # delay (same convention as the receive_time - transmit_time pseudorange in
+    # observables.py), so this grows with range; subtracting the first value removes
+    # the nominal rate and leaves the departure caused by the satellite's own motion.
+    #
+    # Unwrapped on purpose -- see the docstring.  Wrapping here would put a
+    # whole-period step in the middle of any run whose delay crosses the modulus.
+    delay_ms = bpsk_acquisition.code_delay_ms(
+        outputs.uptime_epoch_ms[valid], outputs.code_phase_ms[valid]
+    )
+    residual_ms = delay_ms - delay_ms[0] if len(delay_ms) else delay_ms
+    residual_m = residual_ms * 1e-3 * speed_of_light
+    residual_m = _detrend(plot_time, residual_m, code_delay_detrend_order)
 
     ax = fig.add_subplot(1, 1, 1)
-    ax.plot(plot_time, residual_chips, color="tab:purple", lw=2, label="Code delay")
-    ax.set_ylabel("Code delay residual [chips]", color="tab:purple")
+    ax.plot(plot_time, residual_m, color="tab:purple", lw=2, label="Code delay")
+    code_delay_label = "Code delay [m]"
+    if code_delay_detrend_order is not None:
+        code_delay_label += f" (order-{code_delay_detrend_order} detrended)"
+    ax.set_ylabel(code_delay_label, color="tab:purple")
     ax.tick_params(axis="y", labelcolor="tab:purple")
     ax.set_xlabel("Uptime [s]")
-    ax.grid(True)
 
     ax_doppler = ax.twinx()
     ax_doppler.plot(plot_time, doppler_freq_hz, color="tab:green", lw=2, label="Doppler")
-    ax_doppler.set_ylabel("Doppler [Hz]", color="tab:green")
+    doppler_label = "Doppler [Hz]"
+    if doppler_detrend_order is not None:
+        doppler_label += f" (order-{doppler_detrend_order} detrended)"
+    ax_doppler.set_ylabel(doppler_label, color="tab:green")
     ax_doppler.tick_params(axis="y", labelcolor="tab:green")
+    doppler_freq_bounds = tuple(np.percentile(doppler_freq_hz[np.min([100, doppler_freq_hz.size]):], [0.1, 99.9]))
+    doppler_freq_bounds = doppler_freq_bounds + np.array([-1, 1]) * 1.5 * np.ptp(doppler_freq_bounds)
+    ax_doppler.set_ylim(doppler_freq_bounds)
+
+    # The two lines live in different Axes, and a line's zorder only ranks it
+    # against artists in its own Axes; across Axes what counts is the Axes zorder,
+    # which puts the twin (added last) on top.  Raise the code delay Axes instead,
+    # and hand its now-covering background patch back to the twin.  The grid goes
+    # on the lower Axes so it stays under both lines rather than over the Doppler.
+    ax.set_zorder(ax_doppler.get_zorder() + 1)
+    ax.patch.set_visible(False)
+    ax_doppler.patch.set_visible(True)
+    ax_doppler.grid(True)
 
     ax.set_title(title if title is not None else f"Code delay and Doppler: {sig_id}")
     handles = [
         plt.Line2D([0], [0], color="tab:purple", lw=2, label="Code delay residual"),
         plt.Line2D([0], [0], color="tab:green", lw=2, label="Doppler"),
     ]
+    # The absolute delay the residual was taken from, which the residual itself
+    # cannot show.  Stated once, at the first epoch, with the modulus it is only
+    # known to -- a reader who does not know the delay is ambiguous will otherwise
+    # read this number as a transit time, and on most signals it is not one.
+    if ambiguity_ms and len(delay_ms):
+        start_ms = float(
+            bpsk_acquisition.code_delay_ms(
+                outputs.uptime_epoch_ms[valid][0],
+                outputs.code_phase_ms[valid][0],
+                ambiguity_ms,
+            )
+        )
+        handles.append(plt.Line2D(
+            [0], [0], color="none",
+            label=f"delay at t=0: {start_ms:.3f} ms  (mod {ambiguity_ms:g} ms)",
+        ))
     ax.legend(handles=handles, loc="best", fontsize=8)
     return ax
 
@@ -1062,20 +1228,34 @@ def plot_skyplot(
 
     Elevation is drawn increasing *inward*, which is the convention: the zenith is
     the centre of the sky, not its edge.
+
+    `mask_deg` draws an elevation mask -- a dashed ring with the band below it
+    shaded.  It is annotation only: nothing here or downstream drops a satellite
+    for being under it, and the fix in `utils.navigation` uses every satellite it
+    is given.  Its job is to make a low satellite obvious, which matters most on a
+    horizon-pointed antenna, where the low ones are the strong ones.
     """
     ax = fig.add_subplot(1, 1, 1, projection="polar")
     ax.set_theta_zero_location("N")
     ax.set_theta_direction(-1)  # azimuth runs clockwise from north
+    # `set_rlim(90, 0)` is what puts the zenith at the centre, and it is the ONLY
+    # reversal there should be: the radius a satellite is drawn at is its elevation
+    # unchanged, so a ring at r = 15 is the 15 degree ring and must be labelled 15.
+    # Reversing the labels as well inverted them against the data -- the centre read
+    # "0" while an 80 degree satellite sat on it -- so the labels are the ticks.
     ax.set_rlim(90, 0)          # zenith at the centre
-    ax.set_rgrids([0, 15, 30, 45, 60, 75, 90], labels=["90", "75", "60", "45", "30", "15", "0"])
+    ax.set_rgrids([0, 15, 30, 45, 60, 75, 90])
     ax.set_xticks(np.deg2rad([0, 45, 90, 135, 180, 225, 270, 315]))
     ax.set_xticklabels(["N", "NE", "E", "SE", "S", "SW", "W", "NW"])
 
     if mask_deg > 0:
+        # The band BELOW the mask, which is the part being called into question --
+        # shading the sky above it instead tinted everything the mask accepts and
+        # left the low satellites, the ones a mask exists to flag, on clear ground.
         ax.fill_between(
             np.linspace(0, 2 * np.pi, 181),
+            0,
             mask_deg,
-            90,
             color="tab:red",
             alpha=0.06,
             zorder=0,
@@ -1344,4 +1524,193 @@ def plot_correction_magnitudes(
     ax.set_xlabel("Mean absolute correction [m]")
     ax.grid(True, axis="x", which="both")
     ax.set_title(title if title is not None else "Pseudorange corrections")
+    return ax
+
+
+def plot_orbit_and_clock_differences(
+    fig: Figure | SubFigure,
+    time: np.ndarray,
+    position_diff_m: np.ndarray,
+    clock_diff_m: np.ndarray,
+    sat_ids: Sequence[str],
+    *,
+    title: Optional[str] = None,
+    xlabel: str = "GPS time [hours of day]",
+    sp3_epochs: Optional[np.ndarray] = None,
+    ephemeris_toes: Optional[np.ndarray] = None,
+    ephemeris_toe_marks: Optional[np.ndarray] = None,
+    mark_time: Optional[float] = None,
+) -> tuple[Axes, Axes]:
+    """
+    Broadcast ephemeris against precise orbits, in the two quantities it predicts.
+
+    Both panels are in metres of range so they can be read against each other, and
+    against the residuals in sections 8 and 9 of notebook 02.  They are not equally
+    costly, though, and the plot cannot show that: only the component of an orbit
+    error along the line of sight reaches the pseudorange, and the radial direction
+    is the poorly observed one from the ground, whereas a clock error is a pure
+    range error and arrives in full.
+
+    `position_diff_m` and `clock_diff_m` are `(epochs, satellites)`.  Both are
+    expected to arrive as magnitudes the caller has already reduced -- in
+    particular with the clock's common time-scale offset removed, since that offset
+    is absorbed whole by the receiver clock solution and plotting it would bury the
+    part that is not.
+
+    The x axis is GPS time of week -- absolute, so it can be read against a `toe`
+    (which is stated in seconds, so divide by 3600) rather than being relative to a
+    collect the plot happens to be centred on.  That is what makes the two optional
+    overlays worth having:
+
+    * `ephemeris_changes`, an `(epochs, satellites)` boolean, marks where the
+      broadcast record in use changed.  Every step in a trace should sit on one of
+      these; a step that does not is an interpolation artefact rather than an
+      upload.
+    * `sp3_epochs` draws the precise product's tabulated instants as ticks along
+      the top.  Their density against the sparse ephemeris markers is the point:
+      one is a table sampled every few minutes, the other a prediction reissued
+      every couple of hours.
+
+    `mark_time` draws the collect itself, the one instant a fix actually used.
+
+    The time axis is expected to span hours rather than the tracked run: over a
+    minute neither a broadcast orbit nor a precise one does anything, so a plot of
+    the run alone is two flat lines and says nothing about either.  Over a day the
+    structure appears -- error growing across each fit interval and dropping at
+    every upload.
+    """
+    time = np.asarray(time, dtype=float)
+    position_diff_m = np.atleast_2d(position_diff_m)
+    clock_diff_m = np.atleast_2d(clock_diff_m)
+    if ephemeris_toe_marks is not None:
+        ephemeris_toe_marks = np.atleast_2d(ephemeris_toe_marks)
+
+    top = fig.add_subplot(2, 1, 1)
+    bottom = fig.add_subplot(2, 1, 2, sharex=top)
+
+    for j, sat_id in enumerate(sat_ids):
+        colour = None
+        for ax, values in ((top, position_diff_m), (bottom, clock_diff_m)):
+            if j >= values.shape[1]:
+                continue
+            column = values[:, j]
+            good = np.isfinite(column)
+            if not good.any():
+                continue
+            (line,) = ax.plot(
+                time[good], column[good], lw=1.2, label=sat_id, color=colour
+            )
+            # Both panels describe one satellite, so they must agree on its colour
+            # even when it is missing from one of them.
+            colour = line.get_color()
+            if ephemeris_toe_marks is not None and j < ephemeris_toe_marks.shape[1]:
+                changed = ephemeris_toe_marks[:, j] & good
+                if changed.any():
+                    ax.plot(
+                        time[changed], column[changed], linestyle="none",
+                        marker="o", ms=4, mfc="none", color=colour,
+                    )
+
+    if ephemeris_toes is not None and len(ephemeris_toes):
+        ephemeris_toes = np.unique(np.asarray(ephemeris_toes, dtype=float))
+        inside = (ephemeris_toes >= time.min()) & (ephemeris_toes <= time.max())
+        if inside.any():
+            top.plot(
+                ephemeris_toes[inside], np.zeros(int(inside.sum())),
+                transform=top.get_xaxis_transform(), linestyle="none",
+                marker="|", ms=8, color="tab:blue", alpha=0.5, clip_on=False,
+                label="ephemeris toe",
+            )
+
+    if sp3_epochs is not None and len(sp3_epochs):
+        sp3_epochs = np.asarray(sp3_epochs, dtype=float)
+        inside = (sp3_epochs >= time.min()) & (sp3_epochs <= time.max())
+        if inside.any():
+            top.plot(
+                sp3_epochs[inside], np.full(int(inside.sum()), 1.0),
+                transform=top.get_xaxis_transform(), linestyle="none",
+                marker="|", ms=6, color="gray", alpha=0.6, clip_on=False,
+                label="SP3 nodes",
+            )
+
+    # An hour is the natural unit to read a `toe` against, so tick at every one --
+    # unless the window is wide enough that hourly ticks would be a smear.
+    span_h = float(time.max() - time.min()) if time.size else 0.0
+    locator = plt.MultipleLocator(1.0) if 0.0 < span_h <= 48.0 else None
+
+    top.set_ylabel("|position| [m]")
+    bottom.set_ylabel("|clock| [m]")
+    bottom.set_xlabel(xlabel)
+    for ax in (top, bottom):
+        ax.grid(True)
+        ax.set_ylim(bottom=0.0)
+        if locator is not None:
+            ax.xaxis.set_major_locator(locator)
+        if mark_time is not None and time.size and time.min() <= mark_time <= time.max():
+            ax.axvline(mark_time, color="gray", lw=1.0, ls="--", zorder=0)
+    top.tick_params(labelbottom=False)
+
+    if top.get_legend_handles_labels()[0]:
+        top.legend(fontsize=8, ncol=5, loc="upper left")
+    top.set_title(title if title is not None else "Broadcast minus precise")
+    return top, bottom
+
+
+def plot_prefit_residuals(
+    fig: Figure | SubFigure,
+    time_s: np.ndarray,
+    residual_m: np.ndarray,
+    sat_ids: Sequence[str],
+    *,
+    title: Optional[str] = None,
+) -> Axes:
+    """
+    Pseudorange minus everything that can be modelled, one line per satellite.
+
+    The corrections in section 7 remove the *errors* -- satellite clock,
+    relativity, Sagnac, atmosphere -- but not the **geometry**, which is not an
+    error but the signal itself: 20,200 km at the zenith to 25,800 km near the
+    horizon.  That 5,600 km spread is why a plot of corrected pseudoranges shows
+    satellites thousands of kilometres apart and nothing else.  Subtract the
+    modelled range to the a-priori position as well, and what is left is what a
+    position solve actually works on.
+
+    Two things remain, and they are visually distinct:
+
+    * **The bundle**, common to every satellite: the receiver clock bias.  Its
+      *level* is arbitrary -- `form_observables` picks a nominal receive time so
+      pseudoranges land near their true magnitude -- but its *slope* is not, and is
+      the oscillator's rate error.  A tenth of a ppm is 30 m/s here, so over a few
+      minutes the bundle can travel kilometres.
+    * **The spread within the bundle**: the a-priori position error projected onto
+      each line of sight, plus ephemeris error, multipath and noise.  Tens of
+      metres with an unsurveyed reference, varying smoothly with the satellite's
+      direction because a position error projects as a cosine.
+
+    Note the scale between them.  A tenth of a ppm of clock drift is 30 m/s, so a
+    few minutes of run puts kilometres of ramp on an axis where the spread is tens
+    of metres -- on a long run the lines look like one line.  That is not the plot
+    failing; it is the honest ratio of the two terms, and it is why section 9 holds
+    the position fixed and plots the spread on its own axis.
+
+    Sections 8 and 9 are exactly the business of separating those two.
+    """
+    time_s = np.asarray(time_s, dtype=float)
+    residual_m = np.atleast_2d(residual_m)
+
+    ax = fig.add_subplot(1, 1, 1)
+    for j, sat_id in enumerate(sat_ids):
+        if j >= residual_m.shape[1]:
+            continue
+        column = residual_m[:, j]
+        good = np.isfinite(column)
+        if good.any():
+            ax.plot(time_s[good], column[good], lw=1.4, label=sat_id)
+
+    ax.set_xlabel("Time [s]")
+    ax.set_ylabel("Pseudorange - modelled range [m]")
+    ax.grid(True)
+    if ax.get_legend_handles_labels()[0]:
+        ax.legend(fontsize=8, ncol=4)
+    ax.set_title(title if title is not None else "Pre-fit residuals")
     return ax

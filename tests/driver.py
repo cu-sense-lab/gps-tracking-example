@@ -23,6 +23,7 @@ from utils.signal_interfaces import (
     GpsL2C,
     GpsL5,
     build_signals,
+    coherent_duration_target_ms,
 )
 
 from . import synthetic
@@ -66,6 +67,20 @@ FAMILY_LOOP_OVERRIDES = {
         subcarrier_chip_spacing=0.04,
     ),
 }
+
+# What each family asks for as its coherent integration, in ms.
+#
+# These are the lengths the removed `TrackingPolicy.synced_coherent_duration_ms`
+# used to impose, and stating them here is what keeps the golden baseline
+# comparable across the change that removed it: the integration length is now the
+# caller's to choose, so the driver has to choose the same lengths the policy used
+# to.  The goldens are worth exactly as much as their claim that the numbers did
+# not move, so this is the wrong table to "modernise".
+#
+# L1CA and L2C at one interval means those goldens never exercise the extension.
+# That is deliberate -- it was already true before -- and the extension is covered
+# directly in tests/test_coherent_integration.py.
+REQUESTED_COHERENT_DURATION_MS = {"L1CA": 1, "L2C": 1, "L5": 10, "L1C": 10}
 
 _SIGNAL_TYPES = {
     "L1CA": GpsL1CA,
@@ -144,7 +159,9 @@ def _build_channel(scenario: TrackingScenario):
         # cover a different configuration than the notebook runs: overlay
         # wipe-off without the extended integration and policy switch it enables.
         synced_policy=policy.synced_discriminator_policy,
-        synced_coherent_duration_ms=policy.synced_coherent_duration_ms,
+        synced_coherent_duration_ms=coherent_duration_target_ms(
+            signal_type, signal, REQUESTED_COHERENT_DURATION_MS[scenario.family]
+        ),
         overlay_search=policy.overlay_search,
         overlay_prompts_to_observe=policy.overlay_prompts_to_observe,
     )

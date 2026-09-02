@@ -141,11 +141,25 @@ class AcquisitionConfiguration:
 
         if self.coherent_duration_sample_ms is None:
             self.coherent_duration_sample_ms = float(self.coherent_duration_replica_ms)
-        if not 0 < self.coherent_duration_sample_ms <= self.coherent_duration_replica_ms:
+        if self.coherent_duration_sample_ms <= 0:
             raise ValueError(
-                f"coherent_duration_sample_ms must satisfy 0 < coherent <= replica "
-                f"({self.coherent_duration_replica_ms} ms), got {self.coherent_duration_sample_ms}"
+                f"coherent_duration_sample_ms must be positive, got "
+                f"{self.coherent_duration_sample_ms}"
             )
+        # Longer than the replica means FOLDING: the block covers a whole number of
+        # replica periods and they are summed onto one before the transform.  A
+        # fractional multiple is refused because it has no use and its final part
+        # period would contribute at reduced weight for no stated reason.
+        ratio = self.coherent_duration_sample_ms / self.coherent_duration_replica_ms
+        self.fold_factor = int(round(ratio))
+        if ratio > 1.0 and abs(ratio - self.fold_factor) > 1e-9:
+            raise ValueError(
+                f"coherent_duration_sample_ms {self.coherent_duration_sample_ms} exceeds the "
+                f"replica ({self.coherent_duration_replica_ms} ms) but is not a whole multiple "
+                "of it; folding sums whole replica periods, so the ratio must be an integer"
+            )
+        if ratio <= 1.0:
+            self.fold_factor = 1
         self.coherent_length_samples = int(
             self.sample_rate * self.coherent_duration_sample_ms / 1000
         )
@@ -172,44 +186,144 @@ class AcquisitionConfiguration:
         )
         self.num_doppler_bins = len(self.doppler_search_bins)
 
+        # Rolling the replica's spectrum by whole bins steps Doppler by
+        # `fft_resolution`, which is set by the FFT -- and therefore replica --
+        # length.  Folding shortens that FFT, so whole-bin steps get `fold_factor`
+        # times coarser while the mainlobe, set by how much data is integrated,
+        # does not widen at all.  Left there a 1 ms replica would search a 5 ms
+        # integration on a 1 kHz grid: sinc(500 Hz * 5 ms) is -18 dB, a hole in the
+        # middle of every gap.  The missing steps come back as sub-bin offsets,
+        # applied to the samples as a phase ramp before the fold, and the product
+        # of the two is a grid of exactly the spacing an unfolded replica gives.
+        self.doppler_sub_offsets_hz = (
+            np.arange(self.fold_factor) * self.fft_resolution / self.fold_factor
+        )
+        self.doppler_step_hz = self.fft_resolution / self.fold_factor
+        self.num_doppler_hypotheses = self.num_doppler_bins * self.fold_factor
+        # Monotonic in Doppler: whole bins outer, sub-bin offsets inner, so
+        # neighbouring indices are neighbouring frequencies -- which is what the
+        # fine search's window around a peak assumes.
+        self.doppler_hypotheses_hz = (
+            self.min_doppler_fft_bin * self.fft_resolution
+            + np.arange(self.num_doppler_hypotheses) * self.doppler_step_hz
+        )
+
         # Worst-case seeding error: half a bin, divided by any refinement.
         delay_factor = self.fine_search.delay_factor if self.fine_search else 1
         doppler_factor = self.fine_search.doppler_factor if self.fine_search else 1
         self.code_phase_bin_seconds = 1.0 / self.sample_rate
         self.code_phase_error_seconds = 0.5 * self.code_phase_bin_seconds / delay_factor
-        self.doppler_error_hz = 0.5 * self.fft_resolution / doppler_factor
+        self.doppler_error_hz = 0.5 * self.doppler_step_hz / doppler_factor
 
         self.replica_cache_dict: Dict[str, SignalReplicaCacheEntry] = {}
         # One-component code sets for the fine search, built on first use.
         self.fine_code_set_cache: Dict[str, Any] = {}
 
-    def search_resolution_summary(self) -> str:
+    def search_resolution_summary(
+        self, chip_rate_chips_per_sec: float | None = None
+    ) -> str:
         """
         Human-readable statement of how tightly the search pins each unknown --
         i.e. the worst-case error in the seed handed to tracking.  The code-phase
         error is also given in metres, since one sample of code phase is a range
         error of that size.
+
+        Code phase is stated in **chips** when the acquisition code's chip rate is
+        given, and in nanoseconds otherwise.  Chips are the unit the correlator and
+        the results table work in, and they are the unit in which "how far off is
+        this seed" has a fixed meaning: half a chip is half a chip on any signal at
+        any sample rate, where 100 ns is a fifth of a C/A chip and a whole one of
+        L5.  The config does not know the chip rate -- that belongs to the code --
+        so the caller supplies it.
         """
         speed_of_light_m_per_s = 299792458.0
-        coarse_code_ns = 0.5 * self.code_phase_bin_seconds * 1e9
-        coarse_dopp_hz = 0.5 * self.fft_resolution
+        coarse_code_s = 0.5 * self.code_phase_bin_seconds
+        coarse_dopp_hz = 0.5 * self.doppler_step_hz
+
+        def code(seconds: float) -> str:
+            metres = seconds * speed_of_light_m_per_s
+            if chip_rate_chips_per_sec:
+                return f"{seconds * chip_rate_chips_per_sec:.3f} chips (+/-{metres:.1f} m)"
+            return f"{seconds * 1e9:.1f} ns (+/-{metres:.1f} m)"
+
+        bin_size = (
+            f"{self.code_phase_bin_seconds * chip_rate_chips_per_sec:.3f} chips"
+            if chip_rate_chips_per_sec
+            else f"{self.code_phase_bin_seconds * 1e9:.1f} ns"
+        )
         lines = [
-            f"Search grid: code phase {self.code_phase_bin_seconds * 1e9:.1f} ns/bin "
-            f"({self.sample_rate / 1e6:.1f} Msps), Doppler {self.fft_resolution:.1f} Hz/bin",
-            f"  plain search    -> code phase +/-{coarse_code_ns:.1f} ns "
-            f"(+/-{coarse_code_ns * 1e-9 * speed_of_light_m_per_s:.1f} m), "
+            f"Search grid: code phase {bin_size}/bin "
+            f"({self.sample_rate / 1e6:.1f} Msps), Doppler {self.doppler_step_hz:.1f} Hz/bin",
+            f"  plain search    -> code phase +/-{code(coarse_code_s)}, "
             f"Doppler +/-{coarse_dopp_hz:.1f} Hz",
         ]
         if self.fine_search is not None:
-            fine_code_ns = self.code_phase_error_seconds * 1e9
             lines.append(
                 f"  fine search (delay x{self.fine_search.delay_factor}, "
                 f"Doppler x{self.fine_search.doppler_factor}) -> "
-                f"code phase +/-{fine_code_ns:.1f} ns "
-                f"(+/-{fine_code_ns * 1e-9 * speed_of_light_m_per_s:.1f} m), "
+                f"code phase +/-{code(self.code_phase_error_seconds)}, "
                 f"Doppler +/-{self.doppler_error_hz:.1f} Hz"
             )
         return "\n".join(lines)
+
+
+def code_phase_ambiguity_ms(
+    result: "AcquisitionResult",
+    resolution: "ambiguity_resolution.AmbiguityResolution | None" = None,
+) -> float:
+    """
+    The period over which this channel's cumulative code phase is unambiguous.
+
+    Tracking's `code_phase_ms` is seeded from acquisition and then just accumulates,
+    so whatever acquisition left undetermined stays undetermined for the whole run.
+    That matters as soon as anyone forms a **code delay**, `uptime - code_phase`:
+    the seed is only known modulo this, so the delay is too, and it comes out
+    negative unless one period is added back.
+
+    Acquisition pins the phase modulo the period of the code it correlated against
+    -- 1 ms on L1 C/A's `CA`, 20 ms on L2C's `CM`, 20 ms on L5's `Q x NH20`, 10 ms
+    on L1C's `L1CP`.  A long-code resolution extends that: it decides which of
+    `len(scores)` repetitions of the acquired code the dwell sat in, each one
+    acquisition-period long, so the product is the period it has settled.  L2C is
+    the case that matters -- 75 hypotheses of CM's 20 ms is CL's full 1.5 s, which
+    is longer than any transit time, so an L2C code delay is not merely positive
+    but is the transit time itself (plus the receiver clock offset).
+
+    An unresolved or absent resolution leaves the acquisition period, which is the
+    honest answer: nothing has been settled beyond it.
+    """
+    ambiguity_ms = float(result.code_phase_ambiguity_ms)
+    if resolution is not None and resolution.resolved:
+        ambiguity_ms *= len(resolution.scores)
+    return ambiguity_ms
+
+
+def code_delay_ms(
+    uptime_epoch_ms: NDArray[np.float64] | float,
+    code_phase_ms: NDArray[np.float64] | float,
+    ambiguity_ms: float | None = None,
+) -> NDArray[np.float64] | float:
+    """
+    Code delay from the two quantities tracking actually reports.
+
+    `code_phase_ms` is the satellite's own transmit-time coordinate and
+    `uptime_epoch_ms` is the receiver's, so their difference is transit time plus
+    the receiver clock offset -- the pseudorange, in milliseconds, before anything
+    absolute is known about either clock.  The two are easy to conflate because both
+    advance at very nearly one millisecond per millisecond and differ only by that
+    small delay; they also move in *opposite* directions as range changes, since a
+    satellite getting further away makes its transmit-time coordinate fall further
+    behind receiver time.
+
+    With `ambiguity_ms`, the result is wrapped into `[0, ambiguity_ms)`.  Without
+    the wrap it is negative: acquisition seeds the code phase at the phase it
+    measured, so the difference starts at minus that phase.  See
+    `code_phase_ambiguity_ms` for what the period is.
+    """
+    delay = np.asarray(uptime_epoch_ms, dtype=float) - np.asarray(code_phase_ms, dtype=float)
+    if ambiguity_ms:
+        delay = np.mod(delay, ambiguity_ms)
+    return delay
 
 
 @dataclass
@@ -345,9 +459,7 @@ class AcquisitionResult:
     @property
     def coarse_doppler_hz(self) -> float:
         """Doppler from the coarse grid, whether or not a fine search ran."""
-        return float(
-            self.config.doppler_search_bins[self.peak_doppler_bin] * self.config.fft_resolution
-        )
+        return float(self.config.doppler_hypotheses_hz[self.peak_doppler_bin])
 
     @property
     def coarse_code_phase_seconds(self) -> float:
@@ -447,7 +559,7 @@ def refine_acquisition_peak(
         fine.doppler_halfwidth_bins * fine.doppler_factor + 1,
     )
     doppler_hz = coarse_doppler_hz + doppler_index * (
-        acq_config.fft_resolution / fine.doppler_factor
+        acq_config.doppler_step_hz / fine.doppler_factor
     )
 
     grid = np.zeros((len(doppler_hz), len(taps_chips)), dtype=np.float64)
@@ -523,6 +635,8 @@ def pack_coherent_blocks(
     num_blocks: int,
     fft_length_samples: int,
     coherent_length_samples: int,
+    doppler_hz: float = 0.0,
+    sample_rate: float | None = None,
 ) -> NDArray[np.complex64]:
     """
     Lay each coherent block into a full-length FFT window, zero elsewhere.
@@ -546,6 +660,27 @@ def pack_coherent_blocks(
 
     When `coherent_length == fft_length` every offset is zero and this reduces
     exactly to the reshape it replaces.
+
+    **Folding.**  A block LONGER than the replica covers several whole code
+    periods, and they are summed onto one window before the transform.  That is
+    the same circular placement carried further -- sample `i` still belongs at
+    `(start + i) mod fft_length`, it just wraps more than once -- and it is exactly
+    equivalent to correlating the long block against a replica tiled to match,
+    because a tiled replica's spectrum is non-zero only every `fold` bins and the
+    transform of the fold is precisely those bins.  It costs a `fold`-times shorter
+    FFT and leaves the code phase unambiguous inside one period instead of
+    repeating the same answer `fold` times over.
+
+    **`doppler_hz` must be applied here, not to the packed window.**  Wipe-off is
+    indexed from the start of the *block*, so each of the folded periods carries
+    its own phase `exp(-2j*pi*f*rL/fs)`, and that inter-period rotation is the
+    whole difference between one coherent integration of `fold` periods and `fold`
+    incoherent ones.  Ramping the window afterwards cannot express it: every period
+    lands on the same index and would be given the same phase.  At 200 Hz over five
+    1 ms periods those five contributions sit 72 degrees apart and sum to exactly
+    zero -- the peak does not degrade, it vanishes.  For an unfolded block the two
+    orders differ only by a constant phase per block, which the square law
+    discards, which is why this argument was not needed before.
     """
     required = num_blocks * coherent_length_samples
     if len(sample_block) < required:
@@ -553,13 +688,27 @@ def pack_coherent_blocks(
             f"need {required} samples for {num_blocks} x {coherent_length_samples}-sample "
             f"coherent blocks, got {len(sample_block)}"
         )
+    if doppler_hz and sample_rate is None:
+        raise ValueError("sample_rate is required to apply a Doppler ramp")
 
     blocks = np.zeros((num_blocks, fft_length_samples), dtype=sample_block.dtype)
     for j in range(num_blocks):
         src = sample_block[j * coherent_length_samples : (j + 1) * coherent_length_samples]
+        if doppler_hz:
+            ramp = np.exp(
+                -2j * np.pi * doppler_hz * np.arange(len(src)) / float(sample_rate)
+            )
+            src = (src * ramp).astype(sample_block.dtype)
         start = (j * coherent_length_samples) % fft_length_samples
         stop = start + coherent_length_samples
-        if stop <= fft_length_samples:
+
+        if coherent_length_samples > fft_length_samples:
+            pad = (-len(src)) % fft_length_samples
+            if pad:
+                src = np.concatenate([src, np.zeros(pad, dtype=src.dtype)])
+            folded = src.reshape(-1, fft_length_samples).sum(axis=0)
+            blocks[j] = np.roll(folded, start)
+        elif stop <= fft_length_samples:
             blocks[j, start:stop] = src
         else:
             # The block straddles a code period boundary; it wraps, and the
@@ -637,7 +786,16 @@ def run_acquisition(
     M = acq_config.num_blocks
     N = acq_config.replica_length_samples
     N_coh = acq_config.coherent_length_samples
-    samples = pack_coherent_blocks(sample_block, M, N, N_coh)
+    # One packed set per sub-bin Doppler offset.  Without folding there is exactly
+    # one, at 0 Hz, and this is the single call it always was.
+    samples_by_sub_offset = [
+        pack_coherent_blocks(
+            sample_block, M, N, N_coh,
+            doppler_hz=float(f_sub), sample_rate=acq_config.sample_rate,
+        )
+        for f_sub in acq_config.doppler_sub_offsets_hz
+    ]
+    samples = samples_by_sub_offset[0]
 
     # Convert the caller's total into the per-cell rate the threshold needs.
     #
@@ -654,7 +812,12 @@ def run_acquisition(
     # already declared detections, over a neighbourhood the threshold was never
     # asked about, so inflating the cell count for it would tighten the Sidak
     # correction and quietly desensitise the coarse search that does the deciding.
-    num_detection_cells = acq_config.num_doppler_bins * acq_config.replica_length_samples
+    # Delay cells number one replica period, never the coherent block: a replica
+    # tiled to cover several periods repeats its correlation exactly, so the extra
+    # copies are the same numbers rather than further chances at a false alarm.
+    num_detection_cells = (
+        acq_config.num_doppler_hypotheses * acq_config.replica_length_samples
+    )
     if not 0.0 < prob_false_alarm_total < 1.0:
         raise ValueError(
             f"prob_false_alarm_total must be in (0, 1), got {prob_false_alarm_total}"
@@ -676,16 +839,19 @@ def run_acquisition(
     # scipy.fft rather than numpy: it releases the GIL and threads across the
     # blocks with workers=-1.  Single-threaded scipy is *slower* than numpy here,
     # so the workers argument is not optional.
-    conj_samples_fft = np.conj(scipy.fft.fft(samples, axis=1, workers=-1))
+    conj_samples_fft_by_sub = [
+        np.conj(scipy.fft.fft(packed, axis=1, workers=-1))
+        for packed in samples_by_sub_offset
+    ]
+    conj_samples_fft = conj_samples_fft_by_sub[0]
 
     if print_progress:
-        # The code period is what code phase is ambiguous over; state it in the
-        # header when every signal shares one, rather than on every row.
-        code_periods_ms = {
-            1e3 * p.length_chips / p.rate_chips_per_sec for p in code_parameters.values()
-        }
+        # The code length is what code phase is ambiguous over; state it in the
+        # header when every signal shares one, rather than on every row.  In chips,
+        # because that is the modulus in the unit the column is printed in.
+        code_lengths_chips = {p.length_chips for p in code_parameters.values()}
         ambiguity = (
-            f", mod {code_periods_ms.pop():g} ms" if len(code_periods_ms) == 1 else ""
+            f", mod {code_lengths_chips.pop():,}" if len(code_lengths_chips) == 1 else ""
         )
         print(
             f"Detection threshold: {threshold_db:.2f} dB above noise "
@@ -696,17 +862,27 @@ def run_acquisition(
         # the columns are widened and the code phase gains decimals -- one sample is
         # 4.5e-5 ms at 22 Msps, invisible at the 3 decimals the plain table uses.
         showing_fine = acq_config.fine_search is not None
-        # Code phase in whole nanoseconds with thousands separators: the groups fall
-        # on ms | us | ns, so 17,566,500 reads off directly, and one sample (45 ns at
-        # 22 Msps) is plainly visible -- it is not at 3 decimals of a millisecond.
-        cp_header = "Code phase [ns" + ambiguity + "]"
+        # Code phase in chips: the unit the correlator counts in, the unit the
+        # ambiguity is a whole number of, and the one in which a delay error means
+        # the same thing on every signal.  Three decimals resolves one sample on any
+        # front end fast enough to be used here.
+        cp_header = "Code phase [chips" + ambiguity + "]"
         snr_w, dopp_w = (18, 21) if showing_fine else (9, 13)
-        cp_w = max(len(cp_header), 24 if showing_fine else 10)
+        # Two 11-character chip figures either side of " => " when a fine search
+        # ran, one otherwise; the header is usually the wider of the two.
+        cp_w = max(len(cp_header), 26 if showing_fine else 11)
         if showing_fine:
             print("Detected signals show  coarse => fine.")
             print()
         print(f"  {'PRN':<5} {'SNR [dB]':>{snr_w}} {'Doppler [Hz]':>{dopp_w}} {cp_header:>{cp_w}}")
         print(f"  {'-' * 5} {'-' * snr_w} {'-' * dopp_w} {'-' * cp_w}")
+
+    # Undetected PRNs are the great majority of a sweep and every one of their rows
+    # says the same thing -- a noise maximum, and two dashes where the location
+    # would go.  They are summarised in one line under the table instead: the count,
+    # and the range their peaks span, which is the only part worth reading (a peak
+    # far above the others is a marginal signal worth a longer dwell).
+    undetected: list[tuple[str, float]] = []
 
     for signal_id, code_params in code_parameters.items():
 
@@ -762,18 +938,25 @@ def run_acquisition(
         # Match the sample precision rather than always using float64: real
         # collects are complex64, where float64 here only doubles the write
         # bandwidth.  Tests that feed complex128 keep their precision.
+        num_sub = acq_config.fold_factor
         correlation = np.zeros(
-            (len(doppler_search_bins), N),
+            (len(doppler_search_bins) * num_sub, N),
             dtype=np.float32 if samples.dtype == np.complex64 else np.float64,
         )
 
-        for i, roll in enumerate(doppler_search_bins):
+        # Whole bins outer, sub-bin offsets inner, so row index is monotonic in
+        # Doppler and `doppler_hypotheses_hz` indexes straight into it.  Without
+        # folding num_sub is 1 and this is the original single loop.
+        for i in range(len(doppler_search_bins) * num_sub):
+            bin_index, sub_index = divmod(i, num_sub)
+            roll = int(doppler_search_bins[bin_index])
             # Coherent integration over the N_coh non-zero samples of each block;
             # the padding contributes nothing, so z_noise ~ CN(0, N_coh*noise_var)
             # regardless of the FFT length.
             shifted_replica_fft = np.roll(replica_samples_fft, roll)
             corr = scipy.fft.ifft(
-                conj_samples_fft * shifted_replica_fft[None, :], axis=1, workers=-1
+                conj_samples_fft_by_sub[sub_index] * shifted_replica_fft[None, :],
+                axis=1, workers=-1,
             )
             # non-coherent square-law summation over M blocks, normalized by the
             # number of samples actually integrated (N_coh, not N -- they differ
@@ -830,8 +1013,8 @@ def run_acquisition(
                 code_set = _acquisition_code_set(code_params)
                 acq_config.fine_code_set_cache[signal_id] = code_set
 
-            coarse_doppler_hz = (
-                acq_config.doppler_search_bins[peak_doppler_bin] * acq_config.fft_resolution
+            coarse_doppler_hz = float(
+                acq_config.doppler_hypotheses_hz[peak_doppler_bin]
             )
             coarse_code_phase_seconds = peak_sample_bin / acq_config.sample_rate
             fine_grid, fine_peak_doppler_bin, fine_peak_code_phase_bin = refine_acquisition_peak(
@@ -844,15 +1027,15 @@ def run_acquisition(
             )
             fine_correlation_result = CorrelationResult(
                 fine_grid,
-                coarse_doppler_hz - fine.doppler_halfwidth_bins * acq_config.fft_resolution,
-                acq_config.fft_resolution / fine.doppler_factor,
+                coarse_doppler_hz - fine.doppler_halfwidth_bins * acq_config.doppler_step_hz,
+                acq_config.doppler_step_hz / fine.doppler_factor,
                 coarse_code_phase_seconds - fine.delay_halfwidth_bins / acq_config.sample_rate,
                 1.0 / (acq_config.sample_rate * fine.delay_factor),
             )
 
         if save_corr_doppler_window_bins is None:
             retained = correlation
-            first_row_fft_bin = acq_config.doppler_search_bins[0]
+            first_row_doppler_hz = float(acq_config.doppler_hypotheses_hz[0])
         else:
             # Keep `peak +/- window` Doppler rows and the whole delay axis.  Rows
             # off either end of the searched grid are NaN rather than dropped, so
@@ -861,18 +1044,21 @@ def run_acquisition(
             window = int(save_corr_doppler_window_bins)
             retained = np.full((2 * window + 1, N), np.nan, dtype=correlation.dtype)
             src0 = max(0, peak_doppler_bin - window)
-            src1 = min(acq_config.num_doppler_bins, peak_doppler_bin + window + 1)
+            src1 = min(acq_config.num_doppler_hypotheses, peak_doppler_bin + window + 1)
             dst0 = max(0, window - peak_doppler_bin)
             retained[dst0 : dst0 + (src1 - src0)] = correlation[src0:src1]
             # From the UNCLAMPED first row, so the Doppler axis stays correct across
             # the NaN rows; doppler_search_bins[src0] would be wrong whenever the
             # window overhangs the grid.
-            first_row_fft_bin = acq_config.doppler_search_bins[peak_doppler_bin] - window
+            first_row_doppler_hz = (
+                acq_config.doppler_hypotheses_hz[peak_doppler_bin]
+                - window * acq_config.doppler_step_hz
+            )
 
         corr_result = CorrelationResult(
             retained,
-            first_row_fft_bin * acq_config.fft_resolution,
-            acq_config.fft_resolution,
+            first_row_doppler_hz,
+            acq_config.doppler_step_hz,
             0.0,
             1 / acq_config.sample_rate,
         )
@@ -901,30 +1087,41 @@ def run_acquisition(
         acquisition_results[signal_id] = acq_result
 
         if print_progress:
-            # Doppler and code phase are only meaningful where a peak was actually
-            # detected; a dash is honest about the rest being the noise maximum.
-            def _ns(seconds: float) -> str:
-                return f"{round(seconds * 1e9):,}"
+            # Only detections get a row.  Doppler and code phase are meaningless
+            # without one -- the peak is then just the noise maximum -- so the rest
+            # are counted up and summarised under the table.
+            def _chips(seconds: float) -> str:
+                return f"{seconds * code_params.rate_chips_per_sec:11,.3f}"
 
             fine_snr = acq_result.fine_peak_snr_db
             if not signal_detected:
+                undetected.append((signal_id, acq_result.peak_snr_db))
+                continue
+            if fine_snr is None:
                 snr = f"{acq_result.peak_snr_db:.1f}"
-                doppler = code_phase = "-"
-            elif fine_snr is None:
-                snr = f"{acq_result.peak_snr_db:.1f}"
-                doppler = f"{acq_result.acq_doppler_hz:+.0f}"
-                code_phase = _ns(acq_result.acq_code_phase_seconds)
+                doppler = f"{acq_result.acq_doppler_hz:+4.0f}"
+                code_phase = _chips(acq_result.acq_code_phase_seconds)
             else:
                 snr = f"{acq_result.peak_snr_db:.1f} => {fine_snr:.1f}"
                 doppler = (
                     f"{acq_result.coarse_doppler_hz:+.0f} => {acq_result.acq_doppler_hz:+.0f}"
                 )
+                period_s = acq_result.code_phase_ambiguity_ms * 1e-3
+                coarse_s = acq_result.coarse_code_phase_seconds
                 code_phase = (
-                    f"{_ns(acq_result.coarse_code_phase_seconds)} => "
-                    f"{_ns(acq_result.acq_code_phase_seconds)}"
+                    f"{_chips(coarse_s % period_s if period_s > 0 else coarse_s)} => "
+                    f"{_chips(acq_result.acq_code_phase_seconds)}"
                 )
             print(
                 f"  {signal_id:<5} {snr:>{snr_w}} {doppler:>{dopp_w}} {code_phase:>{cp_w}}"
             )
+
+    if print_progress and undetected:
+        peaks = [snr for _, snr in undetected]
+        loudest = max(undetected, key=lambda item: item[1])
+        print(
+            f"  {len(undetected)} PRN(s) below threshold, peaks {min(peaks):.1f}-"
+            f"{max(peaks):.1f} dB (loudest {loudest[0]} at {loudest[1]:.1f})"
+        )
 
     return acquisition_results
