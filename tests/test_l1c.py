@@ -28,15 +28,16 @@ from utils.bpsk_correlation import correlate__multicomponent
 from utils.code_components import CodeComponent, build_code_set
 from utils.signal_interfaces import (
     ACQUISITION_POLICIES,
-    TRACKING_POLICIES,
     GpsL1C,
     GpsL5,
+    TRACKING_POLICIES,
     acquisition_code,
     acquisition_code_period_ms,
     acquisition_resolves_overlay_phase,
     build_acquisition_code_params,
     build_ambiguity_search,
     build_signals,
+    coherent_duration_target_ms,
     create_tracking_channels,
 )
 
@@ -262,7 +263,7 @@ def _track(duration_ms, *, prn=PRN, doppler_hz=800.0, code_phase_ms=2.15,
         output_capacity=duration_ms + 32,
         discriminator_policy=policy.discriminator_policy,
         synced_policy=policy.synced_discriminator_policy,
-        synced_coherent_duration_ms=policy.synced_coherent_duration_ms,
+        synced_coherent_duration_ms=coherent_duration_target_ms(GpsL1C, signal, 10),
         overlay_search=policy.overlay_search,
         overlay_prompts_to_observe=prompts_to_observe or policy.overlay_prompts_to_observe,
     )
@@ -320,20 +321,28 @@ def test_the_overlay_syncs_and_buys_a_four_quadrant_discriminator():
 def test_wipe_off_holds_one_sign_for_all_ten_intervals_of_a_code_period():
     """
     The consequence of an overlay chip lasting a primary code period rather than a
-    correlation interval.  Once synced the epoch grows to 10 ms, and its prompt
-    must be ten times the 1 ms interval's -- fully coherent.  A counter running per
-    interval instead would apply L1CO's own pattern *inside* the period and land
-    well short.
+    correlation interval.  The 10 ms epoch's prompt must be ten times the 1 ms
+    interval's -- fully coherent.  A counter running per interval instead would
+    apply L1CO's own pattern *inside* the period and land well short.
+
+    The epochs are selected by their recorded duration rather than by position,
+    because where the extension falls is not this test's business: L1C extends on
+    PLL lock and not on overlay sync, since L1CO's chip is already a whole primary
+    code period and bounds nothing that L1CD's 10 ms CNAV-2 symbol did not bound
+    first.  That the ratio is 10 either side of that point is the same claim.
     """
     channel = _track(1200, prompts_to_observe=50, nav_bits=False)
     assert channel.overlay_sync.synced
     assert channel.coherent_duration_ms == 10
 
     outputs = channel.outputs
-    magnitudes = np.abs(outputs.prompt_corr[outputs.valid, 1])
-    before = magnitudes[:200].mean()      # 1 ms epochs, pre-sync
-    after = magnitudes[-20:].mean()       # 10 ms epochs, post-sync
-    assert after / before == pytest.approx(10.0, rel=0.02)
+    valid = outputs.valid
+    magnitudes = np.abs(outputs.prompt_corr[valid, 1])
+    durations = outputs.epoch_duration_ms[valid]
+    short = magnitudes[durations == 1][-200:]   # the 1 ms warm-up
+    long = magnitudes[durations == 10][-20:]    # after the extension
+    assert len(short) and len(long)
+    assert long.mean() / short.mean() == pytest.approx(10.0, rel=0.02)
 
 
 def test_tracking_survives_noise_and_a_realistic_seeding_error():
@@ -357,7 +366,9 @@ def test_the_ceiling_on_integration_is_the_data_symbol_not_the_overlay():
     epoch serves every component.  20 ms would look perfect on the pilot while
     quietly cancelling the data component.
     """
-    assert TRACKING_POLICIES["GPS_L1C"].synced_coherent_duration_ms == 10
+    signal = build_signals(GpsL1C, prns=[PRN])[f"G{PRN:02d}"]
+    # A request past the ceiling is capped to it rather than honoured.
+    assert coherent_duration_target_ms(GpsL1C, signal, 20, warn=False) == 10
 
     signal = build_signals(GpsL1C, prns=[PRN])[f"G{PRN:02d}"]
     params = tracking_channel.TrackingSignalParameters(
@@ -390,3 +401,46 @@ def test_the_synchroniser_uses_the_fft_search():
     channel = _track(100)
     assert channel.overlay_sync.search is secondary_code.fft_search
     assert channel.overlay_sync.period == gps_l1c.OVERLAY_LENGTH == 1800
+
+
+def test_extension_does_not_wait_for_the_overlay_search():
+    """
+    L1CO gates the DISCRIMINATOR, not the epoch length, and conflating the two cost
+    L1C two seconds of 1 ms epochs.
+
+    Two facts, both from L1C's 10 ms primary code period.  The boundary: L1CD's
+    code period IS one CNAV-2 symbol, so a code phase that is a multiple of 10 ms
+    is a symbol boundary from the seeded acquisition onward -- nothing about L1CO
+    is needed to locate it.  The length: an L1CO chip lasts one primary code
+    period, so an un-stripped overlay bounds coherent integration at 10 ms, which
+    is exactly where L1CD's symbol bounds it anyway.  Neither is true of L5, whose
+    NH20 chip lasts 1 ms; there the wait is real (see
+    tests/test_l5.py::test_seeded_overlay_extends_only_once_the_pll_has_locked).
+
+    `prompts_to_observe` is set past what the run can supply, so the FFT search
+    cannot possibly have succeeded when the assertions below run.
+    """
+    channel = _track(400, prompts_to_observe=100_000, nav_bits=False)
+
+    assert not channel.overlay_sync.synced, "the search was supposed to be starved"
+    assert channel.policy.costas is True, "Costas is what the overlay does gate"
+    assert channel.loop_state.mode is tracking_channel.TrackingLoopMode.PLL
+    assert channel.coherent_duration_ms == 10, "extension waited on the overlay"
+
+    # And the grid it opened is really on the symbol lattice, not merely 10 ms long.
+    outputs = channel.outputs
+    valid = outputs.valid
+    long_epochs = outputs.epoch_duration_ms[valid] == 10
+    starts = outputs.code_phase_ms[valid][long_epochs]
+    # Distance to the nearest multiple of 10 ms, which is where a CNAV-2 symbol
+    # begins. Wrapped through +/-5 so a start just under a multiple counts as near
+    # it rather than 10 ms away from the one below.
+    off_lattice_ms = np.abs(((starts + 5.0) % 10.0) - 5.0)
+    assert off_lattice_ms.max() < 1e-6, (
+        f"10 ms epochs sit up to {off_lattice_ms.max():g} ms off the CNAV-2 symbol "
+        "lattice; the grid was never anchored"
+    )
+    # And the extension really did happen early, not merely by the end of the run.
+    assert (outputs.epoch_duration_ms[valid] == 1).sum() < 100, (
+        "spent more than 100 ms of warm-up at one interval"
+    )

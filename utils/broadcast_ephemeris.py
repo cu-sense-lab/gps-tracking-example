@@ -50,6 +50,29 @@ def brdc_url_and_path(day: datetime, resources_dir: str | Path) -> tuple[str, Pa
     return url, compressed, compressed.with_suffix("")
 
 
+def availability(
+    day: datetime, resources_dir: str | Path | None = None
+) -> cddis.Availability:
+    """
+    Whether the daily `brdc` file for `day` is published, without downloading it.
+
+    The broadcast file has no analysis latency -- it is what the satellites were
+    transmitting -- but the *daily* merge is only assembled once the day is over,
+    so a collect being processed the same day can find it absent or short.  A
+    cached file is reported without touching the network.
+    """
+    if resources_dir is None:
+        resources_dir = environment_variables.get_resources_path()
+    url, compressed, decompressed = brdc_url_and_path(day, resources_dir)
+    label = f"brdc {day:%Y-%m-%d}"
+    if decompressed.exists() and decompressed.stat().st_size > 0:
+        # The compressed size, to stay comparable with a probe of the archive --
+        # see the same note in `precise_orbits.availability`.
+        size = compressed.stat().st_size if compressed.exists() else None
+        return cddis.Availability(label, url, True, "cached locally", size)
+    return cddis.Availability(label, url, *cddis.exists(url))
+
+
 def download_brdc(
     day: datetime, resources_dir: str | Path | None = None, *, overwrite: bool = False
 ) -> Path:
@@ -165,6 +188,22 @@ def load_brdc_span(
     return records
 
 
+# Two records whose `toe` differ by less than this are the same upload slot, not
+# two slots -- see `select_ephemeris`.  One or two LSBs of the 16 s `toe` field is
+# what the duplicates in a merged file actually differ by; a minute is comfortably
+# above that and three orders below the two hours that separate real slots.
+DUPLICATE_TOE_TOLERANCE_S = 60.0
+
+
+def _unwrapped(seconds: float) -> float:
+    """A week-relative difference, brought into (-half a week, +half a week]."""
+    if seconds > 302400.0:
+        return seconds - 604800.0
+    if seconds < -302400.0:
+        return seconds + 604800.0
+    return seconds
+
+
 def select_ephemeris(
     records: list[RINEX_LNAVEphemeris],
     tow_s: float,
@@ -172,6 +211,7 @@ def select_ephemeris(
     *,
     max_age_s: float = MAX_AGE_S,
     require_healthy: bool = True,
+    duplicate_toe_tolerance_s: float = DUPLICATE_TOE_TOLERANCE_S,
 ) -> RINEX_LNAVEphemeris | None:
     """
     The record to use for one satellite at one time, or None if there isn't one.
@@ -185,17 +225,56 @@ def select_ephemeris(
     Returning None rather than the least-bad record is deliberate.  An ephemeris
     stretched hours past its fit interval yields a position that looks entirely
     plausible and is kilometres wrong.
+
+    **Near-duplicate `toe` values are broken by transmission time, not by `toe`.**
+    A merged daily file holds, a few times a day per satellite, two records whose
+    `toe` differ by 16 or 32 s -- one or two LSBs of the field -- with unrelated
+    IODCs and genuinely different parameters.  Nearest-`toe` alone flips between
+    them as the query time crosses the 8 s midpoint between their `toe` values,
+    which puts a step into any series computed across it.  Measured against IGS
+    precise products on one day, the record with the **later transmission time** is
+    the better of the pair every time, by up to 3.2 m of clock and 2.5 m of orbit --
+    it is a fresh upload superseding the other, issued off the nominal two-hour
+    grid.  So among records whose age is within `duplicate_toe_tolerance_s` of the
+    best, the most recently transmitted wins.
+
+    This changes nothing for records a real two hours apart, whose ages differ by
+    thousands of seconds.
     """
-    best, best_age = None, float("inf")
-    for record in records:
-        if require_healthy and record.sv_health_flag != 0:
-            continue
-        age = abs((record.toe - tow_s) + (record.week_num - week) * 604800.0)
-        if age < best_age:
-            best, best_age = record, age
-    if best is None or best_age > max_age_s:
+    candidates = [
+        record
+        for record in records
+        if not (require_healthy and record.sv_health_flag != 0)
+    ]
+    if not candidates:
         return None
-    return best
+
+    ages = [
+        abs((record.toe - tow_s) + (record.week_num - week) * 604800.0)
+        for record in candidates
+    ]
+    best_age = min(ages)
+    if best_age > max_age_s:
+        return None
+
+    near = [
+        record
+        for record, age in zip(candidates, ages)
+        if age <= best_age + duplicate_toe_tolerance_s
+    ]
+    if len(near) == 1:
+        return near[0]
+
+    def transmitted_at(record) -> float:
+        # Absolute, so a message transmitted just before a week rollover does not
+        # compare as though it were six days late.
+        return (
+            record.week_num * 604800.0
+            + record.toe
+            + _unwrapped(record.transmit_time - record.toe)
+        )
+
+    return max(near, key=transmitted_at)
 
 
 def ephemerides_for(

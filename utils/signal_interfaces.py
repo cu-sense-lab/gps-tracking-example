@@ -396,10 +396,12 @@ class TrackingPolicy:
     Which components drive the tracking loops, and how tiered-code sync and
     ambiguity resolution change that.
 
-    `synced_discriminator_policy`/`synced_coherent_duration_ms` apply once a
-    tiered (overlay) code is synchronised and can be wiped off:
-    `synced_coherent_duration_ms` is how long one coherent accumulation then
-    lasts. Defaults leave behaviour unchanged for signals without an overlay.
+    `synced_discriminator_policy` applies once a tiered (overlay) code is
+    synchronised and can be wiped off.  How LONG the accumulation then runs for
+    is deliberately not stated here: it is the caller's `coherent_duration_ms`,
+    clamped to what the signal can carry by `coherent_duration_target_ms`.  A
+    per-signal constant used to live here and always equalled that clamp, so it
+    could only ever disagree with the caller by ignoring them.
 
     `resolved_discriminator_policy` applies instead of `discriminator_policy`
     when the long-code ambiguity was resolved, i.e. when a component
@@ -411,7 +413,6 @@ class TrackingPolicy:
 
     discriminator_policy: tracking_channel.LoopDiscriminatorPolicy
     synced_discriminator_policy: tracking_channel.LoopDiscriminatorPolicy | None = None
-    synced_coherent_duration_ms: int = tracking_channel.CORRELATION_INTERVAL_MS
     resolved_discriminator_policy: tracking_channel.LoopDiscriminatorPolicy | None = None
 
     # How the overlay phase is searched for, when acquisition did not supply it.
@@ -475,8 +476,8 @@ TRACKING_POLICIES: dict[str, TrackingPolicy] = {
         synced_discriminator_policy=tracking_channel.LoopDiscriminatorPolicy(
             carrier_component=1, code_components=(0, 1), costas=False
         ),
-        # One CNAV symbol, and the whole signal's limit.
-        #
+        # The ceiling here is 10 ms, one CNAV symbol on I, and it is read off the
+        # code set rather than written down: see `coherent_duration_limits_ms`.
         # NH20's 20 ms period is the tempting choice and buys another 3 dB on the
         # pilot, but one epoch serves every component: Q is dataless and would take
         # it, while I would span two CNAV symbols and cancel.  10 ms is exactly one
@@ -484,10 +485,6 @@ TRACKING_POLICIES: dict[str, TrackingPolicy] = {
         # to multiples of their own length in code phase, they keep tiling NH20
         # evenly.  It also leaves I symbol-synchronous, which is what a CNAV
         # decoder wants.
-        #
-        # The loop update rate drops to 10 ms with it, so the loop filter is
-        # retuned at the same moment (see TrackingChannel).
-        synced_coherent_duration_ms=10,
     ),
     "GPS_L1C": TrackingPolicy(
         # Carrier on L1CP, the pilot, from the start -- three times L1CD's power.
@@ -510,12 +507,12 @@ TRACKING_POLICIES: dict[str, TrackingPolicy] = {
         synced_discriminator_policy=tracking_channel.LoopDiscriminatorPolicy(
             carrier_component=1, code_components=(0, 1), costas=False
         ),
-        # NOT longer than 10 ms, and the reason is worth stating because it differs
-        # from L5's: the binding limit is L1CD's CNAV-2 symbol, not the overlay.
-        # One epoch serves every component, so integrating past 10 ms would leave
-        # the pilot happy and quietly cancel the data component.  Stripping L1CO
-        # therefore buys a better discriminator, not a longer accumulation.
-        synced_coherent_duration_ms=gps_l1c.PRIMARY_PERIOD_MS,
+        # The ceiling here is also 10 ms, and the reason is worth stating because
+        # it differs from L5's: the binding limit is L1CD's CNAV-2 symbol, not the
+        # overlay.  One epoch serves every component, so integrating past 10 ms
+        # would leave the pilot happy and quietly cancel the data component.
+        # Stripping L1CO therefore buys a better discriminator, not a longer
+        # accumulation.
         # 1800 offsets is where brute force stops being sensible, and four whole
         # periods would be 72 seconds of tracking before the first attempt.  200
         # prompts is 2 s, and at 40 dB-Hz a 10 ms prompt already carries ~20 dB.
@@ -763,6 +760,64 @@ def requires_bit_sync(signal_type: type[Signal], signal: Signal) -> bool:
     return bool(symbol_periods) and min(symbol_periods) > signal_type.primary_period_ms
 
 
+def tracking_signal_params(
+    signal_type: type[Signal], signal: Signal
+) -> tracking_channel.TrackingSignalParameters:
+    """The signal's structure as the tracking channel wants it."""
+    return tracking_channel.TrackingSignalParameters(
+        code_set=signal.code_set,
+        nominal_code_rate_chips_per_sec=signal_type.tracking_code_rate_chips_per_sec,
+        carrier_freq_hz=signal_type.carrier_freq_hz,
+        primary_period_ms=signal_type.primary_period_ms,
+    )
+
+
+def coherent_duration_target_ms(
+    signal_type: type[Signal],
+    signal: Signal,
+    requested_ms: int,
+    warn: bool = True,
+) -> int:
+    """
+    How long the coherent accumulation runs once the channel is synchronised.
+
+    The caller's `coherent_duration_ms` is a CAP, not a target: this returns it
+    unchanged when the signal can carry it and cuts it down when it cannot.  Two
+    ways it gets cut, and a warning either way, because the loop the caller ends
+    up with is not the one they configured:
+
+      too long      past the shortest data symbol the signal carries -- 10 ms on
+                    L5 and L1C, 20 ms on L1 C/A and L2C.  Beyond that the epoch
+                    spans a symbol boundary and the data components cancel.
+      not a divisor rounded DOWN to one.  Epochs anchor to multiples of their
+                    own length, so 3 ms against L5's 10 ms symbol would put every
+                    third epoch across a boundary; 2 ms tiles it exactly.
+
+    The overlay is taken as stripped, which is what makes this the SYNCED length
+    rather than the starting one.  Every signal here starts at one correlation
+    interval regardless (see `create_tracking_channels`), so the un-stripped
+    bound never binds anything.
+    """
+    signal_params = tracking_signal_params(signal_type, signal)
+    target_ms = tracking_channel.clamp_coherent_duration_ms(
+        signal_params, requested_ms, overlay_stripped=True
+    )
+    if warn and target_ms != requested_ms:
+        limits = tracking_channel.coherent_duration_limits_ms(
+            signal_params, overlay_stripped=True
+        )
+        limit_ms, reason = min(limits)
+        warnings.warn(
+            f"{signal_type.signal_type_id}: coherent_duration_ms {requested_ms} is not "
+            f"usable on this signal, which is bounded by {reason} at {limit_ms} ms and "
+            f"can only use lengths that divide it; coherent integration is capped at "
+            f"{target_ms} ms.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+    return target_ms
+
+
 def create_tracking_channels(
     signal_type: type[Signal],
     signals: dict[str, Signal],
@@ -777,35 +832,46 @@ def create_tracking_channels(
 ) -> dict[str, TrackingChannelAdapter]:
     tracking_policy = TRACKING_POLICIES[signal_type.signal_type_id]
 
-    # A signal whose symbol boundary is not known yet cannot open a multi-interval
-    # epoch grid: there is nothing to anchor it to, and anchoring on the code phase
-    # lattice instead misplaces every epoch by the offset between the two (see
-    # `TrackingChannel._observe_bit_sync`).  So the requested duration becomes the
-    # duration to extend TO, and the channel starts at one correlation interval --
-    # the only length at which the boundary is measurable at all.  For every other
-    # signal this is a no-op and `loop_params` is used exactly as given.
+    # EVERY signal starts at one correlation interval and extends afterwards.  The
+    # requested duration is therefore the duration to extend TO, never the one the
+    # channel opens with.  Two independent reasons, and it is worth separating them
+    # because only the first is about knowing where a symbol begins:
+    #
+    #   Doppler.  Acquisition leaves a residual of up to half a search bin, and a
+    #     coherent accumulation of length T loses sinc(df*T) to it.  Worse, the FLL
+    #     discriminator wraps at `half_range / T` -- +/-250 Hz at 1 ms with Costas,
+    #     +/-25 Hz at 10 ms -- so a channel opened long can start with its residual
+    #     OUTSIDE the range of the loop meant to remove it, and the FLL then pulls
+    #     the wrong way.  One millisecond is where the pull-in range is widest and
+    #     the Doppler loss is negligible, which is exactly what a loop that has not
+    #     converged yet needs.  This applies to every signal.
+    #   Boundary.  A signal whose symbol boundary is not known yet ALSO cannot open
+    #     a multi-interval grid: there is nothing to anchor it to, and anchoring on
+    #     the code phase lattice instead misplaces every epoch by the offset between
+    #     the two (see `TrackingChannel._observe_bit_sync`).  One interval is the
+    #     only length at which that offset is measurable at all.  L1 C/A alone.
+    #
+    # The extension back to the requested length is gated on PLL lock and on a real
+    # symbol boundary, in `TrackingChannel._maybe_extend_coherent_duration`.
     interval_ms = tracking_channel.CORRELATION_INTERVAL_MS
-    start_loop_params = loop_params
-    synced_coherent_duration_ms = tracking_policy.synced_coherent_duration_ms
     # Any PRN answers this -- overlay presence and symbol periods are properties of
     # the signal, not of the satellite -- and `tracking_signal_ids` is only an
     # Iterable, so peeking into it here would consume a caller's generator.
     probe = next(iter(signals.values()), None)
-    if (
-        probe is not None
-        and requires_bit_sync(signal_type, probe)
-        and loop_params.coherent_duration_ms > interval_ms
-    ):
-        synced_coherent_duration_ms = loop_params.coherent_duration_ms
-        start_loop_params = replace(loop_params, coherent_duration_ms=interval_ms)
-        # Capacity is one row per epoch, and the epochs before the extension are
-        # the short ones.  A channel whose bit sync never converges stays short for
-        # the whole run, so the honest bound is the run length in intervals --
-        # anything less truncates the record silently, exactly where a reader would
-        # be looking to find out why the sync failed.
-        output_capacity = output_capacity * (
-            loop_params.coherent_duration_ms // interval_ms
+    synced_coherent_duration_ms = loop_params.coherent_duration_ms
+    if probe is not None:
+        # Warned once per signal type, not once per satellite: the bound comes from
+        # the code set, so every PRN would report the same cap.
+        synced_coherent_duration_ms = coherent_duration_target_ms(
+            signal_type, probe, loop_params.coherent_duration_ms
         )
+    start_loop_params = replace(loop_params, coherent_duration_ms=interval_ms)
+    # Capacity is one row per epoch, and the epochs before the extension are the
+    # short ones.  A channel that never reaches PLL -- or whose bit sync never
+    # converges -- stays short for the whole run, so the honest bound is the run
+    # length in intervals; anything less truncates the record silently, exactly
+    # where a reader would be looking to find out why it never extended.
+    output_capacity = output_capacity * (synced_coherent_duration_ms // interval_ms)
 
     channels: dict[str, TrackingChannelAdapter] = {}
     for signal_id in tracking_signal_ids:
@@ -836,10 +902,10 @@ def create_tracking_channels(
             warnings.warn(
                 f"{signal_id}: {plan.description} unresolved "
                 f"(confidence {resolution.confidence:.2f} < threshold); tracking starts at "
-                f"{loop_params.coherent_duration_ms} ms and "
-                f"{tracking_policy.synced_coherent_duration_ms} ms coherent integration is NOT "
-                f"active. The channel falls back to searching for the overlay phase after "
-                f"PLL lock, and will extend only if that succeeds.",
+                f"{interval_ms} ms and the configured {synced_coherent_duration_ms} ms "
+                f"coherent integration is NOT active yet. The channel falls back to "
+                f"searching for the overlay phase after PLL lock, and will extend only if "
+                f"that succeeds.",
                 RuntimeWarning,
                 stacklevel=2,
             )
@@ -854,12 +920,7 @@ def create_tracking_channels(
             carrier_phase_cycles=0.0,
             carrier_rate_cyc_per_sec=acq_result.acq_doppler_hz,
         )
-        signal_params = tracking_channel.TrackingSignalParameters(
-            code_set=signal.code_set,
-            nominal_code_rate_chips_per_sec=signal_type.tracking_code_rate_chips_per_sec,
-            carrier_freq_hz=signal_type.carrier_freq_hz,
-            primary_period_ms=signal_type.primary_period_ms,
-        )
+        signal_params = tracking_signal_params(signal_type, signal)
         # A signal with a tiered code can start already synced: the acquisition
         # code phase is in the overlay's frame, so the overlay index of the first
         # correlation interval is just its integer millisecond.  That skips the

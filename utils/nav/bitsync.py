@@ -7,8 +7,9 @@ boundary over for free:
     L2C   one CM code period *is* one symbol -- 20 ms, and the code phase already
           says where it starts.
     L5    NH10 overlay sync lands the epoch grid on symbol boundaries, which is
-          exactly why `TRACKING_POLICIES["GPS_L5"].synced_coherent_duration_ms`
-          is 10 ms rather than NH20's more tempting 20.
+          exactly why the signal's coherent ceiling is I's 10 ms CNAV symbol
+          rather than NH20's more tempting 20 (see
+          `tracking_channel.coherent_duration_limits_ms`).
     L1C   L1CD's 10 ms code period is one CNAV-2 symbol.
 
 L1 C/A has a 1 ms code and a 20 ms data bit and nothing to tie them together, so

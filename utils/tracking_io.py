@@ -20,7 +20,9 @@ plot and, worse, into every pseudorange.
 
 from __future__ import annotations
 
+import re
 import subprocess
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -51,6 +53,10 @@ _EPOCH_FIELDS = (
     "bit_synced",
 )
 _CN0_FIELDS = ("cn0_dbhz", "cn0_uptime_ms")
+
+# The `<date>_<time>_` a collect id carries because it names a capture; see
+# `collect_label`, which strips it.
+_COLLECT_ID_DATETIME_PREFIX = re.compile(r"^\d{8}_\d{6}_")
 
 
 @dataclass
@@ -103,6 +109,53 @@ class TrackingRun:
         return min((r.duration_ms for r in self.results.values()), default=0.0)
 
 
+def epoch_duration_mode_columns(
+    outputs_by_signal: dict[str, "tracking_channel.SignalTrackingOutputs"],
+) -> tuple[list[str], dict[str, list[str]]]:
+    """
+    Epoch counts crossed by epoch length and by the loop that filtered them.
+
+    A run does not have one epoch length.  Every channel opens at one correlation
+    interval and lengthens once the carrier is locked *and* the grid has a symbol
+    boundary to anchor to, so the counts split by length -- and separately by loop
+    mode, since those two conditions are not the same condition.  Crossing them is
+    what makes the split legible:
+
+    * a long epoch in FLL should never occur -- the extension requires PLL and the
+      mode never reverts -- so such a column appearing at all means a channel
+      extended without locking;
+    * a 1 ms epoch in *either* mode is normal.  `1 ms PLL` is the waiting room: the
+      carrier is locked and the channel is still looking for a symbol boundary,
+      which on L1 C/A is where bit synchronisation happens.
+
+    So the columns read as a story -- pulling the carrier in, waiting to find where
+    a symbol starts, then everything after both.
+
+    Only combinations that actually occur get a column.  Returns the column headers
+    and, per signal, the counts already formatted, so a caller can concatenate them
+    onto rows it is building for its own table.  Notebooks 01 and 02 both show this
+    breakdown and must agree about it; building it in one place is what makes them.
+    """
+    combinations = sorted({
+        (float(duration), bool(mode))
+        for outputs in outputs_by_signal.values()
+        for duration, mode in zip(
+            outputs.epoch_duration_ms[outputs.valid], outputs.pll_mode[outputs.valid]
+        )
+    })
+    headers = [
+        f"{duration:g} ms {'PLL' if mode else 'FLL'}" for duration, mode in combinations
+    ]
+    counts = {
+        signal_id: [
+            f"{int(np.count_nonzero((outputs.epoch_duration_ms[outputs.valid] == duration) & (outputs.pll_mode[outputs.valid] == mode))):,}"
+            for duration, mode in combinations
+        ]
+        for signal_id, outputs in outputs_by_signal.items()
+    }
+    return headers, counts
+
+
 def _git_commit() -> str:
     """Current commit, or a marker when this is not a checkout.
 
@@ -120,6 +173,99 @@ def _git_commit() -> str:
         return out.stdout.strip() if out.returncode == 0 else "unknown"
     except Exception:
         return "unknown"
+
+
+def collect_label(
+    collect_id: str, experiment_collect_ids: Iterable[str] | None = None
+) -> str:
+    """
+    The short name a collect goes by inside its experiment's output folder.
+
+    Collect ids repeat the experiment's date and time -- `20210611_121000_RX7` --
+    and the folder these files live in is already named after the experiment, so
+    the file name carries only what tells one collect from another: `RX7`.
+
+    The prefix is dropped only when it can be.  Two collects in one experiment can
+    share a tail (both SURGE balloon captures end in `_BALLOON`), and there the
+    full id stays, because the shorter name would put two different runs in one
+    file.  Pass `experiment_collect_ids` -- `metadata.collect_ids` -- to have that
+    checked; without it the prefix is dropped unconditionally.
+    """
+    short = _COLLECT_ID_DATETIME_PREFIX.sub("", collect_id)
+    if not short or short == collect_id:
+        return collect_id
+    if experiment_collect_ids is not None and any(
+        _COLLECT_ID_DATETIME_PREFIX.sub("", other) == short
+        for other in experiment_collect_ids
+        if other != collect_id
+    ):
+        return collect_id
+    return short
+
+
+def tracking_filename(
+    collect_id: str,
+    signal_type_id: str,
+    start_offset_ms: float,
+    duration_ms: float,
+    *,
+    experiment_collect_ids: Iterable[str] | None = None,
+) -> str:
+    """
+    The name one tracking run is written under, e.g. `RX7_GPS_L1C_120-600s.h5`.
+
+    Notebook 01 writes the file and notebook 02 reads it, and the two meet
+    through nothing but this name -- so it is built here rather than spelled out
+    in both places, where the two spellings could drift apart.
+
+    The two numbers are the span of the collect that was tracked, in seconds:
+    where the run started and where it ended, not where it started and how long
+    it lasted.  `120-600s` is the segment from two minutes in to ten minutes in.
+    A run over a different span is a different result rather than a newer one, so
+    it gets its own file and a short exploratory segment cannot overwrite a
+    full-length run.
+
+    Seconds are rounded to whole numbers, which is the resolution of the name and
+    therefore of that separation: two runs whose offsets differ by less than half
+    a second share a file.  Nothing here is set at that resolution -- offsets are
+    chosen in seconds -- and a name carrying `115.0004-600.0004s` would be worse
+    at the one job it has.
+    """
+    label = collect_label(collect_id, experiment_collect_ids)
+    start_s = round(start_offset_ms / 1e3)
+    end_s = round((start_offset_ms + duration_ms) / 1e3)
+    return f"{label}_{signal_type_id}_{start_s}-{end_s}s.h5"
+
+
+def tracking_path(
+    outputs_path: str | Path,
+    experiment_name: str,
+    collect_id: str,
+    signal_type_id: str,
+    start_offset_ms: float,
+    duration_ms: float,
+    *,
+    experiment_collect_ids: Iterable[str] | None = None,
+) -> Path:
+    """
+    Where one tracking run belongs: `<outputs>/tracking/<experiment>/<name>.h5`.
+
+    One folder per experiment, mirroring the layout of `COLLECTS_PATH`, so a
+    tracking file sits under the same experiment name as the samples it came
+    from.  Both notebooks call this rather than assembling the path themselves.
+    """
+    return (
+        Path(outputs_path)
+        / "tracking"
+        / experiment_name
+        / tracking_filename(
+            collect_id,
+            signal_type_id,
+            start_offset_ms,
+            duration_ms,
+            experiment_collect_ids=experiment_collect_ids,
+        )
+    )
 
 
 def save_tracking_results(
@@ -206,9 +352,19 @@ def load_tracking_results(path: str | Path) -> TrackingRun:
     """
     path = Path(path)
     if not path.exists():
+        # The name carries the tracked span, so the usual way to miss is to ask
+        # for a span nobody ran rather than to have run nothing at all.  Listing
+        # the folder tells those two apart at a glance.
+        siblings = sorted(p.name for p in path.parent.glob("*.h5"))
+        nearby = (
+            "\n  ".join(["", f"tracking runs present in {path.parent}:", *siblings])
+            if siblings
+            else ""
+        )
         raise FileNotFoundError(
             f"no tracking results at {path}. Run notebook 01 to completion first -- "
-            "its final cell writes this file."
+            "its final cell writes this file -- or match its START_OFFSET_MS and "
+            f"TRACK_DURATION_MS, which the file name is built from.{nearby}"
         )
 
     with h5py.File(path, "r") as f:

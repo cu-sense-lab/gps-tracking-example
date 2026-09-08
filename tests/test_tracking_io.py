@@ -293,3 +293,67 @@ def test_a_loaded_result_feeds_the_symbol_extractor(saved):
     assert stream.symbol_period_ms == 10
     assert stream.epochs_per_symbol == 1
     assert len(stream) > 0
+
+
+# ---------------------------------------------------------------------------
+# The epoch breakdown both notebooks print
+# ---------------------------------------------------------------------------
+
+
+def _outputs_with(pattern):
+    """`pattern` is a list of (epoch_duration_ms, pll_mode) per epoch."""
+    outputs = tracking_channel.SignalTrackingOutputs(
+        capacity=len(pattern) + 5,
+        num_components=1,
+        cn0_capacity=1,
+        tap_layout=tracking_channel.epl_tap_layout(0.5),
+    )
+    for i, (duration, mode) in enumerate(pattern):
+        outputs.uptime_epoch_ms[i] = float(i)
+        outputs.epoch_duration_ms[i] = duration
+        outputs.pll_mode[i] = mode
+    outputs.output_index = len(pattern)
+    return outputs
+
+
+def test_epochs_are_crossed_by_length_and_by_loop_mode():
+    """
+    The two splits do not coincide, and that is the informative part: a channel
+    sits at one interval *in PLL* for as long as the symbol boundary takes to find.
+    Reporting length and mode separately would hide exactly that state.
+    """
+    outputs = _outputs_with([(1.0, False)] * 3 + [(1.0, True)] * 2 + [(5.0, True)] * 4)
+    headers, counts = tracking_io.epoch_duration_mode_columns({"G01": outputs})
+    assert headers == ["1 ms FLL", "1 ms PLL", "5 ms PLL"]
+    assert counts["G01"] == ["3", "2", "4"]
+
+
+def test_only_combinations_that_occur_get_a_column():
+    """A channel that locked immediately has no `1 ms FLL` epochs, and a column of
+    zeros for every signal is a column that says nothing."""
+    outputs = _outputs_with([(1.0, True)] * 2 + [(20.0, True)] * 3)
+    headers, _ = tracking_io.epoch_duration_mode_columns({"G01": outputs})
+    assert headers == ["1 ms PLL", "20 ms PLL"]
+
+
+def test_columns_span_every_signal_so_the_rows_stay_alignable():
+    """One channel that never extended and one that did must still produce rows of
+    the same width, or they cannot go in one table."""
+    never_locked = _outputs_with([(1.0, False)] * 6)
+    healthy = _outputs_with([(1.0, False)] * 2 + [(5.0, True)] * 4)
+    headers, counts = tracking_io.epoch_duration_mode_columns(
+        {"G01": never_locked, "G02": healthy}
+    )
+    assert headers == ["1 ms FLL", "5 ms PLL"]
+    assert counts["G01"] == ["6", "0"]
+    assert counts["G02"] == ["2", "4"]
+    assert len(counts["G01"]) == len(counts["G02"]) == len(headers)
+
+
+def test_the_zero_tail_is_excluded_from_the_counts():
+    """`SignalTrackingOutputs` pre-allocates, so an unfilled tail is (0 ms, FLL).
+    Counting it would invent a column and inflate every FLL total."""
+    outputs = _outputs_with([(5.0, True)] * 4)
+    headers, counts = tracking_io.epoch_duration_mode_columns({"G01": outputs})
+    assert headers == ["5 ms PLL"]
+    assert counts["G01"] == ["4"]

@@ -242,16 +242,39 @@ class LnavEphemeris:
             Cic=self.Cic,
         )
 
+    def clock_polynomial_s(self, t_gps_sec: float) -> float:
+        """
+        The broadcast clock polynomial alone: `af0 + af1*dt + af2*dt^2`.
+
+        Separate from `clock_correction_s` because this is the half that IGS
+        precise clock products are directly comparable with.  Neither the broadcast
+        parameters nor an SP3 clock includes the **periodic relativistic
+        correction** -- both leave it to the receiver, which is why
+        `clock_correction_s` adds it and this does not.  Compare a
+        relativity-inclusive broadcast clock against SP3 and the difference is
+        dominated by a sinusoid at the orbital period, `2*F*e*sqrt(A)*c` peak to
+        peak: 17 m on a satellite with e = 0.013, against a true clock error of
+        well under a metre.
+        """
+        dt = _wrap_time_from_epoch(t_gps_sec - self.toc)
+        return float(self.af0 + self.af1 * dt + self.af2 * dt * dt)
+
+    def relativistic_correction_s(self, state: OrbitState) -> float:
+        """
+        The periodic term an eccentric orbit puts on the satellite's clock.
+
+        It is a property of where the satellite is, not of its clock, which is why
+        it takes an orbit state rather than a time.
+        """
+        return float(
+            RELATIVISTIC_F * self.e * self.sqrt_a * np.sin(state.eccentric_anomaly_rad)
+        )
+
     def clock_correction_s(self, t_gps_sec: float, state: OrbitState | None = None) -> float:
         """SV clock bias including relativity, excluding group delay."""
         if state is None:
             state = self.orbit_state(t_gps_sec)
-        dt = _wrap_time_from_epoch(t_gps_sec - self.toc)
-        polynomial = self.af0 + self.af1 * dt + self.af2 * dt * dt
-        relativistic = (
-            RELATIVISTIC_F * self.e * self.sqrt_a * np.sin(state.eccentric_anomaly_rad)
-        )
-        return float(polynomial + relativistic)
+        return self.clock_polynomial_s(t_gps_sec) + self.relativistic_correction_s(state)
 
 
 @dataclass(frozen=True)
@@ -349,15 +372,21 @@ class CnavEphemeris:
             Cic=self.Cic,
         )
 
+    def clock_polynomial_s(self, t_gps_sec: float) -> float:
+        """The clock polynomial alone -- see `LnavEphemeris.clock_polynomial_s`."""
+        dt = _wrap_time_from_epoch(t_gps_sec - self.toc)
+        return float(self.af0 + self.af1 * dt + self.af2 * dt * dt)
+
+    def relativistic_correction_s(self, state: OrbitState) -> float:
+        """The periodic relativistic term -- see `LnavEphemeris`."""
+        return float(
+            RELATIVISTIC_F * self.e * self.sqrt_a * np.sin(state.eccentric_anomaly_rad)
+        )
+
     def clock_correction_s(self, t_gps_sec: float, state: OrbitState | None = None) -> float:
         if state is None:
             state = self.orbit_state(t_gps_sec)
-        dt = _wrap_time_from_epoch(t_gps_sec - self.toc)
-        polynomial = self.af0 + self.af1 * dt + self.af2 * dt * dt
-        relativistic = (
-            RELATIVISTIC_F * self.e * self.sqrt_a * np.sin(state.eccentric_anomaly_rad)
-        )
-        return float(polynomial + relativistic)
+        return self.clock_polynomial_s(t_gps_sec) + self.relativistic_correction_s(state)
 
 
 Ephemeris = LnavEphemeris | CnavEphemeris

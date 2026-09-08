@@ -27,10 +27,11 @@ from utils.nav import cnav, lnav
 from utils.nav import primitives as prim
 from utils.nav import symbols as nav_symbols
 from utils.signal_interfaces import (
-    TRACKING_POLICIES,
     GpsL1CA,
     GpsL5,
+    TRACKING_POLICIES,
     build_signals,
+    coherent_duration_target_ms,
 )
 
 from . import synthetic
@@ -48,6 +49,11 @@ def track(
     nav_symbols_sequence: np.ndarray,
     duration_ms: int,
     coherent_duration_ms: int,
+    # The length to extend to once the channel is synced. Defaults to no extension,
+    # which is what the L1 C/A cases want: their epochs stay one code period long
+    # and `utils.nav.symbols` finds the bit boundary itself, which is the path
+    # those tests exist to cover.
+    extend_to_ms: int | None = None,
     doppler_hz: float = 0.0,
     code_phase_ms: float = 0.0,
     noise_sigma: float = 0.0,
@@ -89,7 +95,9 @@ def track(
         output_capacity=duration_ms + 64,
         discriminator_policy=policy.discriminator_policy,
         synced_policy=policy.synced_discriminator_policy,
-        synced_coherent_duration_ms=policy.synced_coherent_duration_ms,
+        synced_coherent_duration_ms=coherent_duration_target_ms(
+            signal_type, signal, extend_to_ms or coherent_duration_ms
+        ),
         overlay_search=policy.overlay_search,
         overlay_prompts_to_observe=policy.overlay_prompts_to_observe,
     )
@@ -152,6 +160,7 @@ def l5_channel():
         nav_symbols_sequence=sequence,
         duration_ms=26000,
         coherent_duration_ms=1,
+        extend_to_ms=10,
     )
 
 
@@ -167,7 +176,8 @@ def test_l5_epoch_grid_extends_to_one_cnav_symbol(l5_channel):
     # `validate_coherent_duration` refuses to build such a channel.
     assert durations[0] == 1.0
     assert durations[-1] == 10.0
-    assert TRACKING_POLICIES["GPS_L5"].synced_coherent_duration_ms == 10
+    signal = build_signals(GpsL5, prns=[PRN])[f"G{PRN:02d}"]
+    assert coherent_duration_target_ms(GpsL5, signal, 20, warn=False) == 10
 
 
 def test_l5_extended_epochs_are_symbol_aligned(l5_channel):
@@ -290,6 +300,7 @@ def test_l5_cnav_decodes_through_noise():
         nav_symbols_sequence=sequence,
         duration_ms=14000,
         coherent_duration_ms=1,
+        extend_to_ms=10,
         doppler_hz=1500.0,
         code_phase_ms=0.31,
         noise_sigma=1.0,

@@ -10,6 +10,8 @@ can actually pull in.
 
 from __future__ import annotations
 
+import dataclasses
+
 import numpy as np
 import pytest
 
@@ -18,11 +20,12 @@ import gnss_tools.signals.gps_l5 as gps_l5
 from utils import bpsk_acquisition, secondary_code
 from utils.bpsk_correlation import correlate__multicomponent
 from utils.signal_interfaces import (
-    TRACKING_POLICIES,
     GpsL1CA,
     GpsL5,
+    TRACKING_POLICIES,
     build_acquisition_code_params,
     build_signals,
+    coherent_duration_target_ms,
 )
 
 from . import synthetic
@@ -622,7 +625,9 @@ def test_acquisition_seeds_tracking_to_convergence():
     definitions = build_signals(GpsL5, prns=[prn])
     loop_params = tracking_channel.TrackingLoopParameters(
         DLL_bandwidth_hz=2.0, PLL_bandwidth_hz=20.0, FLL_bandwidth_hz=50.0,
-        coherent_duration_ms=1, EPL_chip_spacing=0.5,
+        # The length to extend TO. Every channel opens at one correlation interval
+        # whatever this says, so asking for 1 ms here would ask for no extension.
+        coherent_duration_ms=10, EPL_chip_spacing=0.5,
     )
     channels = create_tracking_channels(
         GpsL5,
@@ -697,7 +702,7 @@ def _track_until_synced(noise_sigma=3.0, buffers=14, buffer_ms=50, seed=4):
 
     loop_params = tracking_channel.TrackingLoopParameters(
         DLL_bandwidth_hz=2.0, PLL_bandwidth_hz=20.0, FLL_bandwidth_hz=50.0,
-        coherent_duration_ms=1, EPL_chip_spacing=0.5,
+        coherent_duration_ms=10, EPL_chip_spacing=0.5,
     )
     adapter = create_tracking_channels(
         GpsL5,
@@ -713,8 +718,13 @@ def _track_until_synced(noise_sigma=3.0, buffers=14, buffer_ms=50, seed=4):
     adapter.channel.overlay_sync.status = secondary_code.OverlaySyncStatus.UNSYNCED
     adapter.channel.overlay_sync.counter = 0
     adapter.channel._set_policy(TRACKING_POLICIES[GpsL5.signal_type_id].discriminator_policy)
-    adapter.channel.coherent_duration_ms = loop_params.coherent_duration_ms
-    adapter.channel.loop_params = loop_params
+    # Back to the 1 ms warm-up the channel really opened with -- `loop_params`
+    # names the length it will extend TO, not the one it starts at.
+    start_params = dataclasses.replace(
+        loop_params, coherent_duration_ms=tracking_channel.CORRELATION_INTERVAL_MS
+    )
+    adapter.channel.coherent_duration_ms = start_params.coherent_duration_ms
+    adapter.channel.loop_params = start_params
 
     synced_at_epoch = None
     for i in range(buffers):
@@ -850,7 +860,7 @@ def _seeded_channel(initial_overlay_counter, doppler_hz=1500.0, code_phase_ms=0.
         output_capacity=4000,
         discriminator_policy=policy.discriminator_policy,
         synced_policy=policy.synced_discriminator_policy,
-        synced_coherent_duration_ms=policy.synced_coherent_duration_ms,
+        synced_coherent_duration_ms=coherent_duration_target_ms(GpsL5, signal, 10),
         initial_overlay_counter=initial_overlay_counter,
     )
 

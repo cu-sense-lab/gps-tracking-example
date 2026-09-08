@@ -1,3 +1,5 @@
+import math
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import NotRequired, Optional, Generator, TypedDict
@@ -97,6 +99,48 @@ def compute_sample_array_size_bytes(
     if buffer_size_bytes * 8 != (num_samples * bits_per_sample):
         buffer_size_bytes += 1
     return buffer_size_bytes
+
+
+def samples_per_byte_boundary(
+    component_bit_depth: int,
+    is_complex: bool,
+) -> int:
+    """
+    The sample-count granularity an offset into a packed stream has to respect.
+
+    1 whenever a sample occupies a whole number of bytes, which covers every
+    bit depth of 8 and above; 2 for 4-bit real or 2-bit complex samples, 4 for
+    2-bit real ones.
+    """
+    bits_per_sample = component_bit_depth * (2 if is_complex else 1)
+    return math.lcm(bits_per_sample, 8) // bits_per_sample
+
+
+def compute_sample_offset_bytes(
+    num_samples: int,
+    component_bit_depth: int,
+    is_complex: bool,
+) -> int:
+    """
+    The byte offset at which sample `num_samples` begins.
+
+    Not the same rounding as `compute_sample_array_size_bytes`: a *length* is
+    rounded up to whole bytes, but an *offset* has to be exact.  Seeking to a
+    rounded byte would shift the stream by part of a sample, and every sample
+    after it would be assembled from two neighbours' halves -- which does not
+    fail, it just decodes noise.  Sub-byte bit depths therefore admit only
+    offsets that land on a byte boundary; `samples_per_byte_boundary` gives the
+    granularity to snap a requested offset to.
+    """
+    total_bits = num_samples * component_bit_depth * (2 if is_complex else 1)
+    if total_bits % 8:
+        granularity = samples_per_byte_boundary(component_bit_depth, is_complex)
+        raise ValueError(
+            f"a {num_samples}-sample offset does not land on a byte boundary at "
+            f"{component_bit_depth}-bit {'complex' if is_complex else 'real'} samples; "
+            f"offsets must be a multiple of {granularity} samples."
+        )
+    return total_bits // 8
 
 
 def convert_to_complex64_samples(
@@ -228,12 +272,22 @@ def mixdown_samples(
 
 
 class FileSampleStream:
+    """
+    Buffered reader over a raw sample file.
+
+    `start_sample` skips that many samples before the first buffer, for working
+    on a stretch of a long collect other than its beginning.  It is a sample
+    count rather than a byte count so that callers reason in the same units the
+    rest of the pipeline uses; `compute_sample_offset_bytes` converts, and
+    rejects an offset that a sub-byte bit depth cannot express exactly.
+    """
 
     def __init__(
             self,
             filepath: str | Path,
             sample_params: SampleParameters,
             buffer_size_samples: int,
+            start_sample: int = 0,
         ) -> None:
         self.filepath = filepath
         self.sample_params = sample_params
@@ -241,11 +295,28 @@ class FileSampleStream:
         self.buffer_size_bytes = compute_sample_array_size_bytes(
             buffer_size_samples, sample_params.bit_depth, sample_params.is_complex
         )
+        if start_sample < 0:
+            raise ValueError(f"start_sample must be non-negative, got {start_sample}.")
+        self.start_sample = start_sample
+        self.start_offset_bytes = compute_sample_offset_bytes(
+            start_sample, sample_params.bit_depth, sample_params.is_complex
+        )
         self.byte_buffer = bytearray(self.buffer_size_bytes)
         self.sample_buffer = np.zeros(buffer_size_samples, dtype=np.complex64)
     
     def __enter__(self):
+        # Checked before opening rather than left to the seek: seeking past the
+        # end of a file is legal and silent, so the stream would simply yield
+        # nothing and the caller would see an empty run instead of a bad offset.
+        file_size_bytes = os.path.getsize(self.filepath)
+        if self.start_offset_bytes >= file_size_bytes:
+            raise ValueError(
+                f"start_sample={self.start_sample} is byte {self.start_offset_bytes} of "
+                f"{self.filepath}, which is only {file_size_bytes} bytes long."
+            )
         self.file = open(self.filepath, "rb")
+        if self.start_offset_bytes:
+            self.file.seek(self.start_offset_bytes)
         return self
     
     def __exit__(self, exc_type, exc_value, traceback):
